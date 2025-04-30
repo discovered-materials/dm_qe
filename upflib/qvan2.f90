@@ -297,13 +297,17 @@ SUBROUTINE qvan2_omp( ngy, ih, jh, np, qmod, qg, ylmk0 )
   IF (ivl > nlx .OR. jvl > nlx) &
        CALL upf_error( ' qvan2 ', ' wrong dimensions (2)', MAX(ivl,jvl) )
   !
+#if defined(__OPENMP_GPU)
   !$omp target teams distribute parallel do
+#endif
   DO ig = 1, ngy
     qg(1,ig) = 0.0_DP
     qg(2,ig) = 0.0_DP
   ENDDO
   !
+#if defined(__OPENMP_GPU)
   !$omp target data map(to:tab_qrad)
+#endif
   !
   DO lm = 1, lpx(ivl,jvl)
      lp = lpl(ivl,jvl,lm)
@@ -343,7 +347,9 @@ SUBROUTINE qvan2_omp( ngy, ih, jh, np, qmod, qg, ylmk0 )
      !
      qm1 = -1.0_DP !  any number smaller than qmod(1)
      !
+#if defined(__OPENMP_GPU)
      !$omp target teams distribute parallel do
+#endif
      DO ig = 1, ngy
         qm = qmod(ig) * dqi
         px = qm - INT(qm)
@@ -364,7 +370,9 @@ SUBROUTINE qvan2_omp( ngy, ih, jh, np, qmod, qg, ylmk0 )
      ENDDO
   ENDDO
   !
+#if defined(__OPENMP_GPU)
   !$omp end target data
+#endif
   !
   RETURN
   !
