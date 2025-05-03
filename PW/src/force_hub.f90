@@ -161,10 +161,7 @@ SUBROUTINE force_hub( forceh )
       CALL s_psi_omp( npwx, npw, nbnd, evc, spsi )
       !$omp target update from(spsi)
 #else
-
       CALL s_psi_acc( npwx, npw, nbnd, evc, spsi )
-
-        !$omp target update to(spsi)
 #endif
       CALL deallocate_bec_type_acc( becp )
       !
