@@ -157,14 +157,11 @@ SUBROUTINE force_hub( forceh )
       !$omp target data map(to:vkb,evc)
 #endif
       CALL calbec(offload_type2, npw, vkb, evc, becp ) 
-#if defined (__aOPENMP_GPU)
+#if defined (__OPENMP_GPU)
       CALL s_psi_omp( npwx, npw, nbnd, evc, spsi )
       !$omp target update from(spsi)
 #else
-
       CALL s_psi_acc( npwx, npw, nbnd, evc, spsi )
-
-        !$omp target update to(spsi)
 #endif
       CALL deallocate_bec_type_acc( becp )
       !
