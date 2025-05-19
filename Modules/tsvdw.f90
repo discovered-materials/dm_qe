@@ -1004,7 +1004,11 @@ PRIVATE :: GetVdWParam
   !
   IMPLICIT NONE
   !
-  REAL(DP), INTENT(IN) :: rhor(:)
+#if defined(__FLANG)
+  REAL(DP), INTENT(IN), CONTIGUOUS :: rhor(:)
+#else
+  REAL(DP), INTENT(IN)             :: rhor(:)
+#endif
   !
   ! Local variables
   !

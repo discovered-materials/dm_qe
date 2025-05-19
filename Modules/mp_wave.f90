@@ -26,7 +26,11 @@
 
       IMPLICIT NONE
 
-      COMPLEX(DP), intent(in) :: PW(:)
+#if defined(__FLANG)
+      COMPLEX(DP), intent(in), CONTIGUOUS :: PW(:)
+#else
+      COMPLEX(DP), intent(in)             :: PW(:)
+#endif
       !! piece of wave function
       COMPLEX(DP), intent(out) :: PWT(:)
       !! total wave function
@@ -246,7 +250,11 @@
       USE parallel_include
       IMPLICIT NONE
 
-      COMPLEX(DP), INTENT(OUT) :: PW(:)
+#if defined(__FLANG)
+      COMPLEX(DP), INTENT(OUT), CONTIGUOUS :: PW(:)
+#else
+      COMPLEX(DP), INTENT(OUT)             :: PW(:)
+#endif
       !! piece of wave function
       COMPLEX(DP), INTENT(IN) :: PWT(:)
       !! total wave function
@@ -347,7 +355,11 @@
       USE parallel_include
       IMPLICIT NONE
 
-      INTEGER, INTENT(OUT):: mill(:,:)
+#if defined(__FLANG)
+      INTEGER, INTENT(OUT), CONTIGUOUS :: mill(:,:)
+#else
+      INTEGER, INTENT(OUT)             :: mill(:,:)
+#endif
       !! Miller indices: distributed output
       INTEGER, INTENT(IN) :: millt(:,:)
       !! Miller indices: collected input
@@ -449,7 +461,11 @@
 
       IMPLICIT NONE
 
-      INTEGER, intent(in)  :: igl(:)
+#if defined(__FLANG)
+      INTEGER, intent(in), CONTIGUOUS  :: igl(:)
+#else
+      INTEGER, intent(in)              :: igl(:)
+#endif
       !! piece of splitted vector
       INTEGER, intent(out) :: igtot(:)
       !! total vector

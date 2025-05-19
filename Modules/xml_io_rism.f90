@@ -56,7 +56,11 @@ CONTAINS
     IMPLICIT NONE
     !
     CHARACTER(LEN=*), INTENT(IN) :: rism1d_file_base
+#if defined(__FLANG)
+    REAL(DP),         INTENT(IN), CONTIGUOUS :: zvv(:,:)
+#else
     REAL(DP),         INTENT(IN) :: zvv(:,:)
+#endif
     CHARACTER(LEN=*), INTENT(IN) :: name
     INTEGER,          INTENT(IN) :: ngrid
     INTEGER,          INTENT(IN) :: nsite
@@ -157,7 +161,11 @@ CONTAINS
     IMPLICIT NONE
     !
     CHARACTER(LEN=*), INTENT(IN)  :: rism1d_file_base
+#if defined(__FLANG)
+    REAL(DP),         INTENT(OUT), CONTIGUOUS :: zvv(:,:)
+#else
     REAL(DP),         INTENT(OUT) :: zvv(:,:)
+#endif
     INTEGER,          INTENT(IN)  :: ngrid
     INTEGER,          INTENT(IN)  :: nsite
     INTEGER,          INTENT(IN)  :: ipp(:)
