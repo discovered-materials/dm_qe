@@ -408,7 +408,7 @@ SUBROUTINE cgather_sym( dfftp, f_in, f_out )
   COMPLEX(DP), CONTIGUOUS :: f_in( : ), f_out(:)
   COMPLEX(DP), ALLOCATABLE, CONTIGUOUS ::  f_aux(:)
 #else
-  COMPLEX(DP),                         :: f_in( : ), f_out(:)
+  COMPLEX(DP)                          :: f_in( : ), f_out(:)
   COMPLEX(DP), ALLOCATABLE             ::  f_aux(:)
 #endif
   !
