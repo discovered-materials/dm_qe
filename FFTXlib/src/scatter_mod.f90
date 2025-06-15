@@ -53,7 +53,11 @@ SUBROUTINE gather_real_grid ( dfft, f_in, f_out )
   !
   IMPLICIT NONE
   !
-  REAL(DP), INTENT(in) :: f_in (:)
+#if defined(__FLANG)
+  REAL(DP), INTENT(in), CONTIGUOUS :: f_in (:)
+#else
+  REAL(DP), INTENT(in)             :: f_in (:)
+#endif
   REAL(DP), INTENT(inout):: f_out(:)
   TYPE ( fft_type_descriptor ), INTENT(IN) :: dfft
   !
@@ -135,7 +139,11 @@ SUBROUTINE gather_complex_grid ( dfft, f_in, f_out )
   !
   IMPLICIT NONE
   !
-  COMPLEX(DP), INTENT(in) :: f_in (:)
+#if defined(__FLANG)
+  COMPLEX(DP), INTENT(in), CONTIGUOUS :: f_in (:)
+#else
+  COMPLEX(DP), INTENT(in)             :: f_in (:)
+#endif
   COMPLEX(DP), INTENT(inout):: f_out(:)
   TYPE ( fft_type_descriptor ), INTENT(IN) :: dfft
   COMPLEX(DP), ALLOCATABLE ::  f_aux(:)
@@ -221,9 +229,14 @@ SUBROUTINE scatter_real_grid ( dfft, f_in, f_out )
   IMPLICIT NONE
   !
   REAL(DP), INTENT(in) :: f_in (:)
-  REAL(DP), INTENT(inout):: f_out(:)
-  TYPE ( fft_type_descriptor ), INTENT(IN) :: dfft
+#if defined(__FLANG)
+  REAL(DP), INTENT(inout), CONTIGUOUS :: f_out(:)
+  REAL(DP), ALLOCATABLE, CONTIGUOUS ::  f_aux(:)
+#else
+  REAL(DP), INTENT(inout) :: f_out(:)
   REAL(DP), ALLOCATABLE ::  f_aux(:)
+#endif
+  TYPE ( fft_type_descriptor ), INTENT(IN) :: dfft
   !
 #if defined(__MPI)
   !
@@ -298,9 +311,14 @@ SUBROUTINE scatter_complex_grid ( dfft, f_in, f_out )
   IMPLICIT NONE
   !
   COMPLEX(DP), INTENT(in) :: f_in (:)
-  COMPLEX(DP), INTENT(inout):: f_out(:)
+#if defined(__FLANG)
+  COMPLEX(DP), INTENT(inout), CONTIGUOUS :: f_out(:)
+  COMPLEX(DP), ALLOCATABLE, CONTIGUOUS ::  f_aux(:)
+#else
+  COMPLEX(DP), INTENT(inout) :: f_out(:)
+  COMPLEX(DP), ALLOCATABLE   ::  f_aux(:)
+#endif
   TYPE ( fft_type_descriptor ), INTENT(IN) :: dfft
-  COMPLEX(DP), ALLOCATABLE ::  f_aux(:)
   !
 #if defined(__MPI)
   !
@@ -386,8 +404,13 @@ SUBROUTINE cgather_sym( dfftp, f_in, f_out )
   IMPLICIT NONE
   !
   TYPE (fft_type_descriptor), INTENT(in) :: dfftp
-  COMPLEX(DP) :: f_in( : ), f_out(:)
-  COMPLEX(DP), ALLOCATABLE ::  f_aux(:)
+#if defined(__FLANG)
+  COMPLEX(DP), CONTIGUOUS :: f_in( : ), f_out(:)
+  COMPLEX(DP), ALLOCATABLE, CONTIGUOUS ::  f_aux(:)
+#else
+  COMPLEX(DP)                          :: f_in( : ), f_out(:)
+  COMPLEX(DP), ALLOCATABLE             ::  f_aux(:)
+#endif
   !
 #if defined(__MPI)
   !

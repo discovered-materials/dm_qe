@@ -335,8 +335,11 @@ SUBROUTINE fft_scatter_many_xy ( desc, f_in, f_aux, isgn, howmany)
   TYPE (fft_type_descriptor), INTENT(in), TARGET :: desc
   INTEGER, INTENT(in)                            :: isgn
   INTEGER, INTENT(in)                            :: howmany
-
-  COMPLEX (DP), INTENT(inout)   :: f_in (:), f_aux (:)
+#if defined(__FLANG)
+  COMPLEX (DP), INTENT(inout), CONTIGUOUS   :: f_in (:), f_aux (:)
+#else
+  COMPLEX (DP), INTENT(inout)               :: f_in (:), f_aux (:)
+#endif
 
 #if defined(__MPI)
   !
@@ -879,7 +882,11 @@ SUBROUTINE fft_scatter_many_yz ( desc, f_in, f_aux, isgn, howmany )
   IMPLICIT NONE
 
   TYPE (fft_type_descriptor), INTENT(in), TARGET :: desc
+#if defined (__FLANG)
+  COMPLEX (DP), INTENT(inout), CONTIGUOUS        :: f_in(:), f_aux(:)
+#else
   COMPLEX (DP), INTENT(inout)                    :: f_in(:), f_aux(:)
+#endif
   INTEGER, INTENT(in)                            :: isgn, howmany
 
 #if defined(__MPI)
