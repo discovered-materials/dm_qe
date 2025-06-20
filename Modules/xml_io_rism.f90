@@ -56,7 +56,7 @@ CONTAINS
     IMPLICIT NONE
     !
     CHARACTER(LEN=*), INTENT(IN) :: rism1d_file_base
-#if defined(__FLANG)
+#if defined(__MPIFLANG)
     REAL(DP),         INTENT(IN), CONTIGUOUS :: zvv(:,:)
 #else
     REAL(DP),         INTENT(IN) :: zvv(:,:)
@@ -161,7 +161,7 @@ CONTAINS
     IMPLICIT NONE
     !
     CHARACTER(LEN=*), INTENT(IN)  :: rism1d_file_base
-#if defined(__FLANG)
+#if defined(__MPIFLANG)
     REAL(DP),         INTENT(OUT), CONTIGUOUS :: zvv(:,:)
 #else
     REAL(DP),         INTENT(OUT) :: zvv(:,:)

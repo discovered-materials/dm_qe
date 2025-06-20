@@ -2379,7 +2379,7 @@ MODULE mp
       SUBROUTINE mp_gatherv_inplace_cplx_array(alldata, my_column_type, recvcount, displs, root, gid)
         USE parallel_include
         IMPLICIT NONE
-#if defined(__FLANG)
+#if defined(__MPIFLANG)
         COMPLEX(DP), CONTIGUOUS :: alldata(:,:)
 #else
         COMPLEX(DP)         :: alldata(:,:)

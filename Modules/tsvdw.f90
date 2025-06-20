@@ -1004,7 +1004,7 @@ PRIVATE :: GetVdWParam
   !
   IMPLICIT NONE
   !
-#if defined(__FLANG)
+#if defined(__MPIFLANG)
   REAL(DP), INTENT(IN), CONTIGUOUS :: rhor(:)
 #else
   REAL(DP), INTENT(IN)             :: rhor(:)

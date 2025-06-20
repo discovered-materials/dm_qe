@@ -26,7 +26,7 @@
 
       IMPLICIT NONE
 
-#if defined(__FLANG)
+#if defined(__MPIFLANG)
       COMPLEX(DP), intent(in), CONTIGUOUS :: PW(:)
 #else
       COMPLEX(DP), intent(in)             :: PW(:)
@@ -250,7 +250,7 @@
       USE parallel_include
       IMPLICIT NONE
 
-#if defined(__FLANG)
+#if defined(__MPIFLANG)
       COMPLEX(DP), INTENT(OUT), CONTIGUOUS :: PW(:)
 #else
       COMPLEX(DP), INTENT(OUT)             :: PW(:)
@@ -355,7 +355,7 @@
       USE parallel_include
       IMPLICIT NONE
 
-#if defined(__FLANG)
+#if defined(__MPIFLANG)
       INTEGER, INTENT(OUT), CONTIGUOUS :: mill(:,:)
 #else
       INTEGER, INTENT(OUT)             :: mill(:,:)
@@ -461,7 +461,7 @@
 
       IMPLICIT NONE
 
-#if defined(__FLANG)
+#if defined(__MPIFLANG)
       INTEGER, intent(in), CONTIGUOUS  :: igl(:)
 #else
       INTEGER, intent(in)              :: igl(:)
