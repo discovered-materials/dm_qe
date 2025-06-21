@@ -53,7 +53,7 @@ SUBROUTINE gather_real_grid ( dfft, f_in, f_out )
   !
   IMPLICIT NONE
   !
-#if defined(__FLANG)
+#if defined(__MPIFLANG)
   REAL(DP), INTENT(in), CONTIGUOUS :: f_in (:)
 #else
   REAL(DP), INTENT(in)             :: f_in (:)
@@ -139,7 +139,7 @@ SUBROUTINE gather_complex_grid ( dfft, f_in, f_out )
   !
   IMPLICIT NONE
   !
-#if defined(__FLANG)
+#if defined(__MPIFLANG)
   COMPLEX(DP), INTENT(in), CONTIGUOUS :: f_in (:)
 #else
   COMPLEX(DP), INTENT(in)             :: f_in (:)
@@ -229,7 +229,7 @@ SUBROUTINE scatter_real_grid ( dfft, f_in, f_out )
   IMPLICIT NONE
   !
   REAL(DP), INTENT(in) :: f_in (:)
-#if defined(__FLANG)
+#if defined(__MPIFLANG)
   REAL(DP), INTENT(inout), CONTIGUOUS :: f_out(:)
   REAL(DP), ALLOCATABLE, CONTIGUOUS ::  f_aux(:)
 #else
@@ -311,7 +311,7 @@ SUBROUTINE scatter_complex_grid ( dfft, f_in, f_out )
   IMPLICIT NONE
   !
   COMPLEX(DP), INTENT(in) :: f_in (:)
-#if defined(__FLANG)
+#if defined(__MPIFLANG)
   COMPLEX(DP), INTENT(inout), CONTIGUOUS :: f_out(:)
   COMPLEX(DP), ALLOCATABLE, CONTIGUOUS ::  f_aux(:)
 #else
@@ -404,7 +404,7 @@ SUBROUTINE cgather_sym( dfftp, f_in, f_out )
   IMPLICIT NONE
   !
   TYPE (fft_type_descriptor), INTENT(in) :: dfftp
-#if defined(__FLANG)
+#if defined(__MPIFLANG)
   COMPLEX(DP), CONTIGUOUS :: f_in( : ), f_out(:)
   COMPLEX(DP), ALLOCATABLE, CONTIGUOUS ::  f_aux(:)
 #else
