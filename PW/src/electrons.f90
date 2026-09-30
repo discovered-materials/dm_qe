@@ -44,7 +44,7 @@ SUBROUTINE electrons()
   USE paw_onecenter,        ONLY : PAW_potential
   USE paw_symmetry,         ONLY : PAW_symmetrize_ddd
   USE ions_base,            ONLY : nat
-  USE exx_base,             ONLY : exxbuff_to_device
+  USE exx_base,             ONLY : exxbuff_to_device, exxbuff_sync_host
   USE loc_scdm,             ONLY : use_scdm, localize_orbitals
   USE loc_scdm_k,           ONLY : localize_orbitals_k
   !
@@ -197,6 +197,7 @@ SUBROUTINE electrons()
            WRITE (iunres, *) (et(1:nbnd,ik),ik=1,nks)
            CLOSE (unit=iunres, status='keep')
            CALL seqopn (iunres, 'restart_exx', 'unformatted', exst)
+           CALL exxbuff_sync_host()
            WRITE (iunres) exxbuff
            CLOSE (unit=iunres, status='keep')
         ENDIF

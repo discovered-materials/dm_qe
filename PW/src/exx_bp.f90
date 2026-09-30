@@ -9,7 +9,8 @@ MODULE exx_bp
   !
   USE kinds,                ONLY : DP
   USE control_flags,        ONLY : gamma_only, use_gpu, many_fft, tqr
-  USE exx_base,             ONLY : dfftt , exxbuff, exxbuff_d, exxbuff_to_device, npwt, x_nbnd_occ, &
+  USE exx_base,             ONLY : dfftt , exxbuff, exxbuff_d, exxbuff_to_device, exxbuff_sync_host, &
+                                   exxbuff_host_stale, npwt, x_nbnd_occ, &
                                    gt, ggt, gcutmt, gkcut, gstart_t, ngmt_g, &
                                    eps_occ, exxalfa, x_occupation, x_occupation_d, &
                                    ibnd_start, ibnd_end, ibnd_buff_start, ibnd_buff_end
@@ -28,6 +29,9 @@ MODULE exx_bp
   !
   LOGICAL, ALLOCATABLE :: coulomb_done(:,:)
   !! list of which Coulomb factors have been calculated already
+  !
+  INTEGER :: exxinit_fill_last = -1
+  !! which exxinit fill path was reported on stdout last (-1 none, 0 host, 1 device)
   !
  CONTAINS
 #define _CX(A)  CMPLX(A,0._dp,kind=DP)
@@ -136,9 +140,12 @@ MODULE exx_bp
     USE fft_interfaces,       ONLY : invfft
     USE mp_orthopools,        ONLY : intra_orthopool_comm
     USE exx_base,             ONLY : nkqs, index_xk, index_sym,  &
-                                     rir, working_pool, d_spin
+                                     rir, working_pool, d_spin, local_thr
     USE exx_bp_utils,         ONLY : change_data_structure, nwordwfc_exx, &
-                                     igk_exx, evc_exx, transform_evc_to_exx
+                                     igk_exx, evc_exx, transform_evc_to_exx, igk_exx_d
+    USE mp_pools,             ONLY : npool
+    USE symm_base,            ONLY : nsym
+    USE io_global,            ONLY : stdout
 #if defined(__CUDA)
     USE device_memcpy_m,      ONLY : dev_memset
     USE device_fbuff_m,       ONLY : dev_buf
@@ -162,6 +169,16 @@ MODULE exx_bp
     COMPLEX(DP),POINTER     :: psic_nc_d(:,:)
 #if defined(__CUDA)
     attributes(DEVICE)      :: psic_nc_d
+#endif
+    ! device-side fill of exxbuff (collinear, one FFT process, one pool, no localization)
+    LOGICAL :: gpu_fill
+    CHARACTER(LEN=96) :: fill_why
+#if defined(__CUDA)
+    COMPLEX(DP), ALLOCATABLE :: temppsic_d(:), evc_exx_d(:,:)
+    INTEGER, ALLOCATABLE :: rir_d(:,:)
+    INTEGER, POINTER :: nlt_d(:), nlmt_d(:)
+    INTEGER :: jb1, jb2
+    attributes(DEVICE) :: temppsic_d, evc_exx_d, rir_d, nlt_d, nlmt_d
 #endif
     INTEGER :: nxxs, nrxxs
 #if defined(__MPI)
@@ -254,6 +271,28 @@ MODULE exx_bp
        !CALL threaded_memset(exxbuff, 0.0_DP, nrxxs*npol*SIZE(exxbuff,2)*nkqs*2)
     ENDIF
     !
+    ! ... fill exxbuff on the device when the layout allows it: collinear, no orbital
+    ! ... localization, one FFT process per band group, one pool, undistributed grid.
+    ! ... Every other configuration keeps the host fill below.
+    !
+    gpu_fill = .FALSE.
+#if defined(__CUDA)
+    gpu_fill = use_gpu .AND. (.NOT. noncolin) .AND. (local_thr <= 0.0_DP) .AND. &
+               (dfftt%nproc == 1) .AND. (npool == 1) .AND. (nrxxs == nxxs)
+    IF (gpu_fill) THEN
+       ALLOCATE( temppsic_d(nrxxs), evc_exx_d(SIZE(evc_exx,1),SIZE(evc_exx,2)) )
+       nlt_d => dfftt%nl_d
+       IF (gamma_only) THEN
+          ! no symmetry table at Gamma (exx_set_symm is not called)
+          nlmt_d => dfftt%nlm_d
+          ALLOCATE( rir_d(1,1) )
+       ELSE
+          ALLOCATE( rir_d(nxxs,nsym) )
+          rir_d = rir
+       ENDIF
+    ENDIF
+#endif
+    !
     ! ... This is parallelized over pools. Each pool computes only its k-points
     !
     KPOINTS_LOOP : &
@@ -265,6 +304,9 @@ MODULE exx_bp
        ! current_ik = index of k-point over all pools
        !
        current_ik = global_kpoint_index( nkstot, ik )
+#if defined(__CUDA)
+       IF (gpu_fill) evc_exx_d = evc_exx
+#endif
        !
        IF_GAMMA_ONLY : &
        IF (gamma_only) THEN
@@ -275,6 +317,42 @@ MODULE exx_bp
              ibnd_loop_start = iexx_start
           ENDIF
           !
+          IF (gpu_fill) THEN
+#if defined(__CUDA)
+          ! the Gamma-trick fill on the device: the host loop below, band pair by band pair
+          evc_offset = 0
+          DO ibnd = ibnd_loop_start, iexx_end, 2
+             temppsic_d = ( 0._DP, 0._DP )
+             IF ( ibnd < iexx_end ) THEN
+                IF ( ibnd == ibnd_loop_start .AND. MOD(iexx_start,2) == 0 ) THEN
+                   !$cuf kernel do (1)
+                   DO ig = 1, npwt
+                      temppsic_d(nlt_d(ig))  = ( 0._DP, 1._DP ) * evc_exx_d(ig,1)
+                      temppsic_d(nlmt_d(ig)) = ( 0._DP, 1._DP ) * CONJG( evc_exx_d(ig,1) )
+                   ENDDO
+                   evc_offset = -1
+                ELSE
+                   jb1 = ibnd - ibnd_loop_start + evc_offset + 1
+                   jb2 = jb1 + 1
+                   !$cuf kernel do (1)
+                   DO ig = 1, npwt
+                      temppsic_d(nlt_d(ig))  = evc_exx_d(ig,jb1) + ( 0._DP, 1._DP ) * evc_exx_d(ig,jb2)
+                      temppsic_d(nlmt_d(ig)) = CONJG( evc_exx_d(ig,jb1) ) + ( 0._DP, 1._DP ) * CONJG( evc_exx_d(ig,jb2) )
+                   ENDDO
+                ENDIF
+             ELSE
+                jb1 = ibnd - ibnd_loop_start + evc_offset + 1
+                !$cuf kernel do (1)
+                DO ig = 1, npwt
+                   temppsic_d(nlt_d(ig))  = evc_exx_d(ig,jb1)
+                   temppsic_d(nlmt_d(ig)) = CONJG( evc_exx_d(ig,jb1) )
+                ENDDO
+             ENDIF
+             CALL invfft( 'Wave', temppsic_d, dfftt )
+             exxbuff_d(1:nrxxs,(ibnd+1)/2,current_ik) = temppsic_d(1:nrxxs)
+          ENDDO
+#endif
+          ELSE
           evc_offset = 0
           DO ibnd = ibnd_loop_start, iexx_end, 2
              !
@@ -307,6 +385,7 @@ MODULE exx_bp
              exxbuff(1:nrxxs,(ibnd+1)/2,current_ik)=psic(1:nrxxs) 
              !
           ENDDO
+          ENDIF   ! gpu_fill
           !
        ELSE IF_GAMMA_ONLY
           !
@@ -333,6 +412,16 @@ MODULE exx_bp
                 ENDDO
 !$omp end parallel do
                 CALL invfft( 'Wave', temppsic_nc(:,2), dfftt )
+             ELSE IF (gpu_fill) THEN
+#if defined(__CUDA)
+                ! psi_k,ibnd(r) on the device
+                temppsic_d = ( 0._DP, 0._DP )
+                !$cuf kernel do (1)
+                DO ig = 1, npw
+                   temppsic_d( nlt_d(igk_exx_d(ig,ik)) ) = evc_exx_d(ig,ibnd-iexx_start+1)
+                ENDDO
+                CALL invfft( 'Wave', temppsic_d, dfftt )
+#endif
              ELSE
 !$omp parallel do default(shared) private(ir) firstprivate(nrxxs)
                 DO ir = 1, nrxxs
@@ -437,6 +526,21 @@ MODULE exx_bp
                 IF (use_gpu) CALL dev_buf%release_buffer(psic_nc_d, ierr)
                 IF (use_gpu) exxbuff = exxbuff_d
 #endif
+                ELSE IF (gpu_fill) THEN
+#if defined(__CUDA)
+                   ! rotate on the device straight into exxbuff_d
+                   IF (index_sym(ikq) > 0) THEN
+                      !$cuf kernel do (1)
+                      DO ir = 1, nrxxs
+                         exxbuff_d(ir,ibnd,ikq) = temppsic_d(rir_d(ir,isym))
+                      ENDDO
+                   ELSE
+                      !$cuf kernel do (1)
+                      DO ir = 1, nrxxs
+                         exxbuff_d(ir,ibnd,ikq) = CONJG( temppsic_d(rir_d(ir,isym)) )
+                      ENDDO
+                   ENDIF
+#endif
                 ELSE ! noncolinear
 #if defined(__MPI)
                    CALL gather_grid( dfftt, temppsic, temppsic_all )
@@ -475,6 +579,22 @@ MODULE exx_bp
        IF_GAMMA_ONLY
     ENDDO&
     KPOINTS_LOOP
+#if defined(__CUDA)
+    IF (gpu_fill) THEN
+       IF (negrp > 1) THEN
+          ! band groups rotate the host array in vexx: keep the host copy current
+          CALL start_clock( 'exxbuff_d2h' )
+          exxbuff = exxbuff_d
+          CALL stop_clock( 'exxbuff_d2h' )
+          exxbuff_host_stale = .FALSE.
+       ELSE
+          ! the host readers (exxenergy, exx_stress, the restart write, vexx_loc)
+          ! download on demand through exxbuff_sync_host
+          exxbuff_host_stale = .TRUE.
+       ENDIF
+       DEALLOCATE( temppsic_d, rir_d, evc_exx_d )
+    ENDIF
+#endif
     !
     IF (noncolin) THEN
        DEALLOCATE( temppsic_nc, psic_nc )
@@ -505,9 +625,26 @@ MODULE exx_bp
     ! and after every later host-side write (restart read, band-group shift,
     ! localization); the GPU vexx routines use it as it is
     !
-    CALL exxbuff_to_device()
+    IF (.NOT. gpu_fill) CALL exxbuff_to_device()
     !
     CALL change_data_structure( .FALSE. )
+    !
+    ! say which fill path this exxinit took, once and again whenever it changes
+    !
+    IF ( use_gpu .AND. MERGE( 1, 0, gpu_fill ) /= exxinit_fill_last ) THEN
+       exxinit_fill_last = MERGE( 1, 0, gpu_fill )
+       IF ( gpu_fill ) THEN
+          WRITE( stdout, '(5X,"EXX-GPU: exxinit fills the orbital buffer on the device")' )
+       ELSE
+          fill_why = ''
+          IF ( noncolin ) fill_why = TRIM(fill_why) // ' noncolinear'
+          IF ( local_thr > 0.0_DP ) fill_why = TRIM(fill_why) // ' localized-orbitals'
+          IF ( dfftt%nproc /= 1 ) fill_why = TRIM(fill_why) // ' parallel-FFT'
+          IF ( npool /= 1 ) fill_why = TRIM(fill_why) // ' k-point-pools'
+          IF ( nrxxs /= nxxs ) fill_why = TRIM(fill_why) // ' distributed-grid'
+          WRITE( stdout, '(5X,"EXX-GPU: exxinit fills the orbital buffer on the host;",A)' ) TRIM(fill_why)
+       ENDIF
+    ENDIF
     !
     RETURN
     !
@@ -1896,6 +2033,7 @@ MODULE exx_bp
     dfftt__nl=>dfftt%nl_d
     !
     CALL start_clock( 'vexx_k_setup' )
+    IF (negrp > 1) CALL exxbuff_sync_host()   ! the band-group shift below rotates the host array
 
     ialloc = nibands(my_egrp_id+1)
     !

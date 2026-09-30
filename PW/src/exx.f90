@@ -540,12 +540,14 @@ MODULE exx
     !! Wrapper to \(\texttt{exxenergy2_gamma}\) and \(\texttt{exxenergy2_k}\).
     !
     USE exx_bp,   ONLY : exxenergy_bp_gamma, exxenergy_bp_k 
+    USE exx_base, ONLY : exxbuff_sync_host
     !
     IMPLICIT NONE
     !
     REAL(DP) :: exxenergy2
     !
     CALL start_clock( 'exxenergy' )
+    CALL exxbuff_sync_host()
     !
     IF ( exx_bgrp_type .eq. EXX_BGRP_BANDS ) THEN
        !
@@ -572,12 +574,14 @@ MODULE exx
     !
     USE exx_std,  ONLY : exx_stress_std
     USE exx_bp,   ONLY : exx_stress_bp
+    USE exx_base, ONLY : exxbuff_sync_host
     !
     IMPLICIT NONE
     !
     REAL(DP)   :: exx_stress(3,3)
     !
     CALL start_clock( 'exx_stress' )
+    CALL exxbuff_sync_host()
     !
     IF ( exx_bgrp_type .eq. EXX_BGRP_BANDS ) THEN 
        exx_stress = exx_stress_std() 
@@ -1303,6 +1307,7 @@ MODULE exx
     USE klist,             ONLY : xk, nks, nkstot
     USE fft_interfaces,    ONLY : fwfft, invfft
     USE mp,                ONLY : mp_stop, mp_barrier, mp_sum
+    USE exx_base,          ONLY : exxbuff_sync_host
     USE exx_base,          ONLY : nqs, xkq_collect, index_xkq, index_xk, &
                                   g2_convolution
     !
@@ -1332,6 +1337,7 @@ MODULE exx
     WRITE( stdout, '(5X,A)' ) 'Exact-exchange with localized orbitals'  
     !
     CALL start_clock( 'vexxloc' )
+    CALL exxbuff_sync_host()
     !
     WRITE( stdout,'(7X,A,f24.12)' ) 'local_thr =', local_thr  
     nrxxs = dfftt%nnr  
@@ -1477,6 +1483,7 @@ MODULE exx
     USE wvfct,           ONLY : current_k, npwx
     USE klist,           ONLY : xk, nks, nkstot, igk_k
     USE fft_interfaces,  ONLY : fwfft, invfft
+    USE exx_base,        ONLY : exxbuff_sync_host
     USE exx_base,        ONLY : index_xkq, nqs, index_xk, xkq_collect, &
                                 g2_convolution
     !
@@ -1508,6 +1515,7 @@ MODULE exx
     INTEGER, EXTERNAL :: global_kpoint_index
     !
     CALL start_clock( 'vexxloc' )
+    CALL exxbuff_sync_host()
     !
     ALLOCATE( fac(dfftt%ngm) )
     !
