@@ -5100,5 +5100,322 @@ end associate
     CALL p18_release()   ! P18
   END SUBROUTINE p15_release_work_arrays
 #endif
+#if defined(__CUDA)
+  !-----------------------------------------------------------------------
+  LOGICAL FUNCTION exx_stress_fast_path()
+  !-----------------------------------------------------------------------
+    !! P17: can the exchange stress be computed on the device? The conditions of the vexx fast path
+    !! (norm-conserving, collinear, k-points, one band group, serial unpadded EXX grid), one pool, and
+    !! the analytic Coulomb kernels (the vcut kernels are host tables).
+    USE uspp,           ONLY : okvan
+    USE paw_variables,  ONLY : okpaw
+    USE mp_exx,         ONLY : negrp
+    USE mp_pools,       ONLY : npool
+    USE exx_base,       ONLY : use_coulomb_vcut_ws, use_coulomb_vcut_spheric
+    IMPLICIT NONE
+    LOGICAL, SAVE :: checked = .FALSE., env_off = .FALSE.
+    CHARACTER(LEN=16) :: val
+    INTEGER :: lenv, stat
+    CHARACTER(LEN=160) :: why
+    IF ( .NOT. checked ) THEN
+       CALL GET_ENVIRONMENT_VARIABLE( 'QE_EXX_FAST', val, lenv, stat )
+       env_off = ( stat == 0 .AND. lenv > 0 .AND. ( val(1:1) == '0' .OR. p14_is_off( val ) ) )
+       CALL GET_ENVIRONMENT_VARIABLE( 'QE_EXX_STRESS', val, lenv, stat )
+       IF ( stat == 0 .AND. lenv > 0 .AND. ( val(1:1) == '0' .OR. p14_is_off( val ) ) ) THEN
+          env_off = .TRUE.
+          WRITE( stdout, '(5X,"EXX: device exchange stress disabled by QE_EXX_STRESS=",A)' ) TRIM(val)
+       ENDIF
+       checked = .TRUE.
+    ENDIF
+    exx_stress_fast_path = use_gpu .AND. (.NOT. env_off) .AND. (.NOT. gamma_only) .AND. (.NOT. noncolin) &
+         .AND. (.NOT. okvan) .AND. (.NOT. okpaw) .AND. (negrp == 1) .AND. (npool == 1) &
+         .AND. (.NOT. use_coulomb_vcut_ws) .AND. (.NOT. use_coulomb_vcut_spheric) &
+         .AND. (dfftt%nproc == 1) .AND. (x_nbnd_occ > 0) &
+         .AND. (dfftt%nr1x == dfftt%nr1) .AND. (dfftt%nr2x == dfftt%nr2) .AND. (dfftt%nr3x == dfftt%nr3) &
+         .AND. (dfftt%nnr == dfftt%nr1*dfftt%nr2*dfftt%nr3)
+    IF ( .NOT. exx_stress_fast_path ) THEN
+       why = ''
+       IF ( .NOT. use_gpu ) why = TRIM(why) // ' no-gpu'
+       IF ( env_off ) why = TRIM(why) // ' QE_EXX_STRESS=0'
+       IF ( gamma_only ) why = TRIM(why) // ' gamma_only'
+       IF ( noncolin ) why = TRIM(why) // ' noncolin'
+       IF ( okvan ) why = TRIM(why) // ' ultrasoft'
+       IF ( okpaw ) why = TRIM(why) // ' PAW'
+       IF ( negrp /= 1 ) why = TRIM(why) // ' band-groups'
+       IF ( npool /= 1 ) why = TRIM(why) // ' pools'
+       IF ( use_coulomb_vcut_ws .OR. use_coulomb_vcut_spheric ) why = TRIM(why) // ' vcut-kernel'
+       IF ( dfftt%nproc /= 1 ) why = TRIM(why) // ' parallel-FFT'
+       IF ( x_nbnd_occ <= 0 ) why = TRIM(why) // ' no-occupied-bands'
+       IF ( dfftt%nr1x /= dfftt%nr1 .OR. dfftt%nr2x /= dfftt%nr2 .OR. dfftt%nr3x /= dfftt%nr3 .OR. &
+            dfftt%nnr /= dfftt%nr1*dfftt%nr2*dfftt%nr3 ) why = TRIM(why) // ' padded-FFT-grid'
+       WRITE( stdout, '(5X,"EXX-GPU: exchange stress on the host routine (P17);",A)' ) TRIM(why)
+    ENDIF
+  END FUNCTION exx_stress_fast_path
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE exx_stress_gpu( sigma, ok )
+  !-----------------------------------------------------------------------
+    !! P17: exact-exchange stress, Eq. (10) of PRB 73, 125120 (2006), on the device. The pair loop of
+    !! exx_stress_host (k-point, norm-conserving, collinear, one band group): for every k, q and occupied
+    !! band j of k, the pair densities conj(phi_{i,k+q}) psi_j / omega of a block of occupied k+q
+    !! orbitals are formed from the resident device buffer and transformed by one batched forward cuFFT,
+    !! |rho(G)|^2 is gathered on the EXX G sphere and contracted, by one DGEMM per block, with the six
+    !! independent components of Q(a,b;G) = q_a q_b fac_stress(G)/2 - delta_ab fac(G), the same kernel
+    !! branches as the host loop. Sums are double precision. ok = .FALSE. means nothing was done (no
+    !! device memory): the caller then runs the host routine.
+    USE cufft
+    USE cublas
+    USE cudafor,        ONLY : cudaMemGetInfo
+    USE constants,      ONLY : fpi, e2, pi
+    USE cell_base,      ONLY : omega, tpiba, at
+    USE wvfct,          ONLY : nbnd, npwx, wg, current_k
+    USE klist,          ONLY : xk, ngk, nks, nkstot
+    USE lsda_mod,       ONLY : lsda, current_spin, isk
+    USE io_files,       ONLY : iunwfc_exx
+    USE buffers,        ONLY : get_buffer
+    USE mp,             ONLY : mp_sum
+    USE mp_pools,       ONLY : inter_pool_comm
+    USE mp_exx,         ONLY : inter_egrp_comm, intra_egrp_comm
+    USE exx_base,       ONLY : nqs, nq1, nq2, nq3, eps_odg => eps, exxdiv, x_gamma_extrapolation, &
+                               grid_factor, yukawa, erfc_scrlen, gau_scrlen, index_xkq, index_xk, xkq_collect
+    USE exx_bp_utils,   ONLY : change_data_structure, transform_evc_to_exx, igk_exx_d, evc_exx, nwordwfc_exx
+    !
+    IMPLICIT NONE
+    !
+    REAL(DP), INTENT(OUT) :: sigma(3,3)
+    LOGICAL, INTENT(OUT) :: ok
+    !
+    INTEGER, POINTER :: nl_d(:)
+    attributes(DEVICE) :: nl_d
+    COMPLEX(DP), ALLOCATABLE, DEVICE :: evc_d(:), psic_d(:), rhoc_d(:,:)
+    REAL(DP), ALLOCATABLE, DEVICE :: gtl_d(:,:), qmat_d(:,:), a_d(:,:), s_d(:,:), xw_d(:), sig_d(:)
+    INTEGER, ALLOCATABLE, DEVICE :: il_d(:)
+    INTEGER, ALLOCATABLE :: il_h(:)
+    REAL(DP), ALLOCATABLE :: xw_h(:)
+    REAL(DP) :: sig_h(6)
+    INTEGER :: nrxxs, ngmt, nr1, nr2, nr3, nbuf, nkqs_d, ikk, iq, ikq, ik, ibnd, jbnd, ig, ir, ip, ic, p0, np_
+    INTEGER :: ni, npw, current_ik, pblk, plan_full, plan_one, plan, istat, nj
+    INTEGER(KIND=8) :: need, free_, total_
+    REAL(DP) :: xk1, xk2, xk3, xq1, xq2, xq3, tpiba_, q1, q2, q3, qq, x, gf, f, fs, hf
+    REAL(DP) :: e2_, fpi_, pi_, eps_, exxdiv_, gfac_, yuk_, erfc_, gau_, nqh1, nqh2, nqh3
+    REAL(DP) :: a11, a21, a31, a12, a22, a32, a13, a23, a33
+    REAL(DP) :: omega_inv, scale2, w
+    LOGICAL :: xgamma, odg1, odg2, odg3
+    LOGICAL, SAVE :: banner = .FALSE.
+    INTEGER, EXTERNAL :: global_kpoint_index
+    !
+    ok = .FALSE.
+    sigma = 0.0_DP
+    nrxxs = dfftt%nnr
+    ngmt  = dfftt%ngm
+    nr1 = dfftt%nr1; nr2 = dfftt%nr2; nr3 = dfftt%nr3
+    nbuf   = SIZE( exxbuff_d, 2 )
+    nkqs_d = SIZE( exxbuff_d, 3 )
+    ! ... pair block: the P6e rule, at most the occupied bands
+    IF ( p6_pblk > 0 ) THEN
+       pblk = MIN( x_nbnd_occ, p6_pblk )
+    ELSE
+       pblk = NINT( 18.0E6_DP / ( 16.0_DP * DBLE(nrxxs) ) )
+       pblk = MIN( x_nbnd_occ, MAX( 8, MIN( 128, pblk ) ) )
+    ENDIF
+    ! ... P15-style pre-check of the device work arrays
+    need = 16_8*INT(nrxxs,8)*INT(pblk,8) + 8_8*INT(ngmt,8)*INT(pblk,8) + 16_8*INT(nrxxs,8) &
+         + 72_8*INT(ngmt,8) + 16_8*INT(npwx,8) + 64_8*INT(pblk,8) + 12_8*INT(nbuf,8) + 64_8
+    istat = cudaMemGetInfo( free_, total_ )
+    IF ( istat == 0 .AND. need + 268435456_8 > free_ ) THEN
+       WRITE( stdout, '(5X,"EXX-GPU: exchange stress on the host routine (P17); device-memory (",I0," MB needed, ",I0," MB free)")' ) &
+            need/1000000_8, free_/1000000_8
+       RETURN
+    ENDIF
+    istat = 0
+    ALLOCATE( rhoc_d(nrxxs,pblk), a_d(ngmt,pblk), psic_d(nrxxs), evc_d(npwx), gtl_d(3,ngmt), qmat_d(6,ngmt), &
+              s_d(6,pblk), il_d(nbuf), xw_d(nbuf), sig_d(6), STAT=istat )
+    IF ( istat /= 0 ) THEN
+       IF ( ALLOCATED(rhoc_d) ) DEALLOCATE( rhoc_d )
+       IF ( ALLOCATED(a_d) ) DEALLOCATE( a_d )
+       IF ( ALLOCATED(psic_d) ) DEALLOCATE( psic_d )
+       IF ( ALLOCATED(evc_d) ) DEALLOCATE( evc_d )
+       IF ( ALLOCATED(gtl_d) ) DEALLOCATE( gtl_d )
+       IF ( ALLOCATED(qmat_d) ) DEALLOCATE( qmat_d )
+       IF ( ALLOCATED(s_d) ) DEALLOCATE( s_d )
+       IF ( ALLOCATED(il_d) ) DEALLOCATE( il_d )
+       IF ( ALLOCATED(xw_d) ) DEALLOCATE( xw_d )
+       IF ( ALLOCATED(sig_d) ) DEALLOCATE( sig_d )
+       WRITE( stdout, '(5X,"EXX-GPU: exchange stress on the host routine (P17); device-memory (allocation failed)")' )
+       RETURN
+    ENDIF
+    ALLOCATE( il_h(nbuf), xw_h(nbuf) )
+    !
+    CALL transform_evc_to_exx( 0 )
+    !
+    nl_d => dfftt%nl_d
+    gtl_d = gt(1:3,1:ngmt)
+    ! ... plans (the P6 cache; pinned for this call)
+    p6_plan_pinned = 0
+    plan_full = vexx_fast_plan( nr1, nr2, nr3, pblk, .FALSE. );  p6_plan_pinned(1) = plan_full
+    plan_one  = vexx_fast_plan( nr1, nr2, nr3, 1, .FALSE. );     p6_plan_pinned(2) = plan_one
+    !
+    omega_inv = 1.0_DP / omega
+    scale2 = ( 1.0_DP / DBLE( nr1*nr2*nr3 ) )**2      ! the two fwfft normalisations of the host formula
+    tpiba_ = tpiba
+    e2_ = e2; fpi_ = fpi; pi_ = pi; eps_ = eps_odg; exxdiv_ = exxdiv; gfac_ = grid_factor
+    yuk_ = yukawa; erfc_ = erfc_scrlen; gau_ = gau_scrlen; xgamma = x_gamma_extrapolation
+    nqh1 = DBLE(nq1)*0.5_DP; nqh2 = DBLE(nq2)*0.5_DP; nqh3 = DBLE(nq3)*0.5_DP
+    a11 = at(1,1); a21 = at(2,1); a31 = at(3,1)
+    a12 = at(1,2); a22 = at(2,2); a32 = at(3,2)
+    a13 = at(1,3); a23 = at(2,3); a33 = at(3,3)
+    !
+    IF ( .NOT. banner ) THEN
+       banner = .TRUE.
+       WRITE( stdout, '(5X,"EXX-GPU: exchange stress on the device (P17); ",I0," k-points x ",I0," q, pair block ",I0," of at most ",I0," occupied orbitals")' ) &
+            nks, nqs, pblk, x_nbnd_occ
+    ENDIF
+    !
+    sig_d = 0.0_DP
+    !
+    DO ikk = 1, nks
+       current_k = ikk
+       IF ( lsda ) current_spin = isk(ikk)
+       npw = ngk(ikk)
+       IF ( nks > 1 ) CALL get_buffer( evc_exx, nwordwfc_exx, iunwfc_exx, ikk )
+       current_ik = global_kpoint_index( nkstot, ikk )
+       xk1 = xk(1,ikk); xk2 = xk(2,ikk); xk3 = xk(3,ikk)
+       !
+       DO iq = 1, nqs
+          ikq = index_xkq(current_ik,iq)
+          ik  = index_xk(ikq)
+          xq1 = xkq_collect(1,ikq); xq2 = xkq_collect(2,ikq); xq3 = xkq_collect(3,ikq)
+          ! ... the occupied k+q orbitals of this q (the host loop's threshold)
+          ni = 0
+          DO ibnd = 1, MIN( nbuf, nbnd )
+             IF ( ABS( x_occupation(ibnd,ik) ) < 1.d-6 ) CYCLE
+             ni = ni + 1
+             il_h(ni) = ibnd
+             xw_h(ni) = x_occupation(ibnd,ik)
+          ENDDO
+          IF ( ni == 0 ) CYCLE
+          il_d(1:ni) = il_h(1:ni)
+          xw_d(1:ni) = xw_h(1:ni)
+          !
+          ! ... Q(1:6,G): xx, yy, zz, xy, xz, yz of q_a q_b fac_stress/2 - delta_ab fac, the host branches
+          !$cuf kernel do (1)
+          DO ig = 1, ngmt
+             q1 = xk1 - xq1 + gtl_d(1,ig)
+             q2 = xk2 - xq2 + gtl_d(2,ig)
+             q3 = xk3 - xq3 + gtl_d(3,ig)
+             IF ( xgamma ) THEN
+                x = ( q1*a11 + q2*a21 + q3*a31 ) * nqh1
+                odg1 = ABS( x - NINT(x) ) < eps_
+                x = ( q1*a12 + q2*a22 + q3*a32 ) * nqh2
+                odg2 = ABS( x - NINT(x) ) < eps_
+                x = ( q1*a13 + q2*a23 + q3*a33 ) * nqh3
+                odg3 = ABS( x - NINT(x) ) < eps_
+             ELSE
+                odg1 = .FALSE.; odg2 = .FALSE.; odg3 = .FALSE.
+             ENDIF
+             q1 = q1 * tpiba_; q2 = q2 * tpiba_; q3 = q3 * tpiba_
+             qq = q1*q1 + q2*q2 + q3*q3
+             gf = gfac_
+             IF ( gau_ > 0.0_DP ) THEN
+                f  = e2_ * ( (pi_/gau_)**1.5_DP ) * EXP( -qq/4.0_DP/gau_ ) * gf
+                fs = e2_ * 2.0_DP/4.0_DP/gau_ * EXP( -qq/4.0_DP/gau_ ) * ( (pi_/gau_)**1.5_DP ) * gf
+                IF ( odg1 .AND. odg2 .AND. odg3 ) THEN
+                   f = 0.0_DP; fs = 0.0_DP
+                ENDIF
+             ELSE IF ( qq > 1.d-8 ) THEN
+                IF ( erfc_ > 0.0_DP ) THEN
+                   f  = e2_*fpi_/qq * ( 1.0_DP - EXP( -qq/4.0_DP/erfc_**2 ) ) * gf
+                   fs = -e2_*fpi_ * 2.0_DP/qq**2 * ( ( 1.0_DP + qq/4.0_DP/erfc_**2 ) * EXP( -qq/4.0_DP/erfc_**2 ) - 1.0_DP ) * gf
+                ELSE
+                   f  = e2_*fpi_/( qq + yuk_ ) * gf
+                   fs = 2.0_DP * e2_*fpi_/( qq + yuk_ )**2 * gf
+                ENDIF
+                IF ( odg1 .AND. odg2 .AND. odg3 ) THEN
+                   f = 0.0_DP; fs = 0.0_DP
+                ENDIF
+             ELSE
+                f  = - exxdiv_
+                fs = 0.0_DP
+                IF ( yuk_ > 0.0_DP .AND. .NOT. xgamma ) THEN
+                   f  = f + e2_*fpi_/( qq + yuk_ )
+                   fs = 2.0_DP * e2_*fpi_/( qq + yuk_ )**2
+                ENDIF
+                IF ( erfc_ > 0.0_DP .AND. .NOT. xgamma ) THEN
+                   f  = e2_*fpi_ / ( 4.0_DP*erfc_**2 )
+                   fs = e2_*fpi_ / ( 8.0_DP*erfc_**4 )
+                ENDIF
+             ENDIF
+             hf = 0.5_DP * fs
+             qmat_d(1,ig) = q1*q1*hf - f
+             qmat_d(2,ig) = q2*q2*hf - f
+             qmat_d(3,ig) = q3*q3*hf - f
+             qmat_d(4,ig) = q1*q2*hf
+             qmat_d(5,ig) = q1*q3*hf
+             qmat_d(6,ig) = q2*q3*hf
+          ENDDO
+          !
+          ! ... occupied bands j of k (a zero weight adds nothing on the host either)
+          DO jbnd = 1, nbnd
+             IF ( wg(jbnd,ikk) == 0.0_DP ) CYCLE
+             w = exxalfa * wg(jbnd,ikk) / DBLE(nqs) / 4.0_DP * scale2
+             evc_d(1:npw) = evc_exx(1:npw,jbnd)
+             psic_d = ( 0.0_DP, 0.0_DP )
+             !$cuf kernel do (1)
+             DO ig = 1, npw
+                psic_d( nl_d( igk_exx_d(ig,ikk) ) ) = evc_d(ig)
+             ENDDO
+             istat = cufftExecZ2Z( plan_one, psic_d, psic_d, CUFFT_INVERSE )
+             IF ( istat /= 0 ) CALL errore( 'exx_stress_gpu', 'cuFFT exec failed', ABS(istat) )
+             !
+             DO p0 = 1, ni, pblk
+                np_ = MIN( pblk, ni - p0 + 1 )
+                plan = plan_full
+                IF ( np_ /= pblk ) THEN
+                   plan = vexx_fast_plan( nr1, nr2, nr3, np_, .FALSE. );  p6_plan_pinned(3) = plan
+                ENDIF
+                !$cuf kernel do (2)
+                DO ip = 1, np_
+                   DO ir = 1, nrxxs
+                      rhoc_d(ir,ip) = CONJG( exxbuff_d(ir,il_d(p0+ip-1),ikq) ) * psic_d(ir) * omega_inv
+                   ENDDO
+                ENDDO
+                istat = cufftExecZ2Z( plan, rhoc_d(1,1), rhoc_d(1,1), CUFFT_FORWARD )
+                IF ( istat /= 0 ) CALL errore( 'exx_stress_gpu', 'cuFFT exec failed', ABS(istat) )
+                !$cuf kernel do (2)
+                DO ip = 1, np_
+                   DO ig = 1, ngmt
+                      a_d(ig,ip) = DBLE( rhoc_d(nl_d(ig),ip) )**2 + AIMAG( rhoc_d(nl_d(ig),ip) )**2
+                   ENDDO
+                ENDDO
+                CALL DGEMM( 'N', 'N', 6, np_, ngmt, 1.0_DP, qmat_d, 6, a_d, ngmt, 0.0_DP, s_d, 6 )
+                !$cuf kernel do (1)
+                DO ic = 1, 6
+                   DO ip = 1, np_
+                      sig_d(ic) = sig_d(ic) + w * s_d(ic,ip) * xw_d(p0+ip-1)
+                   ENDDO
+                ENDDO
+             ENDDO
+          ENDDO
+       ENDDO
+    ENDDO
+    !
+    sig_h = sig_d
+    sigma(1,1) = sig_h(1); sigma(2,2) = sig_h(2); sigma(3,3) = sig_h(3)
+    sigma(1,2) = sig_h(4); sigma(2,1) = sig_h(4)
+    sigma(1,3) = sig_h(5); sigma(3,1) = sig_h(5)
+    sigma(2,3) = sig_h(6); sigma(3,2) = sig_h(6)
+    !
+    DEALLOCATE( rhoc_d, a_d, psic_d, evc_d, gtl_d, qmat_d, s_d, il_d, xw_d, sig_d, il_h, xw_h )
+    p6_plan_pinned = 0
+    !
+    CALL mp_sum( sigma, intra_egrp_comm )
+    CALL mp_sum( sigma, inter_egrp_comm )
+    CALL mp_sum( sigma, inter_pool_comm )
+    !
+    CALL change_data_structure( .FALSE. )
+    ok = .TRUE.
+    !
+  END SUBROUTINE exx_stress_gpu
+#endif
   !
 END MODULE exx_bp

@@ -574,19 +574,31 @@ MODULE exx
     !
     USE exx_std,  ONLY : exx_stress_std
     USE exx_bp,   ONLY : exx_stress_bp
+#if defined(__CUDA)
+    USE exx_bp,   ONLY : exx_stress_fast_path, exx_stress_gpu
+#endif
     USE exx_base, ONLY : exxbuff_sync_host
     !
     IMPLICIT NONE
     !
     REAL(DP)   :: exx_stress(3,3)
+    LOGICAL    :: on_device
     !
     CALL start_clock( 'exx_stress' )
-    CALL exxbuff_sync_host()
     !
+    on_device = .FALSE.
     IF ( exx_bgrp_type .eq. EXX_BGRP_BANDS ) THEN 
+       CALL exxbuff_sync_host()
        exx_stress = exx_stress_std() 
     ELSE
-       exx_stress = exx_stress_bp() 
+#if defined(__CUDA)
+       ! the batched device routine when it applies (k-points, norm-conserving, collinear, one band group)
+       IF ( use_gpu .AND. exx_stress_fast_path() ) CALL exx_stress_gpu( exx_stress, on_device )
+#endif
+       IF ( .NOT. on_device ) THEN
+          CALL exxbuff_sync_host()
+          exx_stress = exx_stress_bp() 
+       ENDIF
     END IF
     !
     CALL stop_clock( 'exx_stress' )
