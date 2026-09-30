@@ -153,8 +153,6 @@ SUBROUTINE setup()
         IF ( lmd .OR. lbfgs ) THEN     ! relax and md run on the device force pass; vc-relax still needs the stress
            IF ( lmovecell ) CALL errore &
               ('setup','stress for hybrid functionals + US/PAW not implemented (vc-relax)',1)
-           IF ( .NOT. exx_us_forces_available() ) CALL errore &
-              ('setup','forces for hybrid functionals + US/PAW not implemented',1)
         ENDIF
         IF ( noncolin ) CALL errore &
            ('setup','Noncolinear hybrid XC for USPP not implemented',1)
@@ -740,6 +738,10 @@ SUBROUTINE setup()
           & // ' not allowed for hybrid functionals',1)
      IF ( tstress .and. npool > 1 )  CALL errore('setup', &
          'stress for hybrid functionals not available with pools', 1)
+     ! the US/PAW exchange forces need the device force pass, whose layout
+     ! conditions (one process per pool, one band group) are known only now
+     IF ( okvan .AND. ( lmd .OR. lbfgs ) .AND. .NOT. exx_us_forces_available() ) &
+        CALL errore('setup','forces for hybrid functionals + US/PAW not implemented',1)
      !!!IF ( tstress )  CALL errore('setup', &
      !!!    'stress for hybrid functionals not available', 1)
      !
