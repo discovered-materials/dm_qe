@@ -126,6 +126,9 @@ MODULE exx_base
 #if defined(__CUDA)
   attributes(DEVICE) :: exxbuff_d
 #endif
+  LOGICAL :: exxbuff_host_stale = .FALSE.
+  !! the host copy of exxbuff is behind the device copy (exxinit filled the buffer on
+  !! the device); host readers call exxbuff_sync_host() before touching exxbuff
   !
 #if defined(__USE_INTEL_HBM_DIRECTIVES)
 !DIR$ ATTRIBUTES FASTMEM :: exxbuff
@@ -175,6 +178,47 @@ MODULE exx_base
   !! ending buffer index used in bgrp parallelization
   !
  CONTAINS
+  !
+  !------------------------------------------------------------------------
+  SUBROUTINE exxbuff_to_device()
+    !------------------------------------------------------------------------
+    !! Copy the host orbital buffer to its device mirror. Called once after each
+    !! host-side write of exxbuff (the exxinit fill, the EXX restart read, the
+    !! band-group shifts, orbital localization), so that vexx_bp_*_gpu can use
+    !! the resident device copy instead of re-uploading the whole buffer at
+    !! every call.
+    !
+    USE control_flags, ONLY : use_gpu
+    !
+    IMPLICIT NONE
+    !
+    ! (exxbuff_d is a plain host array in a build without CUDA and is never
+    !  allocated there, so this is a no-op outside GPU runs)
+    !
+    IF ( use_gpu .AND. ALLOCATED(exxbuff) .AND. ALLOCATED(exxbuff_d) ) exxbuff_d = exxbuff
+    exxbuff_host_stale = .FALSE.
+    !
+  END SUBROUTINE exxbuff_to_device
+  !
+  !------------------------------------------------------------------------
+  SUBROUTINE exxbuff_sync_host()
+    !------------------------------------------------------------------------
+    !! Bring the host copy of exxbuff up to date with the device copy when
+    !! exxinit filled the buffer on the device (a no-op otherwise, and in a
+    !! build without CUDA).
+    !
+    USE control_flags, ONLY : use_gpu
+    !
+    IMPLICIT NONE
+    !
+    IF ( use_gpu .AND. exxbuff_host_stale .AND. ALLOCATED(exxbuff) .AND. ALLOCATED(exxbuff_d) ) THEN
+       CALL start_clock( 'exxbuff_d2h' )
+       exxbuff = exxbuff_d
+       CALL stop_clock( 'exxbuff_d2h' )
+    ENDIF
+    exxbuff_host_stale = .FALSE.
+    !
+  END SUBROUTINE exxbuff_sync_host
   !
   !------------------------------------------------------------------------
   SUBROUTINE exx_mp_init()

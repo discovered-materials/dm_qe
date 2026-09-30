@@ -116,7 +116,14 @@ MODULE exx_bp_utils
           ALLOCATE( igk_exx( npwx, nks ) )
           igk_exx = igk_k
        END IF
-       IF(use_gpu .and. ( .not. allocated(igk_exx_d) ) ) THEN
+       IF (use_gpu) THEN
+          !
+          ! after reset_exx (final scf of a vc-relax, every ionic step with
+          ! treinit_gvecs) the host map is rebuilt from the new cell: the
+          ! device copy must follow it, or every device scatter through
+          ! igk_exx_d reads stale, and possibly out-of-range, indices
+          !
+          IF ( ALLOCATED(igk_exx_d) ) DEALLOCATE( igk_exx_d )
           ALLOCATE( igk_exx_d, source=igk_exx )
        END IF
 
@@ -1186,7 +1193,10 @@ MODULE exx_bp_utils
        END IF
        DEALLOCATE( work_space )
 
-       IF(use_gpu) ALLOCATE(igk_exx_d, source=igk_exx)
+       IF (use_gpu) THEN
+          IF ( ALLOCATED(igk_exx_d) ) DEALLOCATE( igk_exx_d )
+          ALLOCATE( igk_exx_d, source=igk_exx )
+       END IF
 
     END IF
     !
