@@ -13,7 +13,34 @@
 SUBROUTINE laxlib_cdiaghg( n, m, h, s, ldh, e, v, me_bgrp, root_bgrp, intra_bgrp_comm )
   !----------------------------------------------------------------------------
   !
-  !! Called by diaghg interface.
+  !! Called by diaghg interface: runs laxlib_cdiaghg_body under the 'cdiaghg' clock.
+  !! P21: the clock wrapper and the solver body are separate routines so that the host
+  !! fallback of laxlib_cdiaghg_gpu (P8) can run the body under its own 'cdiaghg' clock,
+  !! which is already running: one clock call per solve, no nested start/stop of a label.
+  !
+  IMPLICIT NONE
+  include 'laxlib_kinds.fh'
+  !
+  INTEGER, INTENT(IN) :: n, m, ldh
+  COMPLEX(DP), INTENT(INOUT) :: h(ldh,n), s(ldh,n)
+  REAL(DP), INTENT(OUT) :: e(n)
+  COMPLEX(DP), INTENT(OUT) :: v(ldh,m)
+  INTEGER, INTENT(IN) :: me_bgrp, root_bgrp, intra_bgrp_comm
+  !
+  CALL start_clock( 'cdiaghg' )
+  CALL laxlib_cdiaghg_body( n, m, h, s, ldh, e, v, me_bgrp, root_bgrp, intra_bgrp_comm )
+  CALL stop_clock( 'cdiaghg' )
+  !
+  RETURN
+  !
+END SUBROUTINE laxlib_cdiaghg
+!
+!----------------------------------------------------------------------------
+SUBROUTINE laxlib_cdiaghg_body( n, m, h, s, ldh, e, v, me_bgrp, root_bgrp, intra_bgrp_comm )
+  !----------------------------------------------------------------------------
+  !
+  !! The LAPACK solver of laxlib_cdiaghg without its clock (P21): called by laxlib_cdiaghg
+  !! and by the host fallback of laxlib_cdiaghg_gpu (P8); the caller owns the 'cdiaghg' clock.
   !! Calculates eigenvalues and eigenvectors of the generalized problem.
   !! Solve Hv = eSv, with H symmetric matrix, S overlap matrix.
   !! complex matrices version.
@@ -59,8 +86,6 @@ SUBROUTINE laxlib_cdiaghg( n, m, h, s, ldh, e, v, me_bgrp, root_bgrp, intra_bgrp
   INTEGER,  EXTERNAL       :: ILAENV
     ! ILAENV returns optimal block size "nb"
   !
-  !
-  CALL start_clock( 'cdiaghg' )
   !
   ! ... only the first processor diagonalizes the matrix
   !
@@ -198,11 +223,9 @@ SUBROUTINE laxlib_cdiaghg( n, m, h, s, ldh, e, v, me_bgrp, root_bgrp, intra_bgrp
         CALL lax_error__( 'cdiaghg', 'error broadcasting array v', ABS( info ) )
 #endif
   !
-  CALL stop_clock( 'cdiaghg' )
-  !
   RETURN
   !
-END SUBROUTINE laxlib_cdiaghg
+END SUBROUTINE laxlib_cdiaghg_body
 !
 !----------------------------------------------------------------------------
 SUBROUTINE laxlib_cdiaghg_gpu( n, m, h_d, s_d, ldh, e_d, v_d, me_bgrp, root_bgrp, intra_bgrp_comm)
@@ -300,11 +323,33 @@ SUBROUTINE laxlib_cdiaghg_gpu( n, m, h_d, s_d, ldh, e_d, v_d, me_bgrp, root_bgrp
 #endif
   INTEGER :: i, j
 #undef VARTYPE
+#if defined(__CUDA)
+  INTEGER, EXTERNAL :: lax_cdiaghg_host_n
+  LOGICAL, SAVE :: host_banner = .FALSE.
+  LOGICAL, SAVE :: env_note = .FALSE.
+#endif
   !
   !
   !
   !
   CALL start_clock( 'cdiaghg' )
+#if defined(__CUDA)
+  IF ( me_bgrp == root_bgrp .AND. .NOT. env_note ) THEN   ! a rejected LAX_CDIAGHG_HOST_N is reported once
+     env_note = .TRUE.
+     CALL lax_cdiaghg_host_n_note()
+  ENDIF
+  ! small problems go to LAPACK on the host (cuSOLVER latency dominates below ~64)
+  IF ( n <= lax_cdiaghg_host_n() ) THEN
+     IF ( me_bgrp == root_bgrp .AND. .NOT. host_banner ) THEN
+        host_banner = .TRUE.
+        WRITE( *, '(5X,"LAX-GPU: cdiaghg subspace problems with n <= ",I0," solved by host LAPACK; first n = ",I0)' ) &
+             lax_cdiaghg_host_n(), n
+     ENDIF
+     CALL laxlib_cdiaghg_small_host( n, m, h_d, s_d, ldh, e_d, v_d, me_bgrp, root_bgrp, intra_bgrp_comm )
+     CALL stop_clock( 'cdiaghg' )   ! one clock call per solve, the host round trip included
+     RETURN
+  ENDIF
+#endif
   !
   ! ... only the first processor diagonalizes the matrix
   !
@@ -425,6 +470,95 @@ SUBROUTINE laxlib_cdiaghg_gpu( n, m, h_d, s_d, ldh, e_d, v_d, me_bgrp, root_bgrp
   RETURN
   !
 END SUBROUTINE laxlib_cdiaghg_gpu
+
+#if defined(__CUDA)
+!----------------------------------------------------------------------------
+INTEGER FUNCTION lax_cdiaghg_host_n()
+  !----------------------------------------------------------------------------
+  !! P8: largest subspace dimension solved on the host. Default 64 with one OpenMP thread (the host
+  !! LAPACK is then ~3x faster than cuSOLVER for these sizes), 0 with more threads (their spinning
+  !! makes the host solve slower than cuSOLVER); LAX_CDIAGHG_HOST_N overrides.
+#if defined(_OPENMP)
+  USE omp_lib, ONLY : omp_get_max_threads
+#endif
+  IMPLICIT NONE
+  INTEGER, SAVE :: nmax = -1
+  CHARACTER(LEN=16) :: val
+  INTEGER :: lenv, stat, ios
+  LOGICAL, EXTERNAL :: lax_cdiaghg_host_n_ok   ! P14
+  IF ( nmax < 0 ) THEN
+     nmax = 64
+#if defined(_OPENMP)
+     IF ( omp_get_max_threads() > 1 ) nmax = 0
+#endif
+     CALL GET_ENVIRONMENT_VARIABLE( 'LAX_CDIAGHG_HOST_N', val, lenv, stat )
+     IF ( stat == 0 .AND. lenv > 0 ) THEN
+        ios = 0
+        IF ( lax_cdiaghg_host_n_ok( val ) ) THEN
+           READ( val, *, IOSTAT=ios ) nmax
+        ELSE
+           ios = 1                                   ! P14: not a non-negative whole number
+        ENDIF
+        IF ( ios /= 0 .OR. nmax < 0 ) nmax = 0
+     ENDIF
+  ENDIF
+  lax_cdiaghg_host_n = nmax
+END FUNCTION lax_cdiaghg_host_n
+!
+!----------------------------------------------------------------------------
+LOGICAL FUNCTION lax_cdiaghg_host_n_ok( val )
+  !----------------------------------------------------------------------------
+  !! P14: the value is a non-negative whole number (digits with blanks around)
+  IMPLICIT NONE
+  CHARACTER(LEN=*), INTENT(IN) :: val
+  CHARACTER(LEN=LEN(val)) :: t
+  INTEGER :: i, n
+  t = ADJUSTL( val )
+  n = LEN_TRIM( t )
+  lax_cdiaghg_host_n_ok = ( n > 0 )
+  DO i = 1, n
+     IF ( t(i:i) < '0' .OR. t(i:i) > '9' ) lax_cdiaghg_host_n_ok = .FALSE.
+  ENDDO
+END FUNCTION lax_cdiaghg_host_n_ok
+!
+!----------------------------------------------------------------------------
+SUBROUTINE lax_cdiaghg_host_n_note()
+  !----------------------------------------------------------------------------
+  !! P14: one line when LAX_CDIAGHG_HOST_N is set to something that is not a non-negative whole number
+  !! (the host solve is then off, which used to happen silently)
+  IMPLICIT NONE
+  CHARACTER(LEN=16) :: val
+  INTEGER :: lenv, stat
+  LOGICAL, EXTERNAL :: lax_cdiaghg_host_n_ok
+  CALL GET_ENVIRONMENT_VARIABLE( 'LAX_CDIAGHG_HOST_N', val, lenv, stat )
+  IF ( stat /= 0 .OR. lenv == 0 ) RETURN
+  IF ( .NOT. lax_cdiaghg_host_n_ok( val ) ) WRITE( *, &
+       '(5X,"LAX-GPU: LAX_CDIAGHG_HOST_N=",A," is not a non-negative whole number: host solve disabled")' ) TRIM(val)
+END SUBROUTINE lax_cdiaghg_host_n_note
+!
+!----------------------------------------------------------------------------
+SUBROUTINE laxlib_cdiaghg_small_host( n, m, h_d, s_d, ldh, e_d, v_d, me_bgrp, root_bgrp, intra_bgrp_comm )
+  !----------------------------------------------------------------------------
+  !! P8: device -> host, LAPACK generalized eigensolver (laxlib_cdiaghg_body), host -> device.
+  !! P21: the body, not the clocked wrapper: the caller's 'cdiaghg' clock is running.
+  IMPLICIT NONE
+  include 'laxlib_kinds.fh'
+  INTEGER, INTENT(IN) :: n, m, ldh, me_bgrp, root_bgrp, intra_bgrp_comm
+  COMPLEX(DP), INTENT(INOUT) :: h_d(ldh,n), s_d(ldh,n)
+  REAL(DP), INTENT(OUT) :: e_d(n)
+  COMPLEX(DP), INTENT(OUT) :: v_d(ldh,n)
+  ATTRIBUTES(DEVICE) :: h_d, s_d, e_d, v_d
+  COMPLEX(DP), ALLOCATABLE :: h(:,:), s(:,:), v(:,:)
+  REAL(DP), ALLOCATABLE :: e(:)
+  ALLOCATE( h(ldh,n), s(ldh,n), v(ldh,m), e(n) )
+  h = h_d
+  s = s_d
+  CALL laxlib_cdiaghg_body( n, m, h, s, ldh, e, v, me_bgrp, root_bgrp, intra_bgrp_comm )
+  e_d(1:n) = e(1:n)
+  v_d(1:ldh,1:m) = v(1:ldh,1:m)
+  DEALLOCATE( h, s, v, e )
+END SUBROUTINE laxlib_cdiaghg_small_host
+#endif
 !
 !----------------------------------------------------------------------------
 !----------------------------------------------------------------------------
