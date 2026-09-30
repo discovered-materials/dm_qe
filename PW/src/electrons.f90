@@ -45,6 +45,7 @@ SUBROUTINE electrons()
   USE paw_symmetry,         ONLY : PAW_symmetrize_ddd
   USE ions_base,            ONLY : nat
   USE exx_base,             ONLY : exxbuff_to_device, exxbuff_sync_host
+  USE exx_bp,               ONLY : exx_dexx_current
   USE loc_scdm,             ONLY : use_scdm, localize_orbitals
   USE loc_scdm_k,           ONLY : localize_orbitals_k
   !
@@ -298,6 +299,7 @@ SUBROUTINE electrons()
            !        & or ecutfock may be too low', 1 )
            !ENDIF
         ENDIF
+        exx_dexx_current = dexx
         !
         !   remove the estimate exchange energy exxen used in the inner SCF
         !
