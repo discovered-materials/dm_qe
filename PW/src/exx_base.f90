@@ -177,6 +177,26 @@ MODULE exx_base
  CONTAINS
   !
   !------------------------------------------------------------------------
+  SUBROUTINE exxbuff_to_device()
+    !------------------------------------------------------------------------
+    !! Copy the host orbital buffer to its device mirror. Called once after each
+    !! host-side write of exxbuff (the exxinit fill, the EXX restart read, the
+    !! band-group shifts, orbital localization), so that vexx_bp_*_gpu can use
+    !! the resident device copy instead of re-uploading the whole buffer at
+    !! every call.
+    !
+    USE control_flags, ONLY : use_gpu
+    !
+    IMPLICIT NONE
+    !
+    ! (exxbuff_d is a plain host array in a build without CUDA and is never
+    !  allocated there, so this is a no-op outside GPU runs)
+    !
+    IF ( use_gpu .AND. ALLOCATED(exxbuff) .AND. ALLOCATED(exxbuff_d) ) exxbuff_d = exxbuff
+    !
+  END SUBROUTINE exxbuff_to_device
+  !
+  !------------------------------------------------------------------------
   SUBROUTINE exx_mp_init()
     !------------------------------------------------------------------------
     !! 1) Setup the orthopool communicators, which include the (n-1)-th CPU of

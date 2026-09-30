@@ -144,6 +144,7 @@ SUBROUTINE localize_orbitals_k( )
   !
   USE noncollin_module,     ONLY : npol
   USE exx,                  ONLY : x_occupation
+  USE exx_base,             ONLY : exxbuff_to_device
   USE klist,                ONLY : nks
   USE wvfct,                ONLY : nbnd
   USE mp_bands,             ONLY : me_bgrp
@@ -246,6 +247,8 @@ SUBROUTINE localize_orbitals_k( )
   ! IF (me_bgrp == 0) THEN
   !   CALL AbsOv_histogram_k( NBands, 'hist2.dat' )
   ! ENDIF
+  !
+  CALL exxbuff_to_device()
   !
 END SUBROUTINE localize_orbitals_k
 !

@@ -9,7 +9,7 @@ MODULE exx_bp
   !
   USE kinds,                ONLY : DP
   USE control_flags,        ONLY : gamma_only, use_gpu, many_fft, tqr
-  USE exx_base,             ONLY : dfftt , exxbuff, exxbuff_d, npwt, x_nbnd_occ, &
+  USE exx_base,             ONLY : dfftt , exxbuff, exxbuff_d, exxbuff_to_device, npwt, x_nbnd_occ, &
                                    gt, ggt, gcutmt, gkcut, gstart_t, ngmt_g, &
                                    eps_occ, exxalfa, x_occupation, x_occupation_d, &
                                    ibnd_start, ibnd_end, ibnd_buff_start, ibnd_buff_end
@@ -499,6 +499,13 @@ MODULE exx_bp
          CALL mp_bcast( exxbuff(:,:,ikq), working_pool(ikq), intra_orthopool_comm ) 
        ENDDO
     ENDIF
+    !
+    !
+    ! the device copy of the orbital buffer is refreshed here, once per exxinit,
+    ! and after every later host-side write (restart read, band-group shift,
+    ! localization); the GPU vexx routines use it as it is
+    !
+    CALL exxbuff_to_device()
     !
     CALL change_data_structure( .FALSE. )
     !
@@ -1019,9 +1026,6 @@ MODULE exx_bp
     dfftt__nl=>dfftt%nl_d
     dfftt__nlm=>dfftt%nlm_d
     ALLOCATE(psi_d, source=psi)
-    !
-    !initial copy of exxbuff
-    exxbuff_d = exxbuff
     !
     ialloc = nibands(my_egrp_id+1)
     !
@@ -1903,9 +1907,6 @@ MODULE exx_bp
     ALLOCATE( hpsi_d, source=hpsi )
     ALLOCATE( facb_d(nrxxs) )
 
-    !initial copy of exxbuff
-    exxbuff_d = exxbuff
-    !
     IF (noncolin) THEN
        ALLOCATE( result_nc_d(nrxxs,npol,ialloc) )
 
@@ -2170,7 +2171,7 @@ end associate
           ! get the next nbnd/negrp data
           IF (negrp>1) THEN
              call mp_circular_shift_left( exxbuff(:,:,ikq), me_egrp, inter_egrp_comm )
-             exxbuff_d = exxbuff
+             exxbuff_d(:,:,ikq) = exxbuff(:,:,ikq)
           ENDIF
           !
        END DO !iegrp
