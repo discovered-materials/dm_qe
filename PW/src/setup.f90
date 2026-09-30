@@ -67,7 +67,7 @@ SUBROUTINE setup()
                                  isolve, niter, noinv, ts_vdw, tstress, &
                                  lbands, gamma_only, restart, use_spinflip, symm_by_label
   USE diag_direct,        ONLY : diag_direct_check_compat
-  USE cellmd,             ONLY : calc
+  USE cellmd,             ONLY : calc, lmovecell
   USE upf_ions,           ONLY : n_atom_wfc
   USE uspp_param,         ONLY : upf
   USE uspp,               ONLY : okvan
@@ -88,6 +88,7 @@ SUBROUTINE setup()
   USE qes_libs_module,    ONLY : qes_reset
   USE qes_types_module,   ONLY : output_type
   USE exx,                ONLY : ecutfock
+  USE exx_bp,             ONLY : exx_us_forces_available
   USE xc_lib,             ONLY : xclib_dft_is
   USE paw_variables,      ONLY : okpaw
   USE extfield,           ONLY : gate
@@ -149,8 +150,12 @@ SUBROUTINE setup()
            CALL infomsg ('setup', &
                     'Warning: ecutfock not valid for US/PAW, ignored')
         END IF
-        IF ( lmd .OR. lbfgs ) CALL errore &
-           ('setup','forces for hybrid functionals + US/PAW not implemented',1)
+        IF ( lmd .OR. lbfgs ) THEN     ! relax and md run on the device force pass; vc-relax still needs the stress
+           IF ( lmovecell ) CALL errore &
+              ('setup','stress for hybrid functionals + US/PAW not implemented (vc-relax)',1)
+           IF ( .NOT. exx_us_forces_available() ) CALL errore &
+              ('setup','forces for hybrid functionals + US/PAW not implemented',1)
+        ENDIF
         IF ( noncolin ) CALL errore &
            ('setup','Noncolinear hybrid XC for USPP not implemented',1)
      END IF

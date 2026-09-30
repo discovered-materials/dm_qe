@@ -43,6 +43,8 @@ SUBROUTINE forces()
   USE bp,                ONLY : lelfield, gdir, l3dstring, efield_cart, &
                                 efield_cry,efield
   USE uspp,              ONLY : okvan
+  USE exx_bp,            ONLY : exx_force_us, exx_us_forces_done
+  USE xc_lib,            ONLY : xclib_dft_is
   USE martyna_tuckerman, ONLY : do_comp_mt, wg_corr_force
   USE london_module,     ONLY : force_london
   USE dftd3_api,         ONLY : get_atomic_number
@@ -91,6 +93,7 @@ SUBROUTINE forces()
   REAL(DP) :: sumscf, sum_mm
   REAL(DP), PARAMETER :: eps = 1.e-12_dp
   INTEGER  :: ipol, na
+  REAL(DP), ALLOCATABLE :: forceexx(:,:)
   ! counter on polarization
   ! counter on atoms
   !
@@ -119,6 +122,8 @@ SUBROUTINE forces()
   ALLOCATE( forcenl(3,nat), forcelc(3,nat), forcecc(3,nat), &
             forceh(3,nat), forceion(3,nat), forcescc(3,nat) )
   !    
+  ALLOCATE( forceexx(3,nat) )
+  forceexx(:,:) = 0.D0
   forcescc(:,:) = 0.D0
   forceh(:,:)   = 0.D0
   !
@@ -127,6 +132,15 @@ SUBROUTINE forces()
   call start_clock('frc_us')
   CALL force_us( forcenl )
   call stop_clock('frc_us')
+  !
+  ! ... the explicit position dependence of the exact-exchange energy through the ultrasoft / PAW
+  !     augmentation charges and projectors (zero for norm-conserving pseudopotentials)
+  !
+  IF ( okvan .AND. xclib_dft_is('hybrid') ) THEN
+     CALL start_clock( 'frc_exx' )
+     CALL exx_force_us( forceexx )
+     CALL stop_clock( 'frc_exx' )
+  ENDIF
   !
   ! ... The local contribution
   !
@@ -266,7 +280,8 @@ SUBROUTINE forces()
                          forcelc(ipol,na)  + &
                          forcecc(ipol,na)  + &
                          forceh(ipol,na)   + &
-                         forcescc(ipol,na)
+                         forcescc(ipol,na) + &
+                         forceexx(ipol,na)
         !
         IF ( llondon )  force(ipol,na) = force(ipol,na) + force_disp(ipol,na)
         IF ( ldftd3 )   force(ipol,na) = force(ipol,na) + force_d3(ipol,na)
@@ -365,6 +380,12 @@ SUBROUTINE forces()
      DO na = 1, nat
         WRITE( stdout, 9035) na, ityp(na), ( forcenl(ipol,na), ipol = 1, 3 )
      ENDDO
+     IF ( okvan .AND. xclib_dft_is('hybrid') .AND. exx_us_forces_done ) THEN
+        WRITE( stdout, '(5x,"The exact-exchange US/PAW contrib. to forces")')
+        DO na = 1, nat
+           WRITE( stdout, 9035) na, ityp(na), ( forceexx(ipol,na), ipol = 1, 3 )
+        ENDDO
+     ENDIF
      WRITE( stdout, '(5x,"The ionic contribution  to forces")')
      DO na = 1, nat
         WRITE( stdout, 9035) na, ityp(na), ( forceion(ipol,na), ipol = 1, 3 )
@@ -506,6 +527,7 @@ SUBROUTINE forces()
   END IF
   !
   DEALLOCATE( forcenl, forcelc, forcecc, forceh, forceion, forcescc )
+  DEALLOCATE( forceexx )
   IF ( llondon  ) DEALLOCATE( force_disp       )
   IF ( ldftd3   ) DEALLOCATE( force_d3         )
   IF ( lxdm     ) DEALLOCATE( force_disp_xdm   ) 

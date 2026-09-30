@@ -40,6 +40,10 @@ MODULE exx_bp
   REAL(DP) :: exx_dexx_current = 1.0_DP
   !! the exchange energy change of the last outer step (dexx of module exx, which cannot be
   !! imported here), for the adaptive single-precision mode of the batched operator
+  LOGICAL :: p20_force_mode = .FALSE.
+  !! the batched operator runs in force mode (exx_force_us)
+  LOGICAL :: exx_us_forces_done = .FALSE.
+  !! forces.f90 prints the exact-exchange US/PAW term only when it was computed
   LOGICAL :: p15_fast_disabled = .FALSE.   ! P15: the fast path's device work arrays did not fit; original path from then on
 #if defined(__CUDA)
   ! P6: persistent state of the batched fast path (vexx_k_gpu_fast)
@@ -71,8 +75,6 @@ MODULE exx_bp
   REAL(DP), ALLOCATABLE, DEVICE :: p18_qc_coef_d(:,:)   ! the (-i)^l ap(lp,ivl,jvl) of every pair column (qvan2.f90)
   ! P20: exact-exchange forces of ultrasoft / PAW runs: the fast path runs in force mode and leaves the exchange
   ! D matrix of every band and the structure-factor term of every (atom, ij) pair behind
-  LOGICAL :: p20_force_mode = .FALSE.
-  LOGICAL :: exx_us_forces_done = .FALSE.   ! P20: forces.f90 prints the term only when it was computed
   REAL(DP) :: p20_ex = 0.0_DP, p20_tpiba = 0.0_DP
   REAL(DP), ALLOCATABLE :: p20_wg_h(:)
   REAL(DP), ALLOCATABLE, DEVICE :: p20_fa_d(:,:), p20_xkq_d(:,:), p20_gt_d(:,:), p20_wg_d(:)
@@ -5417,5 +5419,213 @@ end associate
     !
   END SUBROUTINE exx_stress_gpu
 #endif
+  !
+  LOGICAL FUNCTION exx_us_forces_available()
+  !-----------------------------------------------------------------------
+    !! P20: the exact-exchange forces of an ultrasoft / PAW hybrid run come from the device force pass, which needs
+    !! the batched path (GPU build, k-points, collinear, G-space augmentation); setup lets relax / md through when true
+    USE control_flags,    ONLY : gamma_only, tqr
+    USE noncollin_module, ONLY : noncolin
+    USE mp_pools,         ONLY : nproc_pool
+    USE mp_bands,         ONLY : nbgrp
+    IMPLICIT NONE
+    LOGICAL, EXTERNAL :: check_gpu_support   ! setup.f90; use_gpu itself is set in setup_para, after setup's guard
+    exx_us_forces_available = .FALSE.
+#if defined(__CUDA)
+    exx_us_forces_available = check_gpu_support() .AND. (.NOT. gamma_only) .AND. (.NOT. noncolin) .AND. (.NOT. tqr) &
+                              .AND. ( nproc_pool == 1 ) .AND. ( nbgrp == 1 )
+#endif
+  END FUNCTION exx_us_forces_available
+  !
+  LOGICAL FUNCTION exx_force_path_ok()
+    !! P20: can the force pass run now? The structural conditions of exx_us_forces_available plus the run-time state
+    !! of the batched path (device memory, exxinit done). QE_EXX_FAST switches vexx only: the force pass has no other
+    !! implementation, so it runs whatever that switch says.
+    USE mp_exx, ONLY : negrp
+    IMPLICIT NONE
+#if defined(__CUDA)
+    exx_force_path_ok = exx_us_forces_available() .AND. (.NOT. p15_fast_disabled) .AND. (x_nbnd_occ > 0) .AND. (negrp == 1) &
+                        .AND. (dfftt%nproc == 1) .AND. (dfftt%nr1x == dfftt%nr1) .AND. (dfftt%nr2x == dfftt%nr2) &
+                        .AND. (dfftt%nr3x == dfftt%nr3) .AND. (dfftt%nnr == dfftt%nr1*dfftt%nr2*dfftt%nr3)
+#else
+    exx_force_path_ok = .FALSE.
+#endif
+  END FUNCTION exx_force_path_ok
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE exx_force_us( forcex )
+  !-----------------------------------------------------------------------
+    !! P20: the forces from the explicit position dependence of the exact-exchange energy of an ultrasoft / PAW
+    !! run (augmentation charges and projectors in the pair densities; zero for norm-conserving pseudopotentials).
+    !! For every k-point of this pool: <beta|psi> and <d beta/d tau_alpha|psi> of the converged occupied bands, then
+    !! the batched fast path in force mode (exx_force_main_us) leaves the structure-factor term of every (atom, ij)
+    !! pair and the exchange D matrix of every band; the projector term is 2 alpha_x w_i Re[conj(<d beta|psi_i>) D_i]
+    !! (the factor 2 stands for the derivative through the other orbital of each pair, see the patch header).
+    USE ions_base,        ONLY : nat, ityp
+    USE cell_base,        ONLY : tpiba
+    USE klist,            ONLY : nks, nkstot, ngk, igk_k, xk
+    USE wvfct,            ONLY : npwx, wg, current_k
+    USE wavefunctions,    ONLY : evc
+    USE buffers,          ONLY : get_buffer
+    USE io_files,         ONLY : iunwfc, nwordwfc
+    USE uspp,             ONLY : nkb, vkb, okvan, ofsbeta
+    USE uspp_param,       ONLY : nh, upf
+    USE uspp_init,        ONLY : init_us_2
+    USE becmod,           ONLY : bec_type, calbec, allocate_bec_type, deallocate_bec_type
+    USE gvect,            ONLY : g
+    USE exx_base,         ONLY : nqs, index_xkq, xkq_collect
+    USE mp_exx,           ONLY : max_ibands
+    USE mp_pools,         ONLY : inter_pool_comm
+    USE mp,               ONLY : mp_sum
+    USE symme,            ONLY : symvector
+    USE io_global,        ONLY : stdout
+    USE noncollin_module, ONLY : npol
+    USE control_flags,    ONLY : lbfgs, lmd
+    USE xc_lib,           ONLY : exx_is_active
+    IMPLICIT NONE
+    REAL(DP), INTENT(OUT) :: forcex(3,nat)
+#if defined(__CUDA)
+    INTEGER, EXTERNAL :: global_kpoint_index
+    TYPE(bec_type) :: becpsi, dbec(3)
+    COMPLEX(DP), ALLOCATABLE :: vkb1(:,:), hdum(:,:), deexx_h(:,:)
+    REAL(DP), ALLOCATABLE :: fa_h(:,:), xkq_h(:,:)
+    INTEGER :: ik, ipol, ig, ikb, m, npw, current_ik, iq, ia, na, nt, ih, ibnd, ngmt, k_save
+    REAL(DP) :: wi
+    LOGICAL :: ok, okall
+    INTEGER :: nfail
+    !
+    forcex = 0.0_DP
+    exx_us_forces_done = .FALSE.
+    IF ( .NOT. okvan ) RETURN
+    IF ( .NOT. exx_is_active() ) THEN
+       CALL infomsg( 'exx_force_us', 'exact exchange not active: no exchange force term (P20)' )
+       RETURN
+    ENDIF
+    IF ( .NOT. exx_force_path_ok() ) THEN
+       IF ( lbfgs .OR. lmd ) THEN
+          IF ( p15_fast_disabled ) CALL errore( 'exx_force_us', &
+             'the exact-exchange forces of a US/PAW run need the batched device path, which this run left for lack of device memory; the term has no host implementation (P20)', 1 )
+          CALL errore( 'exx_force_us', &
+             'the exact-exchange forces of a US/PAW run need the batched device path (k-points, collinear, one band group, serial FFT grid, G-space augmentation) (P20)', 1 )
+       ENDIF
+       CALL infomsg( 'exx_force_us', 'exact-exchange forces of a US/PAW run not available on this path: the printed forces lack that term (P20)' )
+       RETURN
+    ENDIF
+    CALL start_clock( 'exx_force' )
+    okall = .TRUE.
+    m = x_nbnd_occ
+    ngmt = dfftt%ngm
+    k_save = current_k
+    CALL allocate_bec_type( nkb, m, becpsi )
+    DO ipol = 1, 3
+       CALL allocate_bec_type( nkb, m, dbec(ipol) )
+    ENDDO
+    ALLOCATE( vkb1(npwx,nkb), hdum(npwx*npol,max_ibands), deexx_h(nkb,m), xkq_h(3,nqs) )
+    IF ( ALLOCATED(p20_wg_h) ) DEALLOCATE( p20_wg_h )
+    ALLOCATE( p20_wg_h(m) )
+    IF ( ALLOCATED(p20_wg_d) ) DEALLOCATE( p20_wg_d )
+    ALLOCATE( p20_wg_d(m) )
+    IF ( ALLOCATED(p20_xkq_d) ) DEALLOCATE( p20_xkq_d )
+    ALLOCATE( p20_xkq_d(3,nqs) )
+    IF ( ALLOCATED(p20_gt_d) ) DEALLOCATE( p20_gt_d )
+    ALLOCATE( p20_gt_d(3,ngmt) )
+    p20_gt_d = gt(1:3,1:ngmt)
+    p20_tpiba = tpiba
+    p20_ex = 0.0_DP
+    hdum = ( 0.0_DP, 0.0_DP )
+    !
+    DO ik = 1, nks
+       npw = ngk(ik)
+       current_k = ik
+       current_ik = global_kpoint_index( nkstot, ik )
+       IF ( nks > 1 ) CALL get_buffer( evc, nwordwfc, iunwfc, ik )
+       ! <beta|psi> and its derivative: d vkb / d tau_alpha = -i tpiba (k+G)_alpha vkb (vkb carries e^{-i(k+G).tau})
+       CALL init_us_2( npw, igk_k(1,ik), xk(:,ik), vkb )
+       CALL calbec( npw, vkb, evc, becpsi, m )
+       DO ipol = 1, 3
+          vkb1 = ( 0.0_DP, 0.0_DP )
+          DO ikb = 1, nkb
+             DO ig = 1, npw
+                vkb1(ig,ikb) = vkb(ig,ikb) * CMPLX( 0.0_DP, -tpiba * ( xk(ipol,ik) + g(ipol,igk_k(ig,ik)) ), KIND=DP )
+             ENDDO
+          ENDDO
+          CALL calbec( npw, vkb1, evc, dbec(ipol), m )
+       ENDDO
+       DO iq = 1, nqs
+          xkq_h(:,iq) = xkq_collect(:,index_xkq(current_ik,iq))
+       ENDDO
+       p20_xkq_d = xkq_h
+       p20_wg_h(1:m) = wg(1:m,ik)
+       p20_wg_d = p20_wg_h
+       ! the fast path in force mode: pair densities, D matrix, structure-factor term
+       p20_force_mode = .TRUE.
+       CALL vexx_bp_k_gpu_fast( npwx, npw, m, evc, hdum, ok, becpsi )
+       p20_force_mode = .FALSE.
+       IF ( .NOT. ok ) THEN
+          okall = .FALSE.
+          EXIT
+       ENDIF
+       ! ... structure-factor term: (atom, ij) pair columns into the atoms
+       ALLOCATE( fa_h(3,p18_na) )
+       fa_h = p20_fa_d
+       DO ia = 1, p18_na
+          forcex(:,p18_aat_h(ia)) = forcex(:,p18_aat_h(ia)) + fa_h(:,ia)
+       ENDDO
+       DEALLOCATE( fa_h )
+       ! ... projector term: 2 alpha_x w_i Re[ conj(<d beta_m/d tau|psi_i>) D_m,i ]
+       deexx_h = p18_deexx_d
+       DO ibnd = 1, m
+          wi = wg(ibnd,ik)
+          IF ( wi == 0.0_DP ) CYCLE
+          DO na = 1, nat
+             nt = ityp(na)
+             IF ( .NOT. upf(nt)%tvanp ) CYCLE
+             DO ih = 1, nh(nt)
+                ikb = ofsbeta(na) + ih
+                DO ipol = 1, 3
+                   forcex(ipol,na) = forcex(ipol,na) + 2.0_DP * exxalfa * wi * &
+                                     DBLE( CONJG( dbec(ipol)%k(ikb,ibnd) ) * deexx_h(ikb,ibnd) )
+                ENDDO
+             ENDDO
+          ENDDO
+       ENDDO
+    ENDDO
+    current_k = k_save
+    nfail = MERGE( 0, 1, okall )
+    CALL mp_sum( nfail, inter_pool_comm )
+    IF ( nfail > 0 ) THEN
+       ! a device-memory refusal inside the pass: a relaxation cannot go on without the term, an scf prints its forces without it
+       forcex = 0.0_DP
+       IF ( lbfgs .OR. lmd ) CALL errore( 'exx_force_us', 'no room on the device for the exact-exchange forces (P20)', 1 )
+       CALL infomsg( 'exx_force_us', 'no room on the device for the exact-exchange forces: the printed forces lack that term (P20)' )
+    ELSE
+       CALL mp_sum( forcex, inter_pool_comm )
+       CALL mp_sum( p20_ex, inter_pool_comm )
+       ! the k sum ran over the irreducible wedge: symmetrise, as force_us and addusforce do for their terms
+       CALL symvector( nat, forcex )
+       exx_us_forces_done = .TRUE.
+       WRITE( stdout, '(5X,"EXX-GPU: exact-exchange forces of the ultrasoft/PAW run on the device (P20); exchange energy of the force pass ",F17.8," Ry")' ) p20_ex
+    ENDIF
+    CALL deallocate_bec_type( becpsi )
+    DO ipol = 1, 3
+       CALL deallocate_bec_type( dbec(ipol) )
+    ENDDO
+    DEALLOCATE( vkb1, hdum, deexx_h, xkq_h )
+    IF ( ALLOCATED(p20_vcg3_d) ) DEALLOCATE( p20_vcg3_d, p20_y3_d )
+    IF ( ALLOCATED(p20_dpb_d) ) DEALLOCATE( p20_dpb_d )
+    IF ( ALLOCATED(p20_fa_d) ) DEALLOCATE( p20_fa_d )
+    IF ( ALLOCATED(p20_xkq_d) ) DEALLOCATE( p20_xkq_d )
+    IF ( ALLOCATED(p20_gt_d) ) DEALLOCATE( p20_gt_d )
+    IF ( ALLOCATED(p20_wg_d) ) DEALLOCATE( p20_wg_d )
+    IF ( ALLOCATED(p20_wg_h) ) DEALLOCATE( p20_wg_h )
+    CALL stop_clock( 'exx_force' )
+#else
+    forcex = 0.0_DP
+    IF ( okvan ) CALL infomsg( 'exx_force_us', &
+       'exact-exchange forces with US/PAW are computed by the GPU build only (P20): the printed forces lack that term' )
+#endif
+  END SUBROUTINE exx_force_us
+  !
+  !
   !
 END MODULE exx_bp
