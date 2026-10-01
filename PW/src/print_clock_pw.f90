@@ -278,6 +278,7 @@ SUBROUTINE print_clock_pw()
    IF ( xclib_dft_is('hybrid') ) THEN
       WRITE( stdout, '(/,5X,"EXX routines")' )
       CALL print_clock( 'exx_grid' )
+      CALL print_clock( 'exx_ecut' )
       CALL print_clock( 'exxinit' )
       CALL print_clock( 'vexx' )
       CALL print_clock( 'matcalc' )

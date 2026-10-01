@@ -111,6 +111,9 @@ MODULE exx
     !
     IF ( exx_fft_initialized ) RETURN
     !
+    ! ... the cutoff of the Fock operator from the pair densities themselves, unless the input gives one
+    CALL exx_auto_cutoff()
+    !
     ! Initialise the custom grid that allows us to put the wavefunction
     ! onto the new (smaller) grid for \rho=\psi_{k+q}\psi^*_k and vice versa
     !
@@ -185,6 +188,220 @@ MODULE exx
     RETURN
     !
   END SUBROUTINE exx_fft_create
+  !
+  !------------------------------------------------------------------------
+  SUBROUTINE exx_auto_cutoff()
+    !------------------------------------------------------------------------
+    !! The default cutoff of the Fock operator, 4*ecutwfc, keeps every component of the pair
+    !! densities psi_i psi_j. Most of that sphere holds nothing: the exchange energy is a sum
+    !! over G of v(G) |rho_ij(G)|^2, and what lies beyond a cutoff E is exactly what a run with
+    !! ecutfock = E leaves out (at fixed orbitals), while the cost of the operator goes with
+    !! the number of grid points, E^(3/2).
+    !! When ecutfock is not given in the input (norm-conserving, collinear runs), this routine
+    !! measures that tail and sets ecutfock to the smallest of 1, 1.25, 1.5, 1.75, 2, 2.5, 3
+    !! times ecutwfc beyond which less than a fraction tol of the sum is left. The sum is taken
+    !! with the bare 1/G^2 weight (which bounds the screened kernels at large G) over a sample
+    !! of pair densities at the first k-point of each pool: the pairs of 8 occupied orbitals,
+    !! the highest included, and their pairs with up to 4 empty ones; the two kinds are held to
+    !! the tolerance separately, the second being what the eigenvalues of empty bands see.
+    !! tol is 1e-8, or QE_EXX_ECUT_TOL from the environment (0 keeps 4*ecutwfc).
+    !! Called once, before the EXX grid is made.
+    !
+    USE gvecw,            ONLY : ecutwfc
+    USE gvect,            ONLY : ecutrho, gg, gstart
+    USE cell_base,        ONLY : tpiba2
+    USE fft_base,         ONLY : dffts
+    USE fft_interfaces,   ONLY : invfft, fwfft
+    USE wavefunctions,    ONLY : evc
+    USE wvfct,            ONLY : nbnd
+    USE klist,            ONLY : nks, igk_k, ngk
+    USE buffers,          ONLY : get_buffer
+    USE io_files,         ONLY : nwordwfc, iunwfc
+    USE uspp,             ONLY : okvan
+    USE control_flags,    ONLY : iverbosity
+    USE mp_bands,         ONLY : intra_bgrp_comm
+    USE mp_pools,         ONLY : inter_pool_comm
+    USE mp,               ONLY : mp_sum
+    !
+    IMPLICIT NONE
+    !
+    INTEGER, PARAMETER :: nl = 7
+    REAL(DP), PARAMETER :: ladder(nl) = (/ 1.0_DP, 1.25_DP, 1.5_DP, 1.75_DP, 2.0_DP, 2.5_DP, 3.0_DP /)
+    CHARACTER(LEN=32) :: val
+    INTEGER :: lenv, stat, ios, ns, ne, nocc, is, js, ig, k, npw, ib, kc, kind, ngs, nnr
+    REAL(DP) :: tol, e, wp, sh(nl+1,2), tot(2), tail(nl,2), edef
+    INTEGER, ALLOCATABLE :: ibs(:)
+    REAL(DP), ALLOCATABLE :: ws(:,:)
+    COMPLEX(DP), ALLOCATABLE :: psir(:,:), rho(:)
+    LOGICAL :: on_device
+#if defined(__CUDA)
+    COMPLEX(DP), ALLOCATABLE, DEVICE :: psir_d(:,:), rho_d(:), evc_d(:)
+    REAL(DP), ALLOCATABLE, DEVICE :: ws_d(:,:), gg_d(:)
+    INTEGER, ALLOCATABLE, DEVICE :: igk_d(:)
+    INTEGER, POINTER, DEVICE :: nl_d(:), nlm_d(:)
+    INTEGER :: ir
+#endif
+    !
+    edef = MIN( ecutrho, 4.0_DP*ecutwfc )
+    ! (ultrasoft and PAW: setup has fixed the cutoff; a cutoff from the input or a restart file is kept)
+    IF ( okvan .OR. noncolin .OR. ABS( ecutfock - edef ) > 1.0E-8_DP .OR. x_nbnd_occ < 1 ) RETURN
+    tol = 1.0E-8_DP
+    CALL GET_ENVIRONMENT_VARIABLE( 'QE_EXX_ECUT_TOL', val, lenv, stat )
+    IF ( stat == 0 .AND. lenv > 0 ) THEN
+       ios = 0
+       READ( val, *, IOSTAT=ios ) tol
+       IF ( ios /= 0 .OR. tol < 0.0_DP ) THEN
+          WRITE( stdout, '(5X,"EXX: QE_EXX_ECUT_TOL=",A," not understood (a relative tolerance, e.g. 1e-8; 0 keeps 4*ecutwfc): 1e-8")' ) TRIM(val)
+          tol = 1.0E-8_DP
+       ENDIF
+    ENDIF
+    IF ( tol == 0.0_DP ) RETURN
+    CALL start_clock( 'exx_ecut' )
+    !
+    ! ... the sample: ns occupied orbitals of the first k-point, the highest included, then ne empty ones
+    nocc = x_nbnd_occ
+    ns = MIN( nocc, 8 )
+    ne = MIN( nbnd - nocc, 4 )
+    ALLOCATE( ibs(ns+ne) )
+    DO is = 1, ns
+       ibs(is) = nocc
+       IF ( ns > 1 ) ibs(is) = 1 + NINT( DBLE( (is-1)*(nocc-1) ) / DBLE(ns-1) )
+    ENDDO
+    DO is = 1, ne
+       ibs(ns+is) = nbnd
+       IF ( ne > 1 ) ibs(ns+is) = nocc + 1 + NINT( DBLE( (is-1)*(nbnd-nocc-1) ) / DBLE(ne-1) )
+    ENDDO
+    IF ( nks > 1 ) CALL get_buffer( evc, nwordwfc, iunwfc, 1 )
+    npw = ngk(1)
+    ngs = dffts%ngm
+    nnr = dffts%nnr
+    ALLOCATE( ws(ngs,2) )
+    !
+    ! ... ws(G,kind): sum over the sampled pairs of |rho_ij(G)|^2 / G^2, the pairs standing for all of their
+    !     kind: nocc diagonal ones and nocc (nocc-1) / 2 off the diagonal (kind 1), occupied x empty (kind 2)
+    on_device = .FALSE.
+#if defined(__CUDA)
+    on_device = use_gpu .AND. ( dffts%nproc == 1 )
+    IF ( on_device ) THEN
+       ALLOCATE( psir_d(nnr,ns+ne), rho_d(nnr), evc_d(npw), ws_d(ngs,2), gg_d(ngs), igk_d(npw) )
+       nl_d  => dffts%nl_d
+       gg_d = gg(1:ngs)
+       igk_d = igk_k(1:npw,1)
+       ws_d = 0.0_DP
+       psir_d = ( 0.0_DP, 0.0_DP )
+       DO is = 1, ns + ne
+          evc_d = evc(1:npw,ibs(is))
+          !$cuf kernel do (1)
+          DO ig = 1, npw
+             psir_d( nl_d(igk_d(ig)), is ) = evc_d(ig)
+          ENDDO
+          IF ( gamma_only ) THEN
+             nlm_d => dffts%nlm_d
+             !$cuf kernel do (1)
+             DO ig = 1, npw
+                psir_d( nlm_d(igk_d(ig)), is ) = CONJG( evc_d(ig) )
+             ENDDO
+          ENDIF
+          CALL invfft( 'Wave', psir_d(:,is), dffts )
+       ENDDO
+       DO js = 1, ns + ne
+          DO is = 1, MIN( js, ns )
+             kind = 1
+             wp = DBLE(nocc) / DBLE(ns)
+             IF ( is /= js ) wp = DBLE(nocc) * DBLE(nocc-1) / ( DBLE(ns) * DBLE(MAX(ns-1,1)) )
+             IF ( js > ns ) THEN
+                kind = 2
+                wp = 1.0_DP
+             ENDIF
+             !$cuf kernel do (1)
+             DO ir = 1, nnr
+                rho_d(ir) = CONJG( psir_d(ir,is) ) * psir_d(ir,js)
+             ENDDO
+             CALL fwfft( 'Rho', rho_d, dffts )
+             !$cuf kernel do (1)
+             DO ig = gstart, ngs
+                ws_d(ig,kind) = ws_d(ig,kind) + wp * ( DBLE( rho_d(nl_d(ig)) )**2 + AIMAG( rho_d(nl_d(ig)) )**2 ) / gg_d(ig)
+             ENDDO
+          ENDDO
+       ENDDO
+       ws = ws_d
+       DEALLOCATE( psir_d, rho_d, evc_d, ws_d, gg_d, igk_d )
+    ENDIF
+#endif
+    IF ( .NOT. on_device ) THEN
+       ALLOCATE( psir(nnr,ns+ne), rho(nnr) )
+       ws = 0.0_DP
+       DO is = 1, ns + ne
+          ib = ibs(is)
+          psir(:,is) = ( 0.0_DP, 0.0_DP )
+          DO ig = 1, npw
+             psir( dffts%nl(igk_k(ig,1)), is ) = evc(ig,ib)
+          ENDDO
+          IF ( gamma_only ) THEN
+             DO ig = 1, npw
+                psir( dffts%nlm(igk_k(ig,1)), is ) = CONJG( evc(ig,ib) )
+             ENDDO
+          ENDIF
+          CALL invfft( 'Wave', psir(:,is), dffts )
+       ENDDO
+       DO js = 1, ns + ne
+          DO is = 1, MIN( js, ns )
+             kind = 1
+             wp = DBLE(nocc) / DBLE(ns)
+             IF ( is /= js ) wp = DBLE(nocc) * DBLE(nocc-1) / ( DBLE(ns) * DBLE(MAX(ns-1,1)) )
+             IF ( js > ns ) THEN
+                kind = 2
+                wp = 1.0_DP
+             ENDIF
+             rho(:) = CONJG( psir(:,is) ) * psir(:,js)
+             CALL fwfft( 'Rho', rho, dffts )
+             DO ig = gstart, ngs
+                ws(ig,kind) = ws(ig,kind) + wp * ( DBLE( rho(dffts%nl(ig)) )**2 + AIMAG( rho(dffts%nl(ig)) )**2 ) / gg(ig)
+             ENDDO
+          ENDDO
+       ENDDO
+       DEALLOCATE( psir, rho )
+    ENDIF
+    !
+    ! ... the shells between the cutoffs of the ladder, summed over the processes of the grid and over the pools
+    sh = 0.0_DP
+    DO ig = gstart, ngs
+       e = gg(ig) * tpiba2
+       IF ( e > edef ) CYCLE
+       kc = nl + 1
+       DO k = nl, 1, -1
+          IF ( e <= ladder(k)*ecutwfc ) kc = k
+       ENDDO
+       sh(kc,:) = sh(kc,:) + ws(ig,:)
+    ENDDO
+    DEALLOCATE( ibs, ws )
+    CALL mp_sum( sh, intra_bgrp_comm )
+    CALL mp_sum( sh, inter_pool_comm )
+    tot(:) = SUM( sh, 1 )
+    tail = 0.0_DP
+    DO k = 1, nl
+       IF ( tot(1) > 0.0_DP ) tail(k,1) = SUM( sh(k+1:nl+1,1) ) / tot(1)
+       IF ( tot(2) > 0.0_DP ) tail(k,2) = SUM( sh(k+1:nl+1,2) ) / tot(2)
+    ENDDO
+    kc = 0
+    DO k = nl, 1, -1
+       IF ( ladder(k)*ecutwfc < edef .AND. MAXVAL( tail(k,:) ) <= tol ) kc = k
+    ENDDO
+    IF ( iverbosity > 0 ) THEN
+       WRITE( stdout, '(/5X,"EXX: part of the exchange sum beyond a cutoff of the Fock operator (occupied pairs, occupied x empty)")' )
+       DO k = 1, nl
+          IF ( ladder(k)*ecutwfc < edef ) WRITE( stdout, '(5X,"EXX:    ecutfock = ",F8.2," Ry:  ",2ES10.2)' ) ladder(k)*ecutwfc, tail(k,:)
+       ENDDO
+    ENDIF
+    IF ( kc > 0 ) THEN
+       ecutfock = ladder(kc)*ecutwfc
+       WRITE( stdout, '(/5X,"EXX: cutoff of the Fock operator set to ",F8.2," Ry (4*ecutwfc = ",F8.2,"): sampled pair densities hold")' ) ecutfock, edef
+       WRITE( stdout, '(5X,"     ",ES8.1," of the exchange sum beyond it (tolerance ",ES8.1,"; ecutfock in the input, or")' ) MAXVAL( tail(kc,:) ), tol
+       WRITE( stdout, '(5X,"     QE_EXX_ECUT_TOL=0 in the environment, keeps the full sphere)")' )
+    ENDIF
+    CALL stop_clock( 'exx_ecut' )
+    !
+  END SUBROUTINE exx_auto_cutoff
   !
   !------------------------------------------------------------------------
   SUBROUTINE exx_device_grid()
