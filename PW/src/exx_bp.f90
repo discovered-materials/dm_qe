@@ -3963,7 +3963,6 @@ end associate
     !! The Coulomb kernels v(k-k'+G) of the nqs k+q points of k-point current_k on the full EXX
     !! grid, in p6_facb_d(:,iq), from the device cache of every k (P6d, P10, P11; pblk and npairs
     !! only go into the banner). Shared by the k-point operators.
-    USE cudafor,        ONLY : cudaMemGetInfo   ! P15
     USE cell_base,      ONLY : tpiba2, at
     USE constants,      ONLY : e2, fpi, pi
     USE klist,          ONLY : nks
@@ -4010,7 +4009,7 @@ end associate
              DEALLOCATE( cfac_all_d, cfac_done )
        ENDIF
        IF ( .NOT. ALLOCATED(cfac_all_d) ) THEN
-          istat = cudaMemGetInfo( p15_free, p15_total )                      ! P15
+          istat = exx_device_room( cache_bytes, p15_free, p15_total )                      ! P15
           IF ( istat == 0 .AND. cache_bytes + 268435456_8 > p15_free ) THEN
              istat = 1                                                      ! not enough room: per-k kernel
           ELSE
@@ -4179,7 +4178,6 @@ end associate
     !! but all (q, j) pairs of a band go through one kernel + one batched FFT at a time,
     !! with resident Coulomb factors, persistent work arrays and own cuFFT plans (P6).
     USE cufft
-    USE cudafor,        ONLY : cudaMemGetInfo   ! P15
     USE cell_base,      ONLY : omega, tpiba2, at
     USE constants,      ONLY : e2, fpi, pi
     USE wvfct,          ONLY : npwx, current_k
@@ -4257,7 +4255,7 @@ end associate
     IF ( .NOT. ALLOCATED(p6_psi_d) )                 p15_need = p15_need + 32_8 * INT(lda*npol,8) * INT(m,8)
     IF ( .NOT. ALLOCATED(p6_facb_d) )                p15_need = p15_need +  8_8 * INT(nrxxs,8) * INT(nqs,8)
     IF ( p15_need > 0_8 ) THEN
-       istat = cudaMemGetInfo( p15_free, p15_total )
+       istat = exx_device_room( p15_need, p15_free, p15_total )
        IF ( istat == 0 .AND. p15_need + 268435456_8 > p15_free ) THEN
           CALL p15_release_work_arrays()
           p15_fast_disabled = .TRUE.
@@ -4374,7 +4372,7 @@ end associate
        ENDIF
        IF ( .NOT. ALLOCATED(p20_vcg3_d) ) THEN
           p15_need = 48_8*INT(ngmt,8)*INT(pblk,8) + 48_8*INT(p18_na,8)*INT(pblk,8) + 16_8*INT(nkb,8)*INT(m,8)
-          istat = cudaMemGetInfo( p15_free, p15_total )
+          istat = exx_device_room( p15_need, p15_free, p15_total )
           IF ( istat == 0 .AND. p15_need + 268435456_8 > p15_free ) THEN
              WRITE( stdout, '(5X,"EXX-GPU: the force pass would need ",I0," MB of device memory, ",I0," MB are free (P20)")' ) &
                   p15_need/1000000_8, p15_free/1000000_8
@@ -4663,7 +4661,6 @@ end associate
     !! k-point: the pair tables and the species layout, the structure factors, <beta|phi> of every
     !! buffered k+q orbital, the PAW one-centre matrix of every k (rebuilt after every exxinit),
     !! the work arrays. ok = .FALSE.: no room; the k-point loop takes over.
-    USE cudafor,       ONLY : cudaMemGetInfo
     USE ions_base,     ONLY : nat, ityp
     USE uspp,          ONLY : nkb, ofsbeta
     USE uspp_param,    ONLY : upf, nh, nhm
@@ -4695,7 +4692,7 @@ end associate
     IF ( .NOT. ALLOCATED(p18_sf_d) ) need = need + 16_8*INT(ngmt,8)*INT(nat,8)
     IF ( .NOT. ALLOCATED(p18_qgm_acc) ) need = need + 16_8*INT(ngmt,8)*INT(p18_nij,8)
     IF ( .NOT. ALLOCATED(gf_vkb) ) need = need + 16_8*INT(npwx,8)*INT(nkb,8)
-    istat = cudaMemGetInfo( free_, total_ )
+    istat = exx_device_room( need, free_, total_ )
     IF ( istat == 0 .AND. need + 268435456_8 > free_ ) THEN
        WRITE( stdout, '(5X,"EXX-GPU: the ultrasoft augmentation of the all-k exchange build would need ",I0," MB of device memory, ",I0," MB are free: V_x is applied k-point by k-point")' ) &
             need/1000000_8, free_/1000000_8
@@ -4842,7 +4839,6 @@ end associate
     !! where the projectors of the two k-points are the same functions (complex conjugates).
     !! ok = .FALSE.: nothing done, aceinit applies V_x k-point by k-point.
     USE cufft
-    USE cudafor,        ONLY : cudaMemGetInfo
     USE cell_base,      ONLY : omega
     USE wvfct,          ONLY : nbnd, npwx
     USE klist,          ONLY : xk, nkstot, nks, ngk
@@ -4944,7 +4940,7 @@ end associate
     IF ( .NOT. ALLOCATED(p6_res_d) )  need = need + 32_8*INT(nrt,8)*INT(m,8)
     IF ( .NOT. ALLOCATED(p6_rhoc_d) ) need = need + 32_8*INT(nrxxs,8)*INT(pblk,8)
     IF ( .NOT. ALLOCATED(p6_facb_d) ) need = need + 8_8*INT(nrxxs,8)*INT(nqs,8)
-    istat = cudaMemGetInfo( free_, total_ )
+    istat = exx_device_room( need, free_, total_ )
     IF ( istat == 0 .AND. need + 268435456_8 > free_ ) THEN
        WRITE( stdout, '(5X,"EXX-GPU: the all-k exchange build would need ",I0," MB of device memory, ",I0," MB are free: V_x is applied k-point by k-point")' ) &
             need/1000000_8, free_/1000000_8
@@ -6069,7 +6065,6 @@ end associate
     !! buffered orbitals and the PAW one-centre matrix (rebuilt after every exxinit), the projectors
     !! and <beta|psi> of this call, the work arrays. ok = .FALSE.: no room on the device; every array
     !! is released and the original routine takes over for the rest of the run.
-    USE cudafor,       ONLY : cudaMemGetInfo
     USE ions_base,     ONLY : nat, ityp, ntyp => nsp
     USE uspp,          ONLY : nkb, ofsbeta
     USE uspp_param,    ONLY : upf, nh, nhm
@@ -6105,7 +6100,7 @@ end associate
     IF ( .NOT. ALLOCATED(p18_sf_d) ) need = need + 16_8*INT(ngmt,8)*INT(nat,8)
     IF ( .NOT. ALLOCATED(p18_qgm_acc) ) need = need + 16_8*INT(ngmt,8)*INT(p18_nij,8)
     IF ( .NOT. ALLOCATED(gf_bec_d) ) need = need + 8_8*INT(nkb,8)*INT(nbe + 2*m + nkb + 4*pblk,8)
-    istat = cudaMemGetInfo( free_, total_ )
+    istat = exx_device_room( need, free_, total_ )
     IF ( istat == 0 .AND. need + 268435456_8 > free_ ) THEN
        WRITE( stdout, '(5X,"EXX-GPU: the ultrasoft augmentation of the batched Gamma operator would need ",I0," MB of device memory, ",I0," MB are free: this run continues on the original vexx_gamma_gpu path")' ) &
             need/1000000_8, free_/1000000_8
@@ -6263,7 +6258,6 @@ end associate
     !!  - the ultrasoft / PAW augmentation charges and the exchange D matrix are matrix products on
     !!    the device (vexx_gfast_main_us), not a host loop for every pair.
     USE cufft
-    USE cudafor,        ONLY : cudaMemGetInfo
     USE cell_base,      ONLY : omega
     USE wvfct,          ONLY : current_k, nbnd
     USE klist,          ONLY : xk, nkstot
@@ -6339,7 +6333,7 @@ end associate
                                              32_8*INT(nrxxs,8)*INT(pblk,8) + 8_8*INT(nrxxs,8)
     IF ( .NOT. ALLOCATED(p6_psi_d) )  need = need + 32_8*INT(lda*npol,8)*INT(m,8)
     IF ( need > 0_8 ) THEN
-       istat = cudaMemGetInfo( free_, total_ )
+       istat = exx_device_room( need, free_, total_ )
        IF ( istat == 0 .AND. need + 268435456_8 > free_ ) THEN
           CALL p15_release_work_arrays()
           p15_fast_disabled = .TRUE.
@@ -6881,7 +6875,6 @@ end associate
     !! structure factors, phases, Q(G,A) of the current k (or of every k, cached), the projectors and becpsi of k,
     !! the PAW one-center matrix of k. ok = .FALSE.: no room on the device -- every P18 array is released and the
     !! fast path is switched off for the rest of the run (P15 policy); the original routine serves the call.
-    USE cudafor,     ONLY : cudaMemGetInfo
     USE constants,   ONLY : tpi
     USE cell_base,   ONLY : at, alat
     USE ions_base,   ONLY : nat, ntyp => nsp, ityp, tau
@@ -6951,7 +6944,7 @@ end associate
     IF ( .NOT. ALLOCATED(p18_sf_d) ) need = need + 16_8*INT(ngmt,8)*INT(nat,8)
     IF ( .NOT. ALLOCATED(p18_qgm_acc) ) need = need + 16_8*INT(ngmt,8)*INT(p18_nij,8)
     IF ( okpaw .AND. .NOT. ALLOCATED(p18_dpaw_d) ) need = need + 16_8*INT(nkb,8)*INT(nkb,8)*INT(nks,8)
-    istat = cudaMemGetInfo( free_, total_ )
+    istat = exx_device_room( need, free_, total_ )
     IF ( istat == 0 .AND. need + 268435456_8 > free_ ) THEN
        WRITE( stdout, '(5X,"EXX-GPU: ultrasoft augmentation would need ",I0," MB of device memory, ",I0," MB are free: this run continues on the original vexx_k_gpu path (P18)")' ) &
             need/1000000_8, free_/1000000_8
@@ -7460,6 +7453,30 @@ end associate
   END SUBROUTINE exx_force_main_us
   !
   !-----------------------------------------------------------------------
+  INTEGER FUNCTION exx_device_room( need, free_, total_ )
+  !-----------------------------------------------------------------------
+    !! cudaMemGetInfo for a caller about to ALLOCATE need bytes of device arrays. Device memory
+    !! that OpenACC regions have released stays in the pool of the OpenACC runtime, where a CUDA
+    !! Fortran ALLOCATE cannot reach it (after the Davidson run of a large cell that is most of
+    !! the card): when the request does not fit, the pool is handed back and the device asked again.
+    USE cudafor, ONLY : cudaMemGetInfo
+    IMPLICIT NONE
+    INTEGER(KIND=8), INTENT(IN)  :: need
+    INTEGER(KIND=8), INTENT(OUT) :: free_, total_
+#if defined(_OPENACC)
+    EXTERNAL :: acc_clear_freelists
+#endif
+    !
+    exx_device_room = cudaMemGetInfo( free_, total_ )
+#if defined(_OPENACC)
+    IF ( exx_device_room /= 0 .OR. need + 1073741824_8 <= free_ ) RETURN
+    CALL acc_clear_freelists()
+    exx_device_room = cudaMemGetInfo( free_, total_ )
+#endif
+    !
+  END FUNCTION exx_device_room
+  !
+  !-----------------------------------------------------------------------
   SUBROUTINE p15_release_work_arrays()
   !-----------------------------------------------------------------------
     !! P15: free every device work array of the batched fast path (after an allocation failure)
@@ -7562,7 +7579,6 @@ end associate
     !! the kernels count G and -G (the Gamma tricks of the host loop).
     USE cufft
     USE cublas
-    USE cudafor,        ONLY : cudaMemGetInfo
     USE constants,      ONLY : fpi, e2, pi
     USE cell_base,      ONLY : omega, tpiba, at
     USE wvfct,          ONLY : nbnd, npwx, wg, current_k
@@ -7621,7 +7637,7 @@ end associate
     ! ... P15-style pre-check of the device work arrays
     need = 16_8*INT(nrxxs,8)*INT(pblk,8) + 16_8*INT(ngmt,8)*INT(pblk,8) + 16_8*INT(nrxxs,8) &
          + 72_8*INT(ngmt,8) + 16_8*INT(npwx,8) + 64_8*INT(pblk,8) + 12_8*INT(nbuf,8) + 64_8
-    istat = cudaMemGetInfo( free_, total_ )
+    istat = exx_device_room( need, free_, total_ )
     IF ( istat == 0 .AND. need + 268435456_8 > free_ ) THEN
        WRITE( stdout, '(5X,"EXX-GPU: exchange stress on the host routine (P17); device-memory (",I0," MB needed, ",I0," MB free)")' ) &
             need/1000000_8, free_/1000000_8
@@ -7894,7 +7910,6 @@ end associate
     !! dx_h: the exchange D matrix (PAW one-centre part included); fa_h: the force of each
     !! projector; ok = .FALSE.: no room on the device, nothing done.
     USE cufft
-    USE cudafor,        ONLY : cudaMemGetInfo
     USE cell_base,      ONLY : omega, tpiba
     USE wvfct,          ONLY : npwx
     USE klist,          ONLY : xk, nkstot, nks, ngk
@@ -7959,7 +7974,7 @@ end associate
     IF ( .NOT. ALLOCATED(p6_rhoc_d) ) need = need + 16_8*INT(nrxxs,8)*INT(pblk,8)
     IF ( .NOT. ALLOCATED(p6_facb_d) ) need = need + 8_8*INT(nrxxs,8)*INT(nqs,8)
     IF ( .NOT. ALLOCATED(kf_fd_d) )   need = need + 8_8*INT(ngmt,8)*INT(nkb,8) + 32_8*INT(ngmt,8)
-    istat = cudaMemGetInfo( free_, total_ )
+    istat = exx_device_room( need, free_, total_ )
     IF ( istat == 0 .AND. need + 268435456_8 > free_ ) RETURN
     IF ( ALLOCATED(p6_rhoc_d) ) THEN
        IF ( SIZE(p6_rhoc_d,1) /= nrxxs .OR. SIZE(p6_rhoc_d,2) /= pblk ) DEALLOCATE( p6_rhoc_d )
@@ -8230,7 +8245,6 @@ end associate
     USE control_flags,    ONLY : lbfgs, lmd
     USE xc_lib,           ONLY : exx_is_active
 #if defined(__CUDA)
-    USE cudafor,          ONLY : cudaMemGetInfo
 #endif
     IMPLICIT NONE
     REAL(DP), INTENT(OUT) :: forcex(3,nat)
@@ -8329,7 +8343,7 @@ end associate
           gf_gt_d = gt(1:3,1:ngmt)
           ! (the sum over bands on (G, projector) where the device has room for it next to the work arrays)
           IF ( ALLOCATED(gf_fd_d) ) DEALLOCATE( gf_fd_d )
-          istat = cudaMemGetInfo( free_, total_ )
+          istat = exx_device_room( 56_8*INT(ngmt,8)*INT(nkb,8), free_, total_ )
           IF ( istat == 0 .AND. 56_8*INT(ngmt,8)*INT(nkb,8) + 1073741824_8 < free_ ) THEN
              ALLOCATE( gf_fd_d(ngmt,nkb) )
              gf_fd_d = 0.0_DP

@@ -1030,7 +1030,7 @@ MODULE exx
     USE wvfct,      ONLY : npwx
     USE klist,      ONLY : nks
 #if defined(__CUDA)
-    USE cudafor,    ONLY : cudaMemGetInfo
+    USE exx_bp,     ONLY : exx_device_room
 #endif
     !
     IMPLICIT NONE
@@ -1054,7 +1054,7 @@ MODULE exx
     ENDIF
     fits = ALLOCATED(xi_all_d)
     IF ( .NOT. fits ) THEN
-       istat = cudaMemGetInfo( free_, total_ )
+       istat = exx_device_room( 8_8*need, free_, total_ )
        fits = ( istat == 0 .AND. need <= 2147483648_8 .AND. 8_8*need < free_ )
        IF ( fits ) ALLOCATE( xi_all_d(SIZE(xi,1),SIZE(xi,2),nks) )
     ENDIF
