@@ -22,6 +22,14 @@ subroutine fft_interpolate_real (dfft_in, v_in, dfft_out, v_out )
   ! local variables
   INTEGER :: ngm
   COMPLEX(DP), ALLOCATABLE :: aux_in (:), aux_out (:)
+#if defined(__CUDA)
+  ! large grids held by one process: the two transforms on the device
+  INTEGER :: i, nin, nout
+  REAL(DP), ALLOCATABLE :: r_d (:)
+  COMPLEX(DP), ALLOCATABLE :: aux_in_d (:), aux_out_d (:)
+  INTEGER, POINTER :: nli_d (:), nlo_d (:), nlmi_d (:), nlmo_d (:)
+  attributes(DEVICE) :: r_d, aux_in_d, aux_out_d, nli_d, nlo_d, nlmi_d, nlmo_d
+#endif
 
   call start_clock ('interpolate')
 
@@ -36,6 +44,47 @@ subroutine fft_interpolate_real (dfft_in, v_in, dfft_out, v_out )
      if (dfft_in%lgamma .neqv. dfft_out%lgamma) &
         call fftx_error__ ('fft_interpolate_real','two grids with inconsistent lgamma values', 1)
 
+#if defined(__CUDA)
+     IF ( MAX( dfft_in%nnr, dfft_out%nnr ) >= 250000 .AND. dfft_in%nproc == 1 .AND. dfft_out%nproc == 1 ) THEN
+        nin  = dfft_in%nnr
+        nout = dfft_out%nnr
+        ngm  = min(dfft_in%ngm, dfft_out%ngm)
+        ALLOCATE (r_d( MAX(nin,nout) ), aux_in_d( nin ), aux_out_d( nout ))
+        nli_d => dfft_in%nl_d
+        nlo_d => dfft_out%nl_d
+        r_d (1:nin) = v_in (1:nin)
+        !$cuf kernel do (1)
+        DO i = 1, nin
+           aux_in_d (i) = CMPLX( r_d (i), 0.d0, KIND=DP )
+        ENDDO
+        CALL fwfft ('Rho', aux_in_d, dfft_in)
+        !$cuf kernel do (1)
+        DO i = 1, nout
+           aux_out_d (i) = (0.d0, 0.d0)
+        ENDDO
+        !$cuf kernel do (1)
+        DO i = 1, ngm
+           aux_out_d (nlo_d (i)) = aux_in_d (nli_d (i))
+        ENDDO
+        IF (dfft_in%lgamma) THEN
+           nlmi_d => dfft_in%nlm_d
+           nlmo_d => dfft_out%nlm_d
+           !$cuf kernel do (1)
+           DO i = 1, ngm
+              aux_out_d (nlmo_d (i)) = aux_in_d (nlmi_d (i))
+           ENDDO
+        ENDIF
+        CALL invfft ('Rho', aux_out_d, dfft_out)
+        !$cuf kernel do (1)
+        DO i = 1, nout
+           r_d (i) = DBLE( aux_out_d (i) )
+        ENDDO
+        v_out (1:nout) = r_d (1:nout)
+        DEALLOCATE (r_d, aux_in_d, aux_out_d)
+        call stop_clock ('interpolate')
+        return
+     ENDIF
+#endif
      ALLOCATE (aux_in( dfft_in%nnr), aux_out(dfft_out%nnr))
 
      aux_in (1:dfft_in%nnr) = v_in(1:dfft_in%nnr)
