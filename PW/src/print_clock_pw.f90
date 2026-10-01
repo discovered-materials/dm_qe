@@ -334,6 +334,8 @@ SUBROUTINE print_clock_pw()
       CALL print_clock ('PAW_symme')
       ! second level routines:
       CALL print_clock ('PAW_rho_lm')
+      CALL print_clock ('PAW_xc_batch')
+      CALL print_clock ('PAW_h_batch')
       CALL print_clock ('PAW_h_pot')
       CALL print_clock ('PAW_xc_pot')
       CALL print_clock ('PAW_lm2rad')

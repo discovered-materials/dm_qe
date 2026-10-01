@@ -67,7 +67,7 @@ MODULE paw_onecenter
     !! Calculate the onecenter contribution to the energy.
     !
     USE atom,              ONLY : g => rgrid
-    USE ions_base,         ONLY : nat, ityp
+    USE ions_base,         ONLY : nat, ityp, ntyp => nsp
     USE lsda_mod,          ONLY : nspin
     USE uspp_param,        ONLY : nh, nhm, upf
     USE noncollin_module,  ONLY : nspin_lsda, nspin_mag
@@ -105,6 +105,17 @@ MODULE paw_onecenter
     REAL(DP) :: integral     ! workspace
     REAL(DP) :: energy_tot
     REAL(DP) :: sgn          ! +1 for AE -1 for PS
+    ! the atoms of a species together (device build, collinear spin):
+    LOGICAL :: batch
+    INTEGER :: nt, na_t, nbt, jb, ib
+    INTEGER, ALLOCATABLE  :: ia_b(:)             ! the atoms of the species
+    REAL(DP), ALLOCATABLE :: rho_b(:,:,:,:)      ! their AE and PS densities on Y_lm
+    REAL(DP), ALLOCATABLE :: v_b(:,:,:,:)        ! workspace: potentials
+    REAL(DP), ALLOCATABLE :: vh_b(:,:,:)         ! Hartree potentials
+    REAL(DP), ALLOCATABLE :: savedv_b(:,:,:,:)   ! Hartree + xc potentials
+    REAL(DP), ALLOCATABLE :: core_b(:,:)         ! AE/PS core charge of each density
+    REAL(DP), ALLOCATABLE :: exc_b(:)            ! xc energies
+    REAL(DP), ALLOCATABLE :: e_at(:,:,:)         ! Hartree and xc energy of each atom, AE and PS
     !
     CALL start_clock( 'PAW_pot' )
     !
@@ -127,7 +138,119 @@ MODULE paw_onecenter
     me_paw    = mp_rank( paw_comm )
     nproc_paw = mp_size( paw_comm )
     !
+    ! ... On the device the xc potential of one density is a long chain of small kernels:
+    ! ... the atoms of a species go through it together (PAW_xc_potential_batch)
+    batch = .FALSE.
+#if defined(_OPENACC)
+    batch = ( nproc_paw == 1 .AND. nspin_mag <= 2 .AND. radial_grad_style == 0 )
+#endif
+    !
+#if defined(_OPENACC)
+    IF ( batch ) THEN
+       !
+       with_small_so = .FALSE.
+       ALLOCATE( e_at(2,2,nat) )
+       e_at = 0._DP
+       !
+       species: DO nt = 1, ntyp
+          !
+          IF ( .NOT. upf(nt)%tpawp ) CYCLE species
+          na_t = 0
+          DO ia = ia_s, ia_e
+             IF ( ityp(ia) == nt ) na_t = na_t + 1
+          ENDDO
+          IF ( na_t == 0 ) CYCLE species
+          !
+          i%t = nt
+          i%m = g(nt)%mesh
+          i%b = upf(nt)%nbeta
+          i%l = upf(nt)%lmax_rho+1
+          l2  = i%l**2
+          kkbeta = upf(nt)%kkbeta
+          !
+          nx_loc = rad(nt)%nx
+          ix_s   = 1
+          ix_e   = nx_loc
+          !
+          nbt = 2*na_t
+          ALLOCATE( ia_b(na_t), rho_b(i%m,l2,nspin,nbt), v_b(i%m,l2,nspin,nbt), &
+                    savedv_b(i%m,l2,nspin,nbt), core_b(i%m,nbt), exc_b(nbt), vh_b(i%m,l2,nbt) )
+          !
+          ! ... the densities, then their Hartree potentials
+          jb = 0
+          DO ia = ia_s, ia_e
+             IF ( ityp(ia) /= nt ) CYCLE
+             jb = jb + 1
+             ia_b(jb) = ia
+             i%a = ia
+             DO i_what = AE, PS
+                i%ae = i_what
+                ib = 2*(jb-1) + i_what
+                IF (i_what == AE) THEN
+                   CALL PAW_rho_lm( i, becsum, upf(nt)%paw%pfunc, rho_b(:,:,:,ib) )
+                   core_b(:,ib) = upf(nt)%paw%ae_rho_atc(1:i%m)
+                ELSE
+                   CALL PAW_rho_lm( i, becsum, upf(nt)%paw%ptfunc, rho_b(:,:,:,ib), upf(nt)%qfuncl )
+                   core_b(:,ib) = upf(nt)%rho_atc(1:i%m)
+                ENDIF
+             ENDDO
+          ENDDO
+          CALL PAW_h_potential_batch( nt, i%m, i%l, nbt, rho_b, vh_b, exc_b )
+          savedv_b(:,:,:,:) = 0._DP
+          DO jb = 1, na_t
+             DO i_what = AE, PS
+                ib = 2*(jb-1) + i_what
+                e_at(H,i_what,ia_b(jb)) = exc_b(ib)
+                DO is = 1, nspin_lsda
+                   savedv_b(:,:,is,ib) = vh_b(:,:,ib)
+                ENDDO
+             ENDDO
+          ENDDO
+          !
+          ! ... their xc potentials
+          CALL PAW_xc_potential_batch( nt, i%m, i%l, nbt, rho_b, core_b, v_b, exc_b )
+          !
+          ! ... the integrals with the density of each pair of partial waves
+          DO jb = 1, na_t
+             i%a = ia_b(jb)
+             DO i_what = AE, PS
+                i%ae = i_what
+                ib = 2*(jb-1) + i_what
+                e_at(XC,i_what,i%a) = exc_b(ib)
+                savedv_b(:,:,:,ib) = savedv_b(:,:,:,ib) + v_b(:,:,:,ib)
+                IF (i_what == AE) THEN
+                   CALL PAW_d_integrals( i, +1._DP, kkbeta, upf(nt)%paw%pfunc, savedv_b(:,:,:,ib), d )
+                ELSE
+                   CALL PAW_d_integrals( i, -1._DP, kkbeta, upf(nt)%paw%ptfunc, savedv_b(:,:,:,ib), d, &
+                                         upf(nt)%qfuncl )
+                ENDIF
+             ENDDO
+          ENDDO
+          !
+          DEALLOCATE( ia_b, rho_b, v_b, savedv_b, core_b, exc_b, vh_b )
+          !
+       ENDDO species
+       !
+       ! ... the energies, summed in the order of the loop over atoms below
+       DO ia = ia_s, ia_e
+          IF ( .NOT. upf(ityp(ia))%tpawp ) CYCLE
+          DO i_what = AE, PS
+             sgn = +1._DP
+             IF (i_what == PS) sgn = -1._DP
+             IF (PRESENT(energy) .AND. mykey == 0 ) energy_tot = energy_tot + sgn*e_at(H,i_what,ia)
+             IF (PRESENT(e_cmp)  .AND. mykey == 0 ) e_cmp(ia,H,i_what) = sgn*e_at(H,i_what,ia)
+             IF (PRESENT(energy) .AND. mykey == 0 ) energy_tot = energy_tot + sgn*e_at(XC,i_what,ia)
+             IF (PRESENT(e_cmp)  .AND. mykey == 0 ) e_cmp(ia,XC,i_what) = sgn*e_at(XC,i_what,ia)
+          ENDDO
+       ENDDO
+       DEALLOCATE( e_at )
+       !
+    ENDIF
+#endif
+    !
     atoms: DO ia = ia_s, ia_e
+       !
+       IF ( batch ) EXIT atoms
        !
        i%a = ia                      ! atom's index
        i%t = ityp(ia)                ! type of atom ia
@@ -917,6 +1040,747 @@ MODULE paw_onecenter
     !
   END SUBROUTINE PAW_gcxc_potential
   !
+  !
+#if defined(_OPENACC)
+  !------------------------------------------------------------------------------------
+  SUBROUTINE PAW_xc_potential_batch( nt, m, l, nb, rho_lm, rho_core, v_lm, energy )
+    !---------------------------------------------------------------------------------
+    !! PAW_xc_potential and its gradient correction (PAW_gcxc_potential) for nb one-center
+    !! densities of species nt at once: the same sums in the same order, with the densities
+    !! as one more array dimension, so that the device kernels and the xc routines are
+    !! launched once per block of densities instead of once per atom and partial wave set.
+    !! One or two spin components (nspin_mag: unpolarised, also noncollinear without
+    !! magnetisation, or LSDA), every integration direction on this process (nproc_paw = 1),
+    !! radial_grad_style = 0.
+    !
+    USE lsda_mod,               ONLY : nspin
+    USE noncollin_module,       ONLY : nspin_mag
+    USE constants,              ONLY : e2
+    USE atom,                   ONLY : g => rgrid
+    USE xc_lib,                 ONLY : xclib_dft_is, xc, xc_gcx
+#if defined(__CUDA)
+    USE cudafor,                ONLY : cudaMemGetInfo
+#endif
+    !
+    INTEGER, INTENT(IN) :: nt
+    !! species
+    INTEGER, INTENT(IN) :: m
+    !! radial mesh
+    INTEGER, INTENT(IN) :: l
+    !! max angular momentum of the density + 1
+    INTEGER, INTENT(IN) :: nb
+    !! number of densities
+    REAL(DP), INTENT(IN) :: rho_lm(m,l**2,nspin,nb)
+    !! charge densities as lm components
+    REAL(DP), INTENT(IN) :: rho_core(m,nb)
+    !! core charge of each density, radial and spherical
+    REAL(DP), INTENT(OUT) :: v_lm(m,l**2,nspin,nb)
+    !! xc potentials as lm components
+    REAL(DP), INTENT(OUT) :: energy(nb)
+    !! xc energies
+    !
+    ! ... local variables
+    !
+    LOGICAL :: gga
+    INTEGER :: nx, l2, lin2, ns, nbc, nbc_max, nbc_alloc, b0, b, np, k, ix, is, lm, ixk, i0, c
+    REAL(DP) :: s, s2, t, asum, e, fact, co
+    REAL(DP), PARAMETER :: r12 = 1.0_DP / 3.0_DP
+#if defined(__CUDA)
+    INTEGER(KIND=8) :: mem_free, mem_total
+#endif
+    ! the integration tables of the species
+    REAL(DP), ALLOCATABLE :: ylm(:,:), wwylm(:,:), dylmt(:,:), dylmp(:,:), sin_th(:), cos_th(:), ww(:)
+    REAL(DP), ALLOCATABLE :: r(:), r2(:), rm2(:), rm3(:), rab(:)
+    ! radial samples of a block of densities: (radial point, direction, density) as one index
+    REAL(DP), ALLOCATABLE :: rr(:,:), arho(:,:), ex(:), ec(:), vx(:,:), vc(:,:), er(:), vr(:,:), es(:,:)
+    REAL(DP), ALLOCATABLE :: gx(:,:,:), v1x(:,:), v2x(:,:), v1c(:,:), v2c(:,:), v2cud(:), hr(:,:,:)
+    ! lm components of a block
+    REAL(DP), ALLOCATABLE :: hl(:,:,:,:,:), gcl(:,:,:,:), dl(:,:,:,:), ga(:,:,:,:)
+    !
+    IF (TIMING) CALL start_clock( 'PAW_xc_batch' )
+    !
+    gga  = xclib_dft_is('gradient')
+    nx   = rad(nt)%nx
+    l2   = l**2
+    lin2 = l2
+    IF ( gga ) lin2 = (l+rad(nt)%ladd)**2
+    ns   = nspin_mag
+    fact = 1.0_DP/DBLE(ns)
+    !
+    ALLOCATE( ylm(nx,lin2), wwylm(nx,lin2), ww(nx), r(m), r2(m), rm2(m), rm3(m), rab(m) )
+    ALLOCATE( dylmt(nx,lin2), dylmp(nx,lin2), sin_th(nx), cos_th(nx) )
+    ylm(:,:)   = rad(nt)%ylm(1:nx,1:lin2)
+    wwylm(:,:) = rad(nt)%wwylm(1:nx,1:lin2)
+    ww(:)      = rad(nt)%ww(1:nx)
+    IF ( gga ) THEN
+       dylmt(:,:) = rad(nt)%dylmt(1:nx,1:lin2)
+       dylmp(:,:) = rad(nt)%dylmp(1:nx,1:lin2)
+       sin_th(:)  = rad(nt)%sin_th(1:nx)
+       cos_th(:)  = rad(nt)%cos_th(1:nx)
+    ELSE
+       dylmt = 0.0_DP ; dylmp = 0.0_DP ; sin_th = 1.0_DP ; cos_th = 0.0_DP
+    ENDIF
+    r(:)   = g(nt)%r(1:m)
+    r2(:)  = g(nt)%r2(1:m)
+    rm2(:) = g(nt)%rm2(1:m)
+    rm3(:) = g(nt)%rm3(1:m)
+    rab(:) = g(nt)%rab(1:m)
+    !
+    ! ... blocks of densities: about four million radial samples at a time (some 350 bytes of
+    ! ... device memory per sample with the work space of the xc routines), fewer where the
+    ! ... device has less than three times that free
+    nbc_max   = MAX( 1, MIN( nb, INT( 4.0E6_DP / DBLE(m*nx) ) ) )
+#if defined(__CUDA)
+    IF ( cudaMemGetInfo( mem_free, mem_total ) == 0 ) &
+       nbc_max = MAX( 1, MIN( nbc_max, INT( DBLE(mem_free) / ( 3.0_DP * 350.0_DP * DBLE(m*nx) ) ) ) )
+#endif
+    nbc_alloc = 0
+    !
+    !$acc data copyin( rho_lm, rho_core ) copyout( v_lm ) &
+    !$acc&     copyin( ylm, wwylm, ww, dylmt, dylmp, sin_th, cos_th, r, r2, rm2, rm3, rab )
+    !
+    DO b0 = 0, nb-1, nbc_max
+       !
+       nbc = MIN( nbc_max, nb-b0 )
+       np  = m*nx*nbc
+       !
+       IF ( nbc /= nbc_alloc ) THEN
+          IF ( nbc_alloc > 0 ) THEN
+             !$acc exit data delete( rr, arho, ex, ec, vx, vc, er, vr, es )
+             DEALLOCATE( rr, arho, ex, ec, vx, vc, er, vr, es )
+             IF ( gga ) THEN
+                !$acc exit data delete( gx, v1x, v2x, v1c, v2c, v2cud, hr, hl, gcl, dl, ga )
+                DEALLOCATE( gx, v1x, v2x, v1c, v2c, v2cud, hr, hl, gcl, dl, ga )
+             ENDIF
+          ENDIF
+          ALLOCATE( rr(np,ns), arho(np,ns), ex(np), ec(np), vx(np,2), vc(np,2), er(np), vr(np,ns), es(nx,nbc) )
+          !$acc enter data create( rr, arho, ex, ec, vx, vc, er, vr, es )
+          IF ( gga ) THEN
+             ALLOCATE( gx(3,np,ns), v1x(np,ns), v2x(np,ns), v1c(np,ns), v2c(np,ns), v2cud(np), hr(np,3,ns), &
+                       hl(m,3,lin2,ns,nbc), gcl(m,l2,ns,nbc), dl(m,l2,ns,nbc), ga(m,l2,ns,nbc) )
+             !$acc enter data create( gx, v1x, v2x, v1c, v2c, v2cud, hr, hl, gcl, dl, ga )
+          ENDIF
+          nbc_alloc = nbc
+       ENDIF
+       !
+       ! ... the densities along every direction (PAW_lm2rad)
+       !$acc parallel loop collapse(4) private(s,ixk)
+       DO is = 1, ns
+         DO b = 1, nbc
+           DO ix = 1, nx
+             DO k = 1, m
+               ixk = ((b-1)*nx + ix-1)*m + k
+               s = 0._DP
+               !$acc loop seq
+               DO lm = 1, l2
+                 s = s + ylm(ix,lm)*rho_lm(k,lm,is,b0+b)
+               ENDDO
+               rr(ixk,is) = s
+             ENDDO
+           ENDDO
+         ENDDO
+       ENDDO
+       !
+       ! ... local (spin) density part. With two spins: up/down to sum/difference
+       !$acc parallel loop collapse(3) private(ixk,t)
+       DO b = 1, nbc
+         DO ix = 1, nx
+           DO k = 1, m
+             ixk = ((b-1)*nx + ix-1)*m + k
+             IF ( ns == 2 ) THEN
+               t = ( rr(ixk,1) + rr(ixk,2) )
+               arho(ixk,1) = t*rm2(k) + rho_core(k,b0+b)
+               arho(ixk,2) = ( t - rr(ixk,2) * 2._DP )*rm2(k)
+               er(ixk) = t + rho_core(k,b0+b)*r2(k)
+             ELSE
+               arho(ixk,1) = rr(ixk,1)*rm2(k) + rho_core(k,b0+b)
+               er(ixk) = rr(ixk,1) + rho_core(k,b0+b)*r2(k)
+             ENDIF
+           ENDDO
+         ENDDO
+       ENDDO
+       !
+       IF ( ns == 1 ) THEN
+         CALL xc( np, 1, 1, arho(:,1:1), ex, ec, vx(:,1:1), vc(:,1:1), gpu_args_=.TRUE. )
+       ELSE
+         CALL xc( np, 2, 2, arho, ex, ec, vx, vc, gpu_args_=.TRUE. )
+       ENDIF
+       !
+       !$acc parallel loop collapse(3) private(ixk)
+       DO b = 1, nbc
+         DO ix = 1, nx
+           DO k = 1, m
+             ixk = ((b-1)*nx + ix-1)*m + k
+             er(ixk) = e2*( ex(ixk) + ec(ixk) ) * er(ixk)
+             vr(ixk,1) = e2*( vx(ixk,1) + vc(ixk,1) )
+             IF ( ns == 2 ) vr(ixk,2) = e2*( vx(ixk,2) + vc(ixk,2) )
+           ENDDO
+         ENDDO
+       ENDDO
+       !
+       ! ... the energies: Simpson's rule along each direction, then the angular weights
+       !$acc parallel loop collapse(2) private(i0,asum)
+       DO b = 1, nbc
+         DO ix = 1, nx
+           i0 = ((b-1)*nx + ix-1)*m
+           asum = 0.0_DP
+           !$acc loop seq
+           DO k = 2, m-1
+             asum = asum + DBLE(ABS(MOD(k,2)-2)*2) * er(i0+k) * rab(k)
+           ENDDO
+           IF ( MOD(m,2) == 1 ) THEN
+             asum = ( asum + er(i0+1)*rab(1) + er(i0+m)*rab(m) ) * r12
+           ELSE
+             asum = ( asum + er(i0+1)*rab(1) - er(i0+m-2)*rab(m-2) * 0.25_DP &
+                                             + er(i0+m-1)*rab(m-1)           &
+                                             + er(i0+m)  *rab(m) * 1.25_DP ) * r12
+           ENDIF
+           es(ix,b) = asum
+         ENDDO
+       ENDDO
+       !$acc update self( es )
+       DO b = 1, nbc
+         e = 0._DP
+         DO ix = 1, nx
+           e = e + es(ix,b) * ww(ix)
+         ENDDO
+         energy(b0+b) = e
+       ENDDO
+       !
+       ! ... the potential back to its lm components (PAW_rad2lm)
+       !$acc parallel loop collapse(4) private(s,i0)
+       DO b = 1, nbc
+         DO is = 1, ns
+           DO lm = 1, l2
+             DO k = 1, m
+               s = 0._DP
+               !$acc loop seq
+               DO ix = 1, nx
+                 i0 = ((b-1)*nx + ix-1)*m
+                 s = s + vr(i0+k,is)*wwylm(ix,lm)
+               ENDDO
+               v_lm(k,lm,is,b0+b) = s
+             ENDDO
+           ENDDO
+         ENDDO
+       ENDDO
+       !
+       IF ( .NOT. gga ) CYCLE
+       !
+       ! ... gradient correction. The gradient of the density (PAW_gradient): the radial
+       !     derivative of rho/r**2 + core (radial_gradient with iflag=0) ...
+       DO is = 1, ns
+         !$acc parallel loop collapse(3) private(ixk)
+         DO b = 1, nbc
+           DO ix = 1, nx
+             DO k = 1, m
+               ixk = ((b-1)*nx + ix-1)*m + k
+               er(ixk) = rr(ixk,is)*rm2(k) + rho_core(k,b0+b)*fact
+             ENDDO
+           ENDDO
+         ENDDO
+         !$acc parallel loop collapse(3) private(ixk)
+         DO b = 1, nbc
+           DO ix = 1, nx
+             DO k = 1, m
+               ixk = ((b-1)*nx + ix-1)*m + k
+               IF ( k > 1 .AND. k < m ) THEN
+                 gx(1,ixk,is) = ( (r(k+1)-r(k))**2*(er(ixk-1)-er(ixk)) &
+                                 -(r(k-1)-r(k))**2*(er(ixk+1)-er(ixk)) ) &
+                                 / ((r(k+1)-r(k))*(r(k-1)-r(k))*(r(k+1)-r(k-1)))
+               ELSE
+                 gx(1,ixk,is) = 0.0_DP
+               ENDIF
+             ENDDO
+           ENDDO
+         ENDDO
+         !$acc parallel loop collapse(2) private(i0)
+         DO b = 1, nbc
+           DO ix = 1, nx
+             i0 = ((b-1)*nx + ix-1)*m
+             gx(1,i0+1,is) = gx(1,i0+2,is) + (gx(1,i0+3,is)-gx(1,i0+2,is)) * (r(1)-r(2)) / (r(3)-r(2))
+           ENDDO
+         ENDDO
+       ENDDO
+       ! ... and the angular ones; the full density
+       !$acc parallel loop collapse(4) private(ixk,s,s2,co)
+       DO is = 1, ns
+         DO b = 1, nbc
+           DO ix = 1, nx
+             DO k = 1, m
+               ixk = ((b-1)*nx + ix-1)*m + k
+               s = 0._DP ; s2 = 0._DP
+               !$acc loop seq
+               DO lm = 2, l2
+                 s  = s  + dylmp(ix,lm) * rho_lm(k,lm,is,b0+b)
+                 s2 = s2 + dylmt(ix,lm) * rho_lm(k,lm,is,b0+b)
+               ENDDO
+               gx(2,ixk,is) = s  * rm3(k)
+               gx(3,ixk,is) = s2 * rm3(k)
+               ! (the core charge is half spin up and half spin down)
+               co = rho_core(k,b0+b)/DBLE(ns)
+               arho(ixk,is) = rr(ixk,is)*rm2(k) + co
+               IF ( ns == 1 ) arho(ixk,1) = ABS( arho(ixk,1) )
+             ENDDO
+           ENDDO
+         ENDDO
+       ENDDO
+       !
+       IF ( ns == 1 ) THEN
+         CALL xc_gcx( np, 1, arho, gx, ex, ec, v1x, v2x, v1c, v2c, gpu_args_=.TRUE. )
+       ELSE
+         CALL xc_gcx( np, 2, arho, gx, ex, ec, v1x, v2x, v1c, v2c, v2cud, gpu_args_=.TRUE. )
+       ENDIF
+       !
+       ! ... gc_rad (in vr) and h = D(rho*Exc)/D(|grad rho|) * (grad rho) / |grad rho|
+       !$acc parallel loop collapse(3) private(ixk)
+       DO b = 1, nbc
+         DO ix = 1, nx
+           DO k = 1, m
+             ixk = ((b-1)*nx + ix-1)*m + k
+             er(ixk) = e2*(ex(ixk)+ec(ixk))*r2(k)
+             vr(ixk,1) = v1x(ixk,1)+v1c(ixk,1)
+             IF ( ns == 1 ) THEN
+               hr(ixk,1,1) = (v2x(ixk,1)+v2c(ixk,1))*gx(1,ixk,1)*r2(k)
+               hr(ixk,2,1) = (v2x(ixk,1)+v2c(ixk,1))*gx(2,ixk,1)*r2(k)
+               hr(ixk,3,1) = (v2x(ixk,1)+v2c(ixk,1))*gx(3,ixk,1)*r2(k)
+             ELSE
+               vr(ixk,2) = v1x(ixk,2)+v1c(ixk,2)
+               hr(ixk,1,1) = ( (v2x(ixk,1)+v2c(ixk,1))*gx(1,ixk,1) + v2cud(ixk)*gx(1,ixk,2) )*r2(k)
+               hr(ixk,2,1) = ( (v2x(ixk,1)+v2c(ixk,1))*gx(2,ixk,1) + v2cud(ixk)*gx(2,ixk,2) )*r2(k)
+               hr(ixk,3,1) = ( (v2x(ixk,1)+v2c(ixk,1))*gx(3,ixk,1) + v2cud(ixk)*gx(3,ixk,2) )*r2(k)
+               hr(ixk,1,2) = ( (v2x(ixk,2)+v2c(ixk,2))*gx(1,ixk,2) + v2cud(ixk)*gx(1,ixk,1) )*r2(k)
+               hr(ixk,2,2) = ( (v2x(ixk,2)+v2c(ixk,2))*gx(2,ixk,2) + v2cud(ixk)*gx(2,ixk,1) )*r2(k)
+               hr(ixk,3,2) = ( (v2x(ixk,2)+v2c(ixk,2))*gx(3,ixk,2) + v2cud(ixk)*gx(3,ixk,1) )*r2(k)
+             ENDIF
+           ENDDO
+         ENDDO
+       ENDDO
+       !
+       ! ... its energy
+       !$acc parallel loop collapse(2) private(i0,asum)
+       DO b = 1, nbc
+         DO ix = 1, nx
+           i0 = ((b-1)*nx + ix-1)*m
+           asum = 0.0_DP
+           !$acc loop seq
+           DO k = 2, m-1
+             asum = asum + DBLE(ABS(MOD(k,2)-2)*2) * er(i0+k) * rab(k)
+           ENDDO
+           IF ( MOD(m,2) == 1 ) THEN
+             asum = ( asum + er(i0+1)*rab(1) + er(i0+m)*rab(m) ) * r12
+           ELSE
+             asum = ( asum + er(i0+1)*rab(1) - er(i0+m-2)*rab(m-2) * 0.25_DP &
+                                             + er(i0+m-1)*rab(m-1)           &
+                                             + er(i0+m)  *rab(m) * 1.25_DP ) * r12
+           ENDIF
+           es(ix,b) = asum
+         ENDDO
+       ENDDO
+       !$acc update self( es )
+       DO b = 1, nbc
+         e = 0._DP
+         DO ix = 1, nx
+           e = e + es(ix,b) * ww(ix)
+         ENDDO
+         energy(b0+b) = energy(b0+b) + e
+       ENDDO
+       !
+       ! ... the first part of the correction back to spherical harmonics
+       !$acc parallel loop collapse(4) private(s,i0)
+       DO b = 1, nbc
+         DO is = 1, ns
+           DO lm = 1, l2
+             DO k = 1, m
+               s = 0._DP
+               !$acc loop seq
+               DO ix = 1, nx
+                 i0 = ((b-1)*nx + ix-1)*m
+                 s = s + vr(i0+k,is)*wwylm(ix,lm)
+               ENDDO
+               gcl(k,lm,is,b) = s
+             ENDDO
+           ENDDO
+         ENDDO
+       ENDDO
+       !
+       ! ... the theta component of h divided by sin(theta), as in PAW_gcxc_potential;
+       !     h in spherical harmonics up to the higher lm (PAW_rad2lm3)
+       !$acc parallel loop collapse(4) private(ixk)
+       DO is = 1, ns
+         DO b = 1, nbc
+           DO ix = 1, nx
+             DO k = 1, m
+               ixk = ((b-1)*nx + ix-1)*m + k
+               hr(ixk,3,is) = hr(ixk,3,is) / sin_th(ix)
+             ENDDO
+           ENDDO
+         ENDDO
+       ENDDO
+       !$acc parallel loop collapse(5) private(s,i0)
+       DO b = 1, nbc
+         DO is = 1, ns
+           DO lm = 1, lin2
+             DO c = 1, 3
+               DO k = 1, m
+                 s = 0._DP
+                 !$acc loop seq
+                 DO ix = 1, nx
+                   i0 = ((b-1)*nx + ix-1)*m
+                   s = s + hr(i0+k,c,is) * wwylm(ix,lm)
+                 ENDDO
+                 hl(k,c,lm,is,b) = s
+               ENDDO
+             ENDDO
+           ENDDO
+         ENDDO
+       ENDDO
+       !
+       ! ... its divergence (PAW_divergence): the angular part along every direction (in vr) ...
+       !$acc parallel loop collapse(4) private(ixk,s)
+       DO is = 1, ns
+         DO b = 1, nbc
+           DO ix = 1, nx
+             DO k = 1, m
+               ixk = ((b-1)*nx + ix-1)*m + k
+               s = hl(k,3,1,is,b) * (dylmt(ix,1)*sin_th(ix) + 2.0_DP*ylm(ix,1)*cos_th(ix))
+               !$acc loop seq
+               DO lm = 2, lin2
+                 s = s + dylmp(ix,lm)* (hl(k,2,lm,is,b)) + &
+                     hl(k,3,lm,is,b) * (dylmt(ix,lm)*sin_th(ix) + &
+                     2.0_DP*ylm(ix,lm)*cos_th(ix))
+               ENDDO
+               vr(ixk,is) = s
+             ENDDO
+           ENDDO
+         ENDDO
+       ENDDO
+       ! ... in spherical harmonics, times 1/r**3 ...
+       !$acc parallel loop collapse(4) private(s,i0)
+       DO b = 1, nbc
+         DO is = 1, ns
+           DO lm = 1, l2
+             DO k = 1, m
+               s = 0._DP
+               !$acc loop seq
+               DO ix = 1, nx
+                 i0 = ((b-1)*nx + ix-1)*m
+                 s = s + vr(i0+k,is)*wwylm(ix,lm)
+               ENDDO
+               dl(k,lm,is,b) = s * rm3(k)
+             ENDDO
+           ENDDO
+         ENDDO
+       ENDDO
+       ! ... plus the radial derivative of the radial component (radial_gradient with iflag=0)
+       !$acc parallel loop collapse(4)
+       DO b = 1, nbc
+         DO is = 1, ns
+           DO lm = 1, l2
+             DO k = 1, m
+               IF ( k > 1 .AND. k < m ) THEN
+                 ga(k,lm,is,b) = ( (r(k+1)-r(k))**2*(hl(k-1,1,lm,is,b)-hl(k,1,lm,is,b)) &
+                                  -(r(k-1)-r(k))**2*(hl(k+1,1,lm,is,b)-hl(k,1,lm,is,b)) ) &
+                                  / ((r(k+1)-r(k))*(r(k-1)-r(k))*(r(k+1)-r(k-1)))
+               ELSE
+                 ga(k,lm,is,b) = 0.0_DP
+               ENDIF
+             ENDDO
+           ENDDO
+         ENDDO
+       ENDDO
+       !$acc parallel loop collapse(3)
+       DO b = 1, nbc
+         DO is = 1, ns
+           DO lm = 1, l2
+             ga(1,lm,is,b) = ga(2,lm,is,b) + (ga(3,lm,is,b)-ga(2,lm,is,b)) * (r(1)-r(2)) / (r(3)-r(2))
+           ENDDO
+         ENDDO
+       ENDDO
+       ! ... the corrected potential
+       !$acc parallel loop collapse(4)
+       DO b = 1, nbc
+         DO is = 1, ns
+           DO lm = 1, l2
+             DO k = 1, m
+               dl(k,lm,is,b) = dl(k,lm,is,b) + ga(k,lm,is,b)*rm2(k)
+               v_lm(k,lm,is,b0+b) = v_lm(k,lm,is,b0+b) + e2*(gcl(k,lm,is,b)-dl(k,lm,is,b))
+             ENDDO
+           ENDDO
+         ENDDO
+       ENDDO
+       !
+    ENDDO
+    !
+    IF ( nbc_alloc > 0 ) THEN
+       !$acc exit data delete( rr, arho, ex, ec, vx, vc, er, vr, es )
+       DEALLOCATE( rr, arho, ex, ec, vx, vc, er, vr, es )
+       IF ( gga ) THEN
+          !$acc exit data delete( gx, v1x, v2x, v1c, v2c, v2cud, hr, hl, gcl, dl, ga )
+          DEALLOCATE( gx, v1x, v2x, v1c, v2c, v2cud, hr, hl, gcl, dl, ga )
+       ENDIF
+    ENDIF
+    !
+    !$acc end data
+    !
+    ! (spin components beyond nspin_mag hold nothing)
+    IF ( ns < nspin ) v_lm(:,:,ns+1:nspin,:) = 0._DP
+    !
+    DEALLOCATE( ylm, wwylm, ww, dylmt, dylmp, sin_th, cos_th, r, r2, rm2, rm3, rab )
+    !
+    IF (TIMING) CALL stop_clock( 'PAW_xc_batch' )
+    !
+  END SUBROUTINE PAW_xc_potential_batch
+#endif
+  !
+  !------------------------------------------------------------------------------------
+  SUBROUTINE PAW_h_potential_batch( nt, m, l, nb, rho_lm, v_lm, energy )
+    !---------------------------------------------------------------------------------
+    !! PAW_h_potential for nb one-center densities of species nt at once. The radial
+    !! Poisson equation of every lm component is the tridiagonal system of radial_grids'
+    !! hartree, whose matrix depends on l only: it is factorized once per l (dpttrf, as dptsv
+    !! does) and every step runs over all the components of that l together, the same
+    !! operations on each of them as in hartree.
+    !
+    USE constants,              ONLY : fpi, e2
+    USE radial_grids,           ONLY : series
+    USE noncollin_module,       ONLY : nspin_lsda
+    USE lsda_mod,               ONLY : nspin
+    USE atom,                   ONLY : g => rgrid
+    !
+    INTEGER, INTENT(IN) :: nt
+    !! species
+    INTEGER, INTENT(IN) :: m
+    !! radial mesh
+    INTEGER, INTENT(IN) :: l
+    !! max angular momentum of the density + 1
+    INTEGER, INTENT(IN) :: nb
+    !! number of densities
+    REAL(DP), INTENT(IN)  :: rho_lm(m,l**2,nspin,nb)
+    !! charge densities as lm components
+    REAL(DP), INTENT(OUT) :: v_lm(m,l**2,nb)
+    !! Hartree potentials as lm components
+    REAL(DP), INTENT(OUT) :: energy(nb)
+    !! Hartree energies
+    !
+    ! ... local variables
+    !
+    INTEGER :: ll, lm, lm0, nlm, nr, j, b, i, k21, nst, nk1, n, info
+    REAL(DP) :: pref, ch, xkh2, ei, di, f1, fn, s1k, s2k, e, dser(4), eser(5)
+    REAL(DP), ALLOCATABLE :: f(:,:), vh(:,:), c0(:), c2(:), c3(:), vhim1(:), vhi(:), d(:), ee(:), aux(:)
+    !
+    IF (TIMING) CALL start_clock( 'PAW_h_batch' )
+    !
+    n = m - 2
+    ALLOCATE( d(m), ee(m), aux(m) )
+    !
+    DO ll = 0, l-1
+       !
+       lm0 = ll**2
+       nlm = 2*ll + 1
+       nr  = nlm*nb
+       pref = e2*fpi/DBLE(2*ll+1)
+       k21 = 2*ll + 1
+       nst = 2*ll + 2
+       nk1 = nst - ll - 1
+       ALLOCATE( f(nr,m), vh(nr,m), c0(nr), c2(nr), c3(nr), vhim1(nr), vhi(nr) )
+       !
+       ! ... the input of hartree: 4 pi e2/(2l+1) times the density summed on spin
+       DO b = 1, nb
+          DO lm = 1, nlm
+             j = (b-1)*nlm + lm
+             DO i = 1, m
+                f(j,i) = pref * SUM( rho_lm(i,lm0+lm,1:nspin_lsda,b) )
+             ENDDO
+          ENDDO
+       ENDDO
+       !
+       ! ... the series expansion of the solution close to r=0
+       IF ( nk1 >= 3 ) THEN
+          c2(:) = 0.0_DP
+          c3(:) = 0.0_DP
+       ELSE
+          DO j = 1, nr
+             eser(:) = 0.0_DP
+             DO i = 1, 4
+                dser(i) = -k21*f(j,i)/g(nt)%r(i)**nst
+             ENDDO
+             CALL series( dser, g(nt)%r, g(nt)%r2, eser(nk1) )
+             c2(j) = eser(1)/(4.0_DP*ll+6.0_DP)
+             c3(j) = eser(2)/(6.0_DP*ll+12.0_DP)
+          ENDDO
+       ENDIF
+       !
+       ! ... the tridiagonal system of this l and its factorization
+       ch   = g(nt)%dx*g(nt)%dx/12.0_DP
+       xkh2 = ch*(DBLE(ll)+0.5_DP)**2
+       ei   = 1.0_DP-xkh2
+       di   = -(2.0_DP+10.0_DP*xkh2)
+       DO i = 2, m
+          d(i)  = -di
+          ee(i) = -ei
+       ENDDO
+       f1 = (g(nt)%sqr(1)/g(nt)%sqr(2))**k21
+       d(2) = d(2)-ei*f1
+       fn = (g(nt)%sqr(m-1)/g(nt)%sqr(m))**k21
+       d(m-1) = d(m-1)-ei*fn
+       CALL dpttrf( n, d(2), ee(2), info )
+       IF ( info /= 0 ) CALL errore( 'PAW_h_potential_batch', 'error in lapack', ABS(info) )
+       !
+       ! ... the right hand sides
+       DO i = 2, m
+          s1k = k21*ch*g(nt)%sqr(i)
+          DO j = 1, nr
+             vh(j,i) = s1k*f(j,i)
+          ENDDO
+       ENDDO
+       s1k = k21*ch*g(nt)%sqr(1)
+       DO j = 1, nr
+          vhim1(j) = s1k*f(j,1)
+       ENDDO
+       DO i = 2, m-1
+          DO j = 1, nr
+             vhi(j)   = vh(j,i)
+             vh(j,i)  = vhim1(j)+10.0_DP*vhi(j)+vh(j,i+1)
+             vhim1(j) = vhi(j)
+          ENDDO
+       ENDDO
+       s1k = ei*g(nt)%sqr(1)**k21
+       s2k = g(nt)%r2(2)-g(nt)%r2(1)
+       DO j = 1, nr
+          vh(j,2) = vh(j,2)-s1k*(c2(j)*s2k+c3(j)*(g(nt)%r(2)**3-g(nt)%r(1)**3))
+       ENDDO
+       !
+       ! ... solve (dpttrs: L D L^T), rows 2 .. m-1
+       DO i = 3, m-1
+          DO j = 1, nr
+             vh(j,i) = vh(j,i) - vh(j,i-1)*ee(i-1)
+          ENDDO
+       ENDDO
+       DO j = 1, nr
+          vh(j,m-1) = vh(j,m-1)/d(m-1)
+       ENDDO
+       DO i = m-2, 2, -1
+          DO j = 1, nr
+             vh(j,i) = vh(j,i)/d(i) - vh(j,i+1)*ee(i)
+          ENDDO
+       ENDDO
+       !
+       ! ... the first and the last point, the factor sqrt(r)/r
+       DO j = 1, nr
+          c0(j) = vh(j,2)/g(nt)%sqr(2)**k21-c2(j)*g(nt)%r2(2)-c3(j)*g(nt)%r(2)*g(nt)%r2(2)
+          vh(j,1) = g(nt)%sqr(1)**k21*(c0(j)+c2(j)*g(nt)%r2(1)+c3(j)*g(nt)%r(1)**3)
+          vh(j,m) = vh(j,m-1)*fn
+       ENDDO
+       DO b = 1, nb
+          DO lm = 1, nlm
+             j = (b-1)*nlm + lm
+             DO i = 1, m
+                v_lm(i,lm0+lm,b) = vh(j,i) / g(nt)%sqr(i)
+             ENDDO
+          ENDDO
+       ENDDO
+       !
+       DEALLOCATE( f, vh, c0, c2, c3, vhim1, vhi )
+       !
+    ENDDO
+    !
+    ! ... the energies: E_h = 1/2 \sum_lm \int v_lm(r) (rho_lm(r) r^2) dr
+    DO b = 1, nb
+       energy(b) = 0._DP
+       DO lm = 1, l**2
+          DO i = 1, m
+             aux(i) = v_lm(i,lm,b) * SUM( rho_lm(i,lm,1:nspin_lsda,b) )
+          ENDDO
+          CALL simpson( m, aux, g(nt)%rab, e )
+          energy(b) = energy(b) + e
+       ENDDO
+       energy(b) = energy(b)/2._DP
+    ENDDO
+    !
+    DEALLOCATE( d, ee, aux )
+    !
+    IF (TIMING) CALL stop_clock( 'PAW_h_batch' )
+    !
+  END SUBROUTINE PAW_h_potential_batch
+  !
+  !------------------------------------------------------------------------------------
+  SUBROUTINE PAW_d_integrals( i, sgn, kkbeta, pfunc, v_lm, d, aug )
+    !---------------------------------------------------------------------------------
+    !! The integrals of the potential v_lm with the one-center density of each pair of
+    !! partial waves of atom i%a, added to d with the sign sgn: what PAW_potential obtains
+    !! from PAW_rho_lm with a single non-zero cross band occupation, restricted to the lm
+    !! components that pair has (the others integrate to zero).
+    !
+    USE ions_base,         ONLY : nat
+    USE lsda_mod,          ONLY : nspin
+    USE noncollin_module,  ONLY : nspin_mag
+    USE uspp_param,        ONLY : upf, nh, nhm
+    USE uspp,              ONLY : indv, ap, nhtolm, lpl, lpx
+    USE atom,              ONLY : g => rgrid
+    !
+    TYPE(paw_info), INTENT(IN) :: i
+    !! atom's minimal info
+    REAL(DP), INTENT(IN) :: sgn
+    !! +1 for AE, -1 for PS
+    INTEGER, INTENT(IN) :: kkbeta
+    !! upper limit of the radial integrals
+    REAL(DP), INTENT(IN) :: pfunc(i%m,i%b,i%b)
+    !! psi_i * psi_j
+    REAL(DP), INTENT(IN) :: v_lm(i%m,i%l**2,nspin)
+    !! potential as lm components
+    REAL(DP), INTENT(INOUT) :: d(nhm*(nhm+1)/2,nat,nspin)
+    !! descreening coefficients
+    REAL(DP), OPTIONAL, INTENT(IN) :: aug(i%m,(i%b*(i%b+1))/2,0:2*upf(i%t)%lmax)
+    !! augmentation functions (only for PS part)
+    !
+    ! ... local variables
+    !
+    INTEGER :: is, ih, jh, ijh, nb, mb, nmb, lp, lm, l, l2, j
+    REAL(DP) :: pref, integral
+    REAL(DP), ALLOCATABLE :: w(:,:)
+    LOGICAL, ALLOCATABLE :: used(:)
+    !
+    l2 = i%l**2
+    ALLOCATE( w(kkbeta,l2), used(l2) )
+    !
+    DO is = 1, nspin_mag
+       ijh = 0
+       DO ih = 1, nh(i%t)
+          DO jh = ih, nh(i%t)
+             ijh = ijh+1
+             nb  = indv(ih,i%t)
+             mb  = indv(jh,i%t)
+             nmb = (mb*(mb-1))/2 + nb
+             used(:) = .FALSE.
+             DO lp = 1, lpx (nhtolm(jh,i%t), nhtolm(ih,i%t))
+                lm = lpl (nhtolm(jh,i%t), nhtolm(ih,i%t), lp)
+                pref = 1._DP * ap(lm, nhtolm(ih,i%t), nhtolm(jh,i%t))
+                IF ( .NOT. used(lm) ) THEN
+                   w(:,lm) = 0._DP
+                   used(lm) = .TRUE.
+                ENDIF
+                w(1:kkbeta,lm) = w(1:kkbeta,lm) + pref * pfunc(1:kkbeta, nb, mb)
+                IF (PRESENT(aug)) THEN
+                   l = INT(SQRT(DBLE(lm-1)))
+                   w(1:kkbeta,lm) = w(1:kkbeta,lm) + pref * aug(1:kkbeta, nmb, l)
+                ENDIF
+             ENDDO
+             DO lm = 1, l2
+                IF ( .NOT. used(lm) ) CYCLE
+                DO j = 1, kkbeta
+                   w(j,lm) = w(j,lm) * v_lm(j,lm,is)
+                ENDDO
+                CALL simpson( kkbeta, w(1,lm), g(i%t)%rab(1), integral )
+                d(ijh,i%a,is) = d(ijh,i%a,is) + sgn * integral
+             ENDDO
+          ENDDO
+       ENDDO
+    ENDDO
+    !
+    DEALLOCATE( w, used )
+    !
+  END SUBROUTINE PAW_d_integrals
   !
   !-------------------------------------------------------------------------------
   SUBROUTINE PAW_divergence( i, F_lm, div_F_lm, lmaxq_in, lmaxq_out )
