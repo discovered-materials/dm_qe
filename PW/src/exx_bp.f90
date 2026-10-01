@@ -1818,7 +1818,7 @@ MODULE exx_bp
     !
     !precompute these guys
     omega_inv = 1.0 / omega
-    nqs_inv = 1.0 / nqs
+    nqs_inv = 1.0_DP / nqs
     !
     !------------------------------------------------------------------------!
     ! Beginning of main loop
@@ -2294,7 +2294,7 @@ MODULE exx_bp
     !
     !precompute these guys
     omega_inv = 1.0 / omega
-    nqs_inv = 1.0 / nqs
+    nqs_inv = 1.0_DP / nqs
     !
     CALL stop_clock( 'vexx_k_setup' )
     CALL start_clock( 'vexx_k_main' )
