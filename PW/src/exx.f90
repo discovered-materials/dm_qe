@@ -43,6 +43,12 @@ MODULE exx
   INTEGER :: xi_d_k = -1
   !! the k-point whose ACE projectors xi_d holds (-1: none): h_psi is applied many times to the
   !! same k-point, and xi is uploaded when the k-point changes, not at every application
+  COMPLEX(DP), ALLOCATABLE :: xi_all_d(:,:,:)
+  !! the ACE projectors of every k-point on the device, when they fit there comfortably: a
+  !! change of k-point is then a copy on the device (ace_to_device)
+#if defined(__CUDA)
+  ATTRIBUTES(DEVICE) :: xi_all_d
+#endif
   LOGICAL :: domat
   !! 
   ! ... energy related variables
@@ -331,6 +337,7 @@ MODULE exx
     IF ( ALLOCATED(exxmat) )       DEALLOCATE( exxmat )
     IF ( ALLOCATED(xi)   )         DEALLOCATE( xi   )
     IF ( ALLOCATED(xi_d) )         DEALLOCATE( xi_d )
+    IF ( ALLOCATED(xi_all_d) )     DEALLOCATE( xi_all_d )
     xi_d_k = -1
     IF ( ALLOCATED(evc0) )         DEALLOCATE( evc0 )
     !
@@ -787,11 +794,7 @@ MODULE exx
     CALL mp_sum( eexx, inter_pool_comm )
     ! WRITE(stdout,'(/,5X,"ACE energy",f15.8)') eexx
     !
-#if defined (__CUDA)
-    IF (nks == 1) xi_d(:,:) = xi(:,:,1)
-#endif
-    xi_d_k = -1      ! xi has changed: the device copy of any k-point is stale
-    IF (nks == 1) xi_d_k = 1
+    CALL ace_to_device()
     !
     IF (PRESENT(exex)) exex = eexx
     IF ( okvan ) CALL deallocate_bec_type( becpsi )
@@ -799,6 +802,51 @@ MODULE exx
     domat = .FALSE.
     !
   END SUBROUTINE aceinit
+  !
+  !-----------------------------------------------------------------------------
+  SUBROUTINE ace_to_device()
+    !---------------------------------------------------------------------------
+    !! The device copies of the ACE projectors after xi has been (re)written on the host: the
+    !! one k-point of a single-k run, or every k-point when that takes little of the device
+    !! memory, so that vexxace need not upload xi whenever the k-point changes.
+    !
+    USE wvfct,      ONLY : npwx
+    USE klist,      ONLY : nks
+#if defined(__CUDA)
+    USE cudafor,    ONLY : cudaMemGetInfo
+#endif
+    !
+    IMPLICIT NONE
+    !
+#if defined(__CUDA)
+    INTEGER :: istat
+    INTEGER(KIND=8) :: need, free_, total_
+    LOGICAL :: fits
+    !
+    xi_d_k = -1      ! xi has changed: the device copy of any k-point is stale
+    IF ( .NOT. use_gpu .OR. .NOT. ALLOCATED(xi_d) ) RETURN
+    IF ( nks == 1 ) THEN
+       xi_d(:,:) = xi(:,:,1)
+       xi_d_k = 1
+       RETURN
+    ENDIF
+    need = 16_8 * INT(SIZE(xi,1),8) * INT(SIZE(xi,2),8) * INT(nks,8)
+    IF ( ALLOCATED(xi_all_d) ) THEN
+       IF ( SIZE(xi_all_d,1) /= SIZE(xi,1) .OR. SIZE(xi_all_d,2) /= SIZE(xi,2) .OR. SIZE(xi_all_d,3) /= nks ) &
+          DEALLOCATE( xi_all_d )
+    ENDIF
+    fits = ALLOCATED(xi_all_d)
+    IF ( .NOT. fits ) THEN
+       istat = cudaMemGetInfo( free_, total_ )
+       fits = ( istat == 0 .AND. need <= 2147483648_8 .AND. 8_8*need < free_ )
+       IF ( fits ) ALLOCATE( xi_all_d(SIZE(xi,1),SIZE(xi,2),nks) )
+    ENDIF
+    IF ( fits ) xi_all_d(:,:,:) = xi(:,:,1:nks)
+#else
+    xi_d_k = -1
+#endif
+    !
+  END SUBROUTINE ace_to_device
   !
   !
   !---------------------------------------------------------------------------------
@@ -1003,7 +1051,11 @@ MODULE exx
     ALLOCATE( rmexx_d(nbndproj,nbnd), cmexx_d(nbndproj,nbnd) )
     !
     IF ( nks > 1 .AND. xi_d_k /= current_k ) THEN
-       xi_d(:,:) = xi(:,:,current_k)
+       IF ( ALLOCATED(xi_all_d) ) THEN
+          xi_d(:,:) = xi_all_d(:,:,current_k)
+       ELSE
+          xi_d(:,:) = xi(:,:,current_k)
+       ENDIF
        xi_d_k = current_k
     ENDIF
     !
@@ -1412,7 +1464,11 @@ MODULE exx
     ALLOCATE( cmexx_d(nbndproj,nbnd) )
     !
     IF ( nks > 1 .AND. xi_d_k /= current_k ) THEN
-       xi_d(:,:) = xi(:,:,current_k)
+       IF ( ALLOCATED(xi_all_d) ) THEN
+          xi_d(:,:) = xi_all_d(:,:,current_k)
+       ELSE
+          xi_d(:,:) = xi(:,:,current_k)
+       ENDIF
        xi_d_k = current_k
     ENDIF
     !

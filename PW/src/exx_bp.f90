@@ -270,15 +270,16 @@ MODULE exx_bp
 #if defined(__CUDA)
     attributes(DEVICE)      :: psic_nc_d
 #endif
-    ! device-side fill of exxbuff (collinear, one FFT process, one pool, no localization)
+    ! device-side fill of exxbuff (one FFT process, one pool, no localization)
     LOGICAL :: gpu_fill
     CHARACTER(LEN=96) :: fill_why
 #if defined(__CUDA)
-    COMPLEX(DP), ALLOCATABLE :: temppsic_d(:), evc_exx_d(:,:)
+    COMPLEX(DP), ALLOCATABLE :: temppsic_d(:), evc_exx_d(:,:), tnc1_d(:), tnc2_d(:)
     INTEGER, ALLOCATABLE :: rir_d(:,:)
     INTEGER, POINTER :: nlt_d(:), nlmt_d(:)
     INTEGER :: jb1, jb2
-    attributes(DEVICE) :: temppsic_d, evc_exx_d, rir_d, nlt_d, nlmt_d
+    COMPLEX(DP) :: u11, u21, u12, u22, za, zb
+    attributes(DEVICE) :: temppsic_d, evc_exx_d, rir_d, nlt_d, nlmt_d, tnc1_d, tnc2_d
 #endif
     INTEGER :: nxxs, nrxxs
 #if defined(__MPI)
@@ -380,10 +381,11 @@ MODULE exx_bp
 #endif
     gpu_fill = .FALSE.
 #if defined(__CUDA)
-    gpu_fill = use_gpu .AND. (.NOT. noncolin) .AND. (local_thr <= 0.0_DP) .AND. &
+    gpu_fill = use_gpu .AND. (local_thr <= 0.0_DP) .AND. &
                (dfftt%nproc == 1) .AND. (npool == 1) .AND. (nrxxs == nxxs)
     IF (gpu_fill) THEN
        ALLOCATE( temppsic_d(nrxxs), evc_exx_d(SIZE(evc_exx,1),SIZE(evc_exx,2)) )
+       IF (noncolin) ALLOCATE( tnc1_d(nrxxs), tnc2_d(nrxxs) )
        nlt_d => dfftt%nl_d
        IF (gamma_only) THEN
           ! no symmetry table at Gamma (exx_set_symm is not called)
@@ -497,7 +499,20 @@ MODULE exx_bp
           DO ibnd = iexx_start, iexx_end
              !
              ibnd_exx = ibnd
-             IF (noncolin) THEN
+             IF (noncolin .AND. gpu_fill) THEN
+#if defined(__CUDA)
+                ! the two spinor components of psi_k,ibnd(r) on the device
+                tnc1_d = ( 0._DP, 0._DP )
+                tnc2_d = ( 0._DP, 0._DP )
+                !$cuf kernel do (1)
+                DO ig = 1, npw
+                   tnc1_d( nlt_d(igk_exx_d(ig,ik)) ) = evc_exx_d(ig,ibnd-iexx_start+1)
+                   tnc2_d( nlt_d(igk_exx_d(ig,ik)) ) = evc_exx_d(ig+npwx,ibnd-iexx_start+1)
+                ENDDO
+                CALL invfft( 'Wave', tnc1_d, dfftt )
+                CALL invfft( 'Wave', tnc2_d, dfftt )
+#endif
+             ELSE IF (noncolin) THEN
 !$omp parallel do default(shared) private(ir) firstprivate(nrxxs)
                 DO ir = 1, nrxxs
                    temppsic_nc(ir,1) = ( 0._DP, 0._DP )
@@ -543,7 +558,32 @@ MODULE exx_bp
                 IF (index_xk(ikq) /= current_ik) CYCLE
                 isym = ABS(index_sym(ikq) )
                 !
-                IF (noncolin) THEN ! noncolinear
+                IF (noncolin .AND. gpu_fill) THEN
+#if defined(__CUDA)
+                   ! rotate the grid and the spinor on the device, straight into exxbuff_d: the host
+                   ! formulas, psi'(ir,ip) = sum_jp conj(d_spin(jp,ip)) psi(rir(ir),jp), and with
+                   ! time reversal spin 1 -> 2*, 2 -> -1*
+                   u11 = CONJG( d_spin(1,1,isym) ); u21 = CONJG( d_spin(2,1,isym) )
+                   u12 = CONJG( d_spin(1,2,isym) ); u22 = CONJG( d_spin(2,2,isym) )
+                   IF (index_sym(ikq) > 0) THEN
+                      !$cuf kernel do (1)
+                      DO ir = 1, nrxxs
+                         za = u11 * tnc1_d(rir_d(ir,isym)) + u21 * tnc2_d(rir_d(ir,isym))
+                         zb = u12 * tnc1_d(rir_d(ir,isym)) + u22 * tnc2_d(rir_d(ir,isym))
+                         exxbuff_d(ir,ibnd,ikq) = za
+                         exxbuff_d(ir+nrxxs,ibnd,ikq) = zb
+                      ENDDO
+                   ELSE
+                      !$cuf kernel do (1)
+                      DO ir = 1, nrxxs
+                         za = u11 * tnc1_d(rir_d(ir,isym)) + u21 * tnc2_d(rir_d(ir,isym))
+                         zb = u12 * tnc1_d(rir_d(ir,isym)) + u22 * tnc2_d(rir_d(ir,isym))
+                         exxbuff_d(ir,ibnd,ikq) = CONJG( zb )
+                         exxbuff_d(ir+nrxxs,ibnd,ikq) = -CONJG( za )
+                      ENDDO
+                   ENDIF
+#endif
+                ELSE IF (noncolin) THEN ! noncolinear
 #if defined(__MPI)
                    DO ipol = 1, npol
                       CALL gather_grid( dfftt, temppsic_nc(:,ipol), temppsic_all_nc(:,ipol) )
@@ -696,6 +736,7 @@ MODULE exx_bp
           exxbuff_host_stale = .TRUE.
        ENDIF
        DEALLOCATE( temppsic_d, rir_d, evc_exx_d )
+       IF (noncolin) DEALLOCATE( tnc1_d, tnc2_d )
     ENDIF
 #endif
     !
@@ -740,7 +781,6 @@ MODULE exx_bp
           WRITE( stdout, '(5X,"EXX-GPU: exxinit fills the orbital buffer on the device")' )
        ELSE
           fill_why = ''
-          IF ( noncolin ) fill_why = TRIM(fill_why) // ' noncolinear'
           IF ( local_thr > 0.0_DP ) fill_why = TRIM(fill_why) // ' localized-orbitals'
           IF ( dfftt%nproc /= 1 ) fill_why = TRIM(fill_why) // ' parallel-FFT'
           IF ( npool /= 1 ) fill_why = TRIM(fill_why) // ' k-point-pools'
@@ -4383,6 +4423,7 @@ end associate
     !! Coulomb kernels without cutoff tricks; with ultrasoft augmentation, cells large enough.
     USE uspp,      ONLY : okvan, nkb
     USE mp_pools,  ONLY : npool
+    USE mp_exx,    ONLY : negrp
     USE wvfct,     ONLY : nbnd
     USE exx_base,  ONLY : use_coulomb_vcut_ws, use_coulomb_vcut_spheric
     IMPLICIT NONE
@@ -4398,26 +4439,45 @@ end associate
     IF ( use_coulomb_vcut_ws .OR. use_coulomb_vcut_spheric ) RETURN
     CALL vexx_fast_env()
     IF ( gf_sym_mode == 0 ) RETURN
-    vexx_all_path = vexx_fast_path()
+    IF ( noncolin ) THEN
+       ! spinors: the conditions of the batched k-point operator, which itself does not take them
+       vexx_all_path = use_gpu .AND. (.NOT. p6_env_off) .AND. (.NOT. p15_fast_disabled) .AND. (.NOT. okvan) &
+                       .AND. (negrp == 1) .AND. (dfftt%nproc == 1) .AND. (x_nbnd_occ > 0) &
+                       .AND. (dfftt%nr1x == dfftt%nr1) .AND. (dfftt%nr2x == dfftt%nr2) &
+                       .AND. (dfftt%nr3x == dfftt%nr3) .AND. (dfftt%nnr == dfftt%nr1*dfftt%nr2*dfftt%nr3)
+    ELSE
+       vexx_all_path = vexx_fast_path()
+    ENDIF
   END FUNCTION vexx_all_path
   !
   !-----------------------------------------------------------------------
-  SUBROUTINE vexx_kall_pair( nrxxs, nbuf, nkqs, ebuf, ikq, ikq0, ns, si, sj, s0, np_, rho, omega_inv )
+  SUBROUTINE vexx_kall_pair( nrxxs, npl, nbuf, nkqs, ebuf, ikq, ikq0, ns, si, sj, s0, np_, rho, omega_inv )
   !-----------------------------------------------------------------------
-    !! The pair densities of slots s0+1 .. s0+np_: conj( phi_j,k' ) psi_i,k / omega, both from the buffer
+    !! The pair densities of slots s0+1 .. s0+np_: conj( phi_j,k' ) psi_i,k / omega, both from the
+    !! buffer (summed over the npl spinor components)
     IMPLICIT NONE
-    INTEGER, INTENT(IN) :: nrxxs, nbuf, nkqs, ikq, ikq0, ns, s0, np_
-    COMPLEX(DP), DEVICE, INTENT(IN) :: ebuf(nrxxs,nbuf,nkqs)
+    INTEGER, INTENT(IN) :: nrxxs, npl, nbuf, nkqs, ikq, ikq0, ns, s0, np_
+    COMPLEX(DP), DEVICE, INTENT(IN) :: ebuf(nrxxs*npl,nbuf,nkqs)
     INTEGER, DEVICE, INTENT(IN) :: si(ns), sj(ns)
     COMPLEX(DP), DEVICE, INTENT(INOUT) :: rho(nrxxs,np_)
     REAL(DP), INTENT(IN) :: omega_inv
     INTEGER :: s, ir
-    !$cuf kernel do (2)
-    DO s = 1, np_
-       DO ir = 1, nrxxs
-          rho(ir,s) = CONJG( ebuf(ir,sj(s0+s),ikq) ) * ebuf(ir,si(s0+s),ikq0) * omega_inv
+    IF ( npl == 1 ) THEN
+       !$cuf kernel do (2)
+       DO s = 1, np_
+          DO ir = 1, nrxxs
+             rho(ir,s) = CONJG( ebuf(ir,sj(s0+s),ikq) ) * ebuf(ir,si(s0+s),ikq0) * omega_inv
+          ENDDO
        ENDDO
-    ENDDO
+    ELSE
+       !$cuf kernel do (2)
+       DO s = 1, np_
+          DO ir = 1, nrxxs
+             rho(ir,s) = ( CONJG( ebuf(ir,sj(s0+s),ikq) ) * ebuf(ir,si(s0+s),ikq0) + &
+                           CONJG( ebuf(ir+nrxxs,sj(s0+s),ikq) ) * ebuf(ir+nrxxs,si(s0+s),ikq0) ) * omega_inv
+          ENDDO
+       ENDDO
+    ENDIF
   END SUBROUTINE vexx_kall_pair
   !
   !-----------------------------------------------------------------------
@@ -4439,7 +4499,7 @@ end associate
   END SUBROUTINE vexx_kall_kern
   !
   !-----------------------------------------------------------------------
-  SUBROUTINE vexx_kall_acc( nrxxs, nbuf, nkqs, ebuf, ikq, ikq0, m, res, acc, ns, si, sj, sw, s0, np_, rho, trans, &
+  SUBROUTINE vexx_kall_acc( nrxxs, npl, nbuf, nkqs, ebuf, ikq, ikq0, m, res, acc, ns, si, sj, sw, s0, np_, rho, trans, &
                             nsy, rirt, isym, tr )
   !-----------------------------------------------------------------------
     !! The pair potentials W_ij of slots s0+1 .. s0+np_ into the two results they serve:
@@ -4448,16 +4508,59 @@ end associate
     !! The second goes straight into the frame of that k-point: the buffer entry of k' holds
     !! phi(ir) = psi(rir(ir,isym)), its conjugate with time reversal, so V_x psi at rir(ir,isym) is
     !! V_x phi at ir, or its conjugate. rir is a permutation of the grid: no two points collide.
+    !! Spinors (npl = 2; coupled through the identity rotation only): time reversal is
+    !! (a,b) -> (conj(b),-conj(a)) in the buffer, and (x,y) -> (-conj(y),conj(x)) on the way back.
     IMPLICIT NONE
-    INTEGER, INTENT(IN) :: nrxxs, nbuf, nkqs, ikq, ikq0, m, ns, s0, np_, nsy, isym
+    INTEGER, INTENT(IN) :: nrxxs, npl, nbuf, nkqs, ikq, ikq0, m, ns, s0, np_, nsy, isym
     LOGICAL, INTENT(IN) :: trans, tr
-    COMPLEX(DP), DEVICE, INTENT(IN) :: ebuf(nrxxs,nbuf,nkqs), rho(nrxxs,np_)
+    COMPLEX(DP), DEVICE, INTENT(IN) :: ebuf(nrxxs*npl,nbuf,nkqs), rho(nrxxs,np_)
     INTEGER, DEVICE, INTENT(IN) :: si(ns), sj(ns), rirt(nrxxs,nsy)
     REAL(DP), DEVICE, INTENT(IN) :: sw(2,ns)
-    COMPLEX(DP), DEVICE, INTENT(INOUT) :: res(nrxxs,m), acc(nrxxs,m)
+    COMPLEX(DP), DEVICE, INTENT(INOUT) :: res(nrxxs*npl,m), acc(nrxxs*npl,m)
     INTEGER :: s, ir, i, j, jr
     COMPLEX(DP) :: v
-    IF ( trans .AND. tr ) THEN
+    IF ( npl == 2 ) THEN
+       IF ( trans .AND. tr ) THEN
+          !$cuf kernel do (1)
+          DO ir = 1, nrxxs
+             jr = rirt(ir,isym)
+             DO s = 1, np_
+                i = si(s0+s)
+                j = sj(s0+s)
+                v = rho(ir,s)
+                res(ir,i) = res(ir,i) + sw(1,s0+s) * v * ebuf(ir,j,ikq)
+                res(ir+nrxxs,i) = res(ir+nrxxs,i) + sw(1,s0+s) * v * ebuf(ir+nrxxs,j,ikq)
+                acc(jr,j) = acc(jr,j) - sw(2,s0+s) * v * CONJG( ebuf(ir+nrxxs,i,ikq0) )
+                acc(jr+nrxxs,j) = acc(jr+nrxxs,j) + sw(2,s0+s) * v * CONJG( ebuf(ir,i,ikq0) )
+             ENDDO
+          ENDDO
+       ELSE IF ( trans ) THEN
+          !$cuf kernel do (1)
+          DO ir = 1, nrxxs
+             jr = rirt(ir,isym)
+             DO s = 1, np_
+                i = si(s0+s)
+                j = sj(s0+s)
+                v = rho(ir,s)
+                res(ir,i) = res(ir,i) + sw(1,s0+s) * v * ebuf(ir,j,ikq)
+                res(ir+nrxxs,i) = res(ir+nrxxs,i) + sw(1,s0+s) * v * ebuf(ir+nrxxs,j,ikq)
+                acc(jr,j) = acc(jr,j) + sw(2,s0+s) * CONJG(v) * ebuf(ir,i,ikq0)
+                acc(jr+nrxxs,j) = acc(jr+nrxxs,j) + sw(2,s0+s) * CONJG(v) * ebuf(ir+nrxxs,i,ikq0)
+             ENDDO
+          ENDDO
+       ELSE
+          !$cuf kernel do (1)
+          DO ir = 1, nrxxs
+             DO s = 1, np_
+                i = si(s0+s)
+                j = sj(s0+s)
+                v = rho(ir,s)
+                res(ir,i) = res(ir,i) + sw(1,s0+s) * v * ebuf(ir,j,ikq)
+                res(ir+nrxxs,i) = res(ir+nrxxs,i) + sw(1,s0+s) * v * ebuf(ir+nrxxs,j,ikq)
+             ENDDO
+          ENDDO
+       ENDIF
+    ELSE IF ( trans .AND. tr ) THEN
        !$cuf kernel do (1)
        DO ir = 1, nrxxs
           jr = rirt(ir,isym)
@@ -4493,20 +4596,20 @@ end associate
   END SUBROUTINE vexx_kall_acc
   !
   !-----------------------------------------------------------------------
-  SUBROUTINE vexx_kall_same( nrxxs, nbuf, ebuf, m, psic, dmax, bmax )
+  SUBROUTINE vexx_kall_same( nrt, nbuf, ebuf, m, psic, dmax, bmax )
   !-----------------------------------------------------------------------
     !! The largest difference between m orbitals in real space and the buffered ones, and the
     !! largest buffered value.
     IMPLICIT NONE
-    INTEGER, INTENT(IN) :: nrxxs, nbuf, m
-    COMPLEX(DP), DEVICE, INTENT(IN) :: ebuf(nrxxs,nbuf), psic(nrxxs,m)
+    INTEGER, INTENT(IN) :: nrt, nbuf, m
+    COMPLEX(DP), DEVICE, INTENT(IN) :: ebuf(nrt,nbuf), psic(nrt,m)
     REAL(DP), INTENT(OUT) :: dmax, bmax
     INTEGER :: i, ir
     dmax = 0.0_DP
     bmax = 0.0_DP
     !$cuf kernel do (2)
     DO i = 1, m
-       DO ir = 1, nrxxs
+       DO ir = 1, nrt
           dmax = MAX( dmax, ABS( psic(ir,i) - ebuf(ir,i) ) )
           bmax = MAX( bmax, ABS( ebuf(ir,i) ) )
        ENDDO
@@ -4685,7 +4788,8 @@ end associate
     !! a k-point are visited target by target, so that the second terms of one target k-point go
     !! back to G-space together. Where few pairs are coupled (many symmetry operations, many
     !! empty bands) the saving does not pay for that, and the build is left to the k-point loop.
-    !! Collinear, one band group, one pool, the kernels of g2_convolution without cutoff tricks.
+    !! One band group, one pool, the kernels of g2_convolution without cutoff tricks. Spinors
+    !! (noncollinear, norm-conserving) are coupled through the identity rotation only.
     !! Ultrasoft and PAW: the augmentation charges and the exchange D matrix are matrix products
     !! over the projectors, as in vexx_gfast_main_us but complex. With q = k-k', e_a = e^{-iq.tau_a}
     !! and the projector index K = (atom a, ih), band i of k has for the k+q point k'
@@ -4731,7 +4835,7 @@ end associate
     REAL(DP) :: work_all, work_k
     INTEGER, ALLOCATABLE :: ord(:)
     LOGICAL :: us, us_ok, first
-    INTEGER :: se, ikb, a_, ih_, jh_, o_, c_, it, ikx
+    INTEGER :: se, ikb, a_, ih_, jh_, o_, c_, it, ikx, nrt, ng0, ipl
     REAL(DP) :: arg, nfft
     COMPLEX(DP) :: z, beta
     COMPLEX(DP), ALLOCATABLE :: eigq_h(:)
@@ -4747,6 +4851,7 @@ end associate
     CALL start_clock( 'vexx_ka_setup' )
     us = okvan
     nfft = DBLE( dfftt%nr1 ) * DBLE( dfftt%nr2 ) * DBLE( dfftt%nr3 )
+    nrt = dfftt%nnr * npol         ! an orbital in the buffer: npol spinor components, one after the other
     nl_d => dfftt%nl_d
     nrxxs = dfftt%nnr
     nr1 = dfftt%nr1; nr2 = dfftt%nr2; nr3 = dfftt%nr3
@@ -4792,9 +4897,9 @@ end associate
     !
     ! ... device memory: the two accumulators, the pair block, V_x|psi> of every k, psi of one k
     need = 0_8
-    IF ( .NOT. ALLOCATED(ka_acc_d) ) need = need + 16_8*INT(nrxxs,8)*INT(m,8) + 16_8*INT(npwx,8)*INT(m,8)*INT(nks,8) + &
+    IF ( .NOT. ALLOCATED(ka_acc_d) ) need = need + 16_8*INT(nrt,8)*INT(m,8) + 16_8*INT(npwx*npol,8)*INT(m,8)*INT(nks,8) + &
                                             4_8*INT(nrxxs,8)*INT(nsym,8)
-    IF ( .NOT. ALLOCATED(p6_res_d) )  need = need + 32_8*INT(nrxxs,8)*INT(m,8)
+    IF ( .NOT. ALLOCATED(p6_res_d) )  need = need + 32_8*INT(nrt,8)*INT(m,8)
     IF ( .NOT. ALLOCATED(p6_rhoc_d) ) need = need + 32_8*INT(nrxxs,8)*INT(pblk,8)
     IF ( .NOT. ALLOCATED(p6_facb_d) ) need = need + 8_8*INT(nrxxs,8)*INT(nqs,8)
     istat = cudaMemGetInfo( free_, total_ )
@@ -4806,18 +4911,18 @@ end associate
        RETURN
     ENDIF
     IF ( ALLOCATED(ka_acc_d) ) THEN
-       IF ( SIZE(ka_acc_d,1) /= nrxxs .OR. SIZE(ka_acc_d,2) /= m .OR. SIZE(ka_h_d,1) /= npwx .OR. SIZE(ka_h_d,3) /= nks .OR. &
-            SIZE(ka_rir_d,2) /= nsym ) DEALLOCATE( ka_acc_d, ka_h_d, ka_rir_d )
+       IF ( SIZE(ka_acc_d,1) /= nrt .OR. SIZE(ka_acc_d,2) /= m .OR. SIZE(ka_h_d,1) /= npwx*npol .OR. SIZE(ka_h_d,3) /= nks .OR. &
+            SIZE(ka_rir_d,1) /= nrxxs .OR. SIZE(ka_rir_d,2) /= nsym ) DEALLOCATE( ka_acc_d, ka_h_d, ka_rir_d )
     ENDIF
-    IF ( .NOT. ALLOCATED(ka_acc_d) ) ALLOCATE( ka_acc_d(nrxxs,m), ka_h_d(npwx,m,nks), ka_rir_d(nrxxs,nsym) )
+    IF ( .NOT. ALLOCATED(ka_acc_d) ) ALLOCATE( ka_acc_d(nrt,m), ka_h_d(npwx*npol,m,nks), ka_rir_d(nrxxs,nsym) )
     IF ( ALLOCATED(p6_rhoc_d) ) THEN
        IF ( SIZE(p6_rhoc_d,1) /= nrxxs .OR. SIZE(p6_rhoc_d,2) /= pblk ) DEALLOCATE( p6_rhoc_d )
     ENDIF
     IF ( .NOT. ALLOCATED(p6_rhoc_d) ) ALLOCATE( p6_rhoc_d(nrxxs,pblk) )
     IF ( ALLOCATED(p6_psic_d) ) THEN
-       IF ( SIZE(p6_psic_d,1) /= nrxxs .OR. SIZE(p6_psic_d,2) /= m ) DEALLOCATE( p6_psic_d, p6_res_d )
+       IF ( SIZE(p6_psic_d,1) /= nrt .OR. SIZE(p6_psic_d,2) /= m ) DEALLOCATE( p6_psic_d, p6_res_d )
     ENDIF
-    IF ( .NOT. ALLOCATED(p6_psic_d) ) ALLOCATE( p6_psic_d(nrxxs,m), p6_res_d(nrxxs,m) )
+    IF ( .NOT. ALLOCATED(p6_psic_d) ) ALLOCATE( p6_psic_d(nrt,m), p6_res_d(nrt,m) )
     IF ( ALLOCATED(p6_psi_d) ) THEN
        IF ( SIZE(p6_psi_d,1) /= lda*npol .OR. SIZE(p6_psi_d,2) /= m ) DEALLOCATE( p6_psi_d, p6_hpsi_d )
     ENDIF
@@ -4857,7 +4962,7 @@ end associate
           IF ( st(iq,ik) /= 0 ) CYCLE
           is = ABS( index_sym(ikq) )
           IF ( .NOT. inv_ok(is) ) CYCLE
-          IF ( us .AND. is /= 1 ) CYCLE
+          IF ( ( us .OR. npol == 2 ) .AND. is /= 1 ) CYCLE
           sinv = SIGN( invs(is), index_sym(ikq) )
           ik2 = ik2g
           jq = 0
@@ -4907,7 +5012,7 @@ end associate
           work_k = work_k + DBLE(m) * DBLE( COUNT( ABS( x_occupation(1:nocc,tk(iq,ik)) ) >= eps_occ ) )
        ENDDO
     ENDDO
-    IF ( work_all > 0.85_DP * work_k .AND. .NOT. us ) THEN
+    IF ( work_all > 0.85_DP * work_k .AND. .NOT. us .AND. npol == 1 ) THEN
        IF ( ka_banner /= -2 ) WRITE( stdout, '(5X,"EXX-GPU: the all-k exchange build would save ",I0,"% of the pair transforms of this system: V_x is applied k-point by k-point")' ) &
             NINT( 100.0_DP * ( 1.0_DP - work_all / MAX( work_k, 1.0_DP ) ) )
        ka_banner = -2
@@ -4921,17 +5026,20 @@ end associate
        IF ( nks > 1 ) CALL get_buffer( evc, nwordwfc, iunwfc, ik )
        p6_psi_d = evc(:,1:m)
        p6_psic_d = ( 0._DP, 0._DP )
-       !$cuf kernel do (2)
-       DO ib = 1, m
-          DO ig = 1, npw
-             p6_psic_d( nl_d(igk_exx_d(ig,ik)), ib ) = p6_psi_d(ig,ib)
+       DO ipl = 0, npol - 1
+          !$cuf kernel do (2)
+          DO ib = 1, m
+             DO ig = 1, npw
+                p6_psic_d( nl_d(igk_exx_d(ig,ik)) + ipl*nrxxs, ib ) = p6_psi_d(ig+ipl*npwx,ib)
+             ENDDO
           ENDDO
        ENDDO
-       DO j0 = 0, m - 1, pblk
-          np_ = MIN( pblk, m - j0 )
-          CALL vexx_gfast_fft_blk( nrxxs, np_, p6_psic_d(1,j0+1), nr1, nr2, nr3, single, cmax, CUFFT_INVERSE )
+       ! (the npol*m grids of the m orbitals lie one after the other)
+       DO j0 = 0, npol*m - 1, pblk
+          np_ = MIN( pblk, npol*m - j0 )
+          CALL vexx_gfast_fft_blk( nrxxs, np_, p6_psic_d(1+MOD(j0,npol)*nrxxs,j0/npol+1), nr1, nr2, nr3, single, cmax, CUFFT_INVERSE )
        ENDDO
-       CALL vexx_kall_same( nrxxs, nbuf, exxbuff_d(1,LBOUND(exxbuff_d,2),ikq0(ik)), m, p6_psic_d, dmax, bmax )
+       CALL vexx_kall_same( nrt, nbuf, exxbuff_d(1,LBOUND(exxbuff_d,2),ikq0(ik)), m, p6_psic_d, dmax, bmax )
        IF ( dmax > 1.0E-11_DP * bmax ) THEN
           CALL stop_clock( 'vexx_ka_setup' )
           RETURN
@@ -5050,11 +5158,11 @@ end associate
           IF ( .NOT. us ) THEN
           DO s0 = seg(iq), seg(iq+1) - 1, pblk
              np_ = MIN( pblk, seg(iq+1) - s0 )
-             CALL vexx_kall_pair( nrxxs, nbuf, nkqs_d, exxbuff_d, ikq, ikq0(ik), ns, ka_si_d, ka_sj_d, s0, np_, p6_rhoc_d, omega_inv )
+             CALL vexx_kall_pair( nrxxs, npol, nbuf, nkqs_d, exxbuff_d, ikq, ikq0(ik), ns, ka_si_d, ka_sj_d, s0, np_, p6_rhoc_d, omega_inv )
              CALL vexx_gfast_fft_blk( nrxxs, np_, p6_rhoc_d, nr1, nr2, nr3, single, cmax, CUFFT_FORWARD )
              CALL vexx_kall_kern( nrxxs, nqs, np_, p6_rhoc_d, p6_facb_d, iq, scale )
              CALL vexx_gfast_fft_blk( nrxxs, np_, p6_rhoc_d, nr1, nr2, nr3, single, cmax, CUFFT_INVERSE )
-             CALL vexx_kall_acc( nrxxs, nbuf, nkqs_d, exxbuff_d, ikq, ikq0(ik), m, p6_res_d, ka_acc_d, ns, ka_si_d, ka_sj_d, &
+             CALL vexx_kall_acc( nrxxs, npol, nbuf, nkqs_d, exxbuff_d, ikq, ikq0(ik), m, p6_res_d, ka_acc_d, ns, ka_si_d, ka_sj_d, &
                                  ka_sw_d, s0, np_, p6_rhoc_d, trans, nsym, ka_rir_d, is, tr )
           ENDDO
           ELSE IF ( seg(iq+1) > seg(iq) ) THEN
@@ -5127,7 +5235,7 @@ end associate
                 ENDDO
                 s0 = s - 1
                 j0 = ka_sj_h(s)
-                CALL vexx_kall_pair( nrxxs, nbuf, nkqs_d, exxbuff_d, ikq, ikq0(ik), ns, ka_si_d, ka_sj_d, s0, np_, p6_rhoc_d, omega_inv )
+                CALL vexx_kall_pair( nrxxs, npol, nbuf, nkqs_d, exxbuff_d, ikq, ikq0(ik), ns, ka_si_d, ka_sj_d, s0, np_, p6_rhoc_d, omega_inv )
                 CALL vexx_gfast_fft_blk( nrxxs, np_, p6_rhoc_d, nr1, nr2, nr3, single, cmax, CUFFT_FORWARD )
                 ! ... the augmentation charges of the block (addusxx_g)
                 CALL MYZGEMM( 'N', 'N', ngmt, np_, nkb, (1.0_DP,0.0_DP), ku_f_d, ngmt, ku_bq_d(1,j0), nkb, (0.0_DP,0.0_DP), ku_aug_d, ngmt )
@@ -5175,7 +5283,7 @@ end associate
                    ENDIF
                 ENDIF
                 CALL vexx_gfast_fft_blk( nrxxs, np_, p6_rhoc_d, nr1, nr2, nr3, single, cmax, CUFFT_INVERSE )
-                CALL vexx_kall_acc( nrxxs, nbuf, nkqs_d, exxbuff_d, ikq, ikq0(ik), m, p6_res_d, ka_acc_d, ns, ka_si_d, ka_sj_d, &
+                CALL vexx_kall_acc( nrxxs, npol, nbuf, nkqs_d, exxbuff_d, ikq, ikq0(ik), m, p6_res_d, ka_acc_d, ns, ka_si_d, ka_sj_d, &
                                     ka_sw_d, s0, np_, p6_rhoc_d, trans, nsym, ka_rir_d, is, tr )
                 s = s + np_
              ENDDO
@@ -5217,20 +5325,22 @@ end associate
           IF ( ik2 == ik ) THEN
              !$cuf kernel do (2)
              DO jb = 1, m
-                DO ir = 1, nrxxs
+                DO ir = 1, nrt
                    p6_res_d(ir,jb) = p6_res_d(ir,jb) + ka_acc_d(ir,jb)
                 ENDDO
              ENDDO
           ELSE
-             DO j0 = 0, m - 1, pblk
-                np_ = MIN( pblk, m - j0 )
-                CALL vexx_gfast_fft_blk( nrxxs, np_, ka_acc_d(1,j0+1), nr1, nr2, nr3, single, cmax, CUFFT_FORWARD )
+             DO j0 = 0, npol*m - 1, pblk
+                np_ = MIN( pblk, npol*m - j0 )
+                CALL vexx_gfast_fft_blk( nrxxs, np_, ka_acc_d(1+MOD(j0,npol)*nrxxs,j0/npol+1), nr1, nr2, nr3, single, cmax, CUFFT_FORWARD )
              ENDDO
              npw = ngk(ik2)
-             !$cuf kernel do (2)
-             DO jb = 1, m
-                DO ig = 1, npw
-                   ka_h_d(ig,jb,ik2) = ka_h_d(ig,jb,ik2) - fs * ka_acc_d( nl_d(igk_exx_d(ig,ik2)), jb )
+             DO ipl = 0, npol - 1
+                !$cuf kernel do (2)
+                DO jb = 1, m
+                   DO ig = 1, npw
+                      ka_h_d(ig+ipl*npwx,jb,ik2) = ka_h_d(ig+ipl*npwx,jb,ik2) - fs * ka_acc_d( nl_d(igk_exx_d(ig,ik2)) + ipl*nrxxs, jb )
+                   ENDDO
                 ENDDO
              ENDDO
              npw = ngk(ik)
@@ -5238,14 +5348,16 @@ end associate
           cur = 0
        ENDDO
        ! ... the result of this k back to G-space
-       DO j0 = 0, m - 1, pblk
-          np_ = MIN( pblk, m - j0 )
-          CALL vexx_gfast_fft_blk( nrxxs, np_, p6_res_d(1,j0+1), nr1, nr2, nr3, single, cmax, CUFFT_FORWARD )
+       DO j0 = 0, npol*m - 1, pblk
+          np_ = MIN( pblk, npol*m - j0 )
+          CALL vexx_gfast_fft_blk( nrxxs, np_, p6_res_d(1+MOD(j0,npol)*nrxxs,j0/npol+1), nr1, nr2, nr3, single, cmax, CUFFT_FORWARD )
        ENDDO
-       !$cuf kernel do (2)
-       DO ib = 1, m
-          DO ig = 1, npw
-             ka_h_d(ig,ib,ik) = ka_h_d(ig,ib,ik) - fs * p6_res_d( nl_d(igk_exx_d(ig,ik)), ib )
+       DO ipl = 0, npol - 1
+          !$cuf kernel do (2)
+          DO ib = 1, m
+             DO ig = 1, npw
+                ka_h_d(ig+ipl*npwx,ib,ik) = ka_h_d(ig+ipl*npwx,ib,ik) - fs * p6_res_d( nl_d(igk_exx_d(ig,ik)) + ipl*nrxxs, ib )
+             ENDDO
           ENDDO
        ENDDO
     ENDDO
@@ -5273,12 +5385,12 @@ end associate
     !
     CALL start_clock( 'vexx_ka_fin' )
     DO ik = 1, nks
-       p6_hpsi_d(1:npwx,1:m) = ka_h_d(1:npwx,1:m,ik)
-       vx(1:npwx,1:m,ik) = p6_hpsi_d(1:npwx,1:m)
+       p6_hpsi_d(1:npwx*npol,1:m) = ka_h_d(1:npwx*npol,1:m,ik)
+       vx(1:npwx*npol,1:m,ik) = p6_hpsi_d(1:npwx*npol,1:m)
     ENDDO
     DEALLOCATE( ikq0, st, tk, inv_ok, seg, ord )
     ! the work arrays of a small system stay for the next build, those of a large one are returned
-    need = 48_8*INT(nrxxs,8)*INT(m,8) + 16_8*INT(nrxxs,8)*INT(pblk,8) + 16_8*INT(npwx,8)*INT(m,8)*INT(nks,8)
+    need = 48_8*INT(nrt,8)*INT(m,8) + 16_8*INT(nrxxs,8)*INT(pblk,8) + 16_8*INT(npwx*npol,8)*INT(m,8)*INT(nks,8)
     IF ( us ) need = need + 32_8*INT(ngmt,8)*INT(nkb,8)
     IF ( need > 536870912_8 ) THEN
        DEALLOCATE( ka_acc_d, ka_h_d, ka_rir_d, p6_psic_d, p6_res_d, p6_rhoc_d )
