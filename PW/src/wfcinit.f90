@@ -476,7 +476,7 @@ SUBROUTINE aceinit0( nbndsize )
   USE io_files,             ONLY : restart_dir
   USE wvfct,                ONLY : nbnd
   USE pw_restart_new,       ONLY : read_collected_wfc
-  USE exx,                  ONLY : xi, xi_d, domat
+  USE exx,                  ONLY : xi, xi_d, xi_d_k, domat
   USE xc_lib,               ONLY : start_exx, exx_is_active
   USE noncollin_module,     ONLY : npol
   USE wvfct,                ONLY : npwx
@@ -521,6 +521,8 @@ SUBROUTINE aceinit0( nbndsize )
     !
 #if defined (__CUDA)
     IF (nks == 1) xi_d(:,:) = xi(:,:,1)
+    xi_d_k = -1
+    IF (nks == 1) xi_d_k = 1
 #endif
     !
     WRITE( stdout, '(5X,"Starting ACE correctly read from file")' )

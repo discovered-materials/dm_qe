@@ -108,6 +108,14 @@ MODULE exx_bp
   LOGICAL :: gf_us_banner = .FALSE.
   REAL(DP), ALLOCATABLE, DEVICE :: gf_bec_d(:,:), gf_becpsi_d(:,:), gf_deexx_d(:,:), gf_wb_d(:,:), gf_t_d(:,:), &
                                    gf_cb_d(:,:), gf_dpaw_d(:,:)
+  ! exchange operator of an ACE build for every k-point in one pass (vexx_bp_k_all_gpu)
+  LOGICAL :: ka_disabled = .FALSE.
+  INTEGER :: ka_banner = -1
+  COMPLEX(DP), ALLOCATABLE, DEVICE :: ka_acc_d(:,:), ka_h_d(:,:,:)
+  INTEGER, ALLOCATABLE, DEVICE :: ka_rir_d(:,:), ka_si_d(:), ka_sj_d(:)
+  REAL(DP), ALLOCATABLE, DEVICE :: ka_sw_d(:,:)
+  INTEGER, ALLOCATABLE :: ka_si_h(:), ka_sj_h(:)
+  REAL(DP), ALLOCATABLE :: ka_sw_h(:,:)
   INTEGER :: gf_ntu = 0
   INTEGER, ALLOCATABLE :: gf_tkb0(:), gf_tnkb(:), gf_tq0(:), gf_tnq(:)
   !! the ultrasoft species: first projector - 1, projectors, first Q column - 1, Q columns
@@ -3853,153 +3861,39 @@ end associate
   END SUBROUTINE vexx_fast_main_sp
   !
   !-----------------------------------------------------------------------
-  SUBROUTINE vexx_bp_k_gpu_fast( lda, n, m, psi, hpsi, ok, becpsi )
+  SUBROUTINE vexx_fast_cfac( current_k, current_ik, xkp, nrxxs, ngmt, pblk, npairs )
   !-----------------------------------------------------------------------
-    !! P4/P6: batched GPU version of vexx_k for norm-conserving, collinear k-point runs with one
-    !! band group and a serial FFT grid. Same math as vexx_k_gpu: for each band i,
-    !!   V_x psi_i(r) = -exxalfa * sum_{q,j occ} x_occ(j,k+q)/nqs * phi_{j,k+q}(r) *
-    !!                   IFFT[ v(k-k-q+G) FFT[ conj(phi_{j,k+q}) psi_i / omega ] ](r)
-    !! but all (q, j) pairs of a band go through one kernel + one batched FFT at a time,
-    !! with resident Coulomb factors, persistent work arrays and own cuFFT plans (P6).
-    USE cufft
+    !! The Coulomb kernels v(k-k'+G) of the nqs k+q points of k-point current_k on the full EXX
+    !! grid, in p6_facb_d(:,iq), from the device cache of every k (P6d, P10, P11; pblk and npairs
+    !! only go into the banner). Shared by the k-point operators.
     USE cudafor,        ONLY : cudaMemGetInfo   ! P15
-    USE cell_base,      ONLY : omega, tpiba2, at
+    USE cell_base,      ONLY : tpiba2, at
     USE constants,      ONLY : e2, fpi, pi
-    USE wvfct,          ONLY : npwx, current_k
-    USE klist,          ONLY : xk, nkstot, nks
-    USE exx_base,       ONLY : nqs, xkq_collect, index_xkq, index_xk, &
+    USE klist,          ONLY : nks
+    USE exx_base,       ONLY : nqs, xkq_collect, index_xkq, &
                                eps_odg => eps, eps_qdiv, exxdiv, &
                                x_gamma_extrapolation, grid_factor, yukawa, erfc_scrlen, erf_scrlen, &
                                gau_scrlen, use_coulomb_vcut_ws, use_coulomb_vcut_spheric, nq1, nq2, nq3
-    USE exx_bp_utils,   ONLY : igk_exx_d
-    USE mp_exx,         ONLY : max_ibands
-    USE becmod,         ONLY : bec_type          ! P18
-    USE uspp,           ONLY : okvan, nkb        ! P18
-    USE paw_variables,  ONLY : okpaw             ! P18
-    USE ions_base,      ONLY : nat               ! P18
-    USE uspp_param,     ONLY : nhm               ! P18
-    USE cublas                                   ! P18: device ZGEMM for the non-local term
-    !
     IMPLICIT NONE
-    !
-    INTEGER, INTENT(IN) :: lda, n, m
-    COMPLEX(DP), INTENT(IN)    :: psi(lda*npol,max_ibands)
-    COMPLEX(DP), INTENT(INOUT) :: hpsi(lda*npol,max_ibands)
-    LOGICAL, INTENT(OUT) :: ok   ! P15: .FALSE. when the device work arrays would not fit (nothing done)
-    TYPE(bec_type), OPTIONAL, INTENT(IN) :: becpsi   ! P18: <beta|psi> of the current k, ultrasoft/PAW runs
-    LOGICAL :: us_ok   ! P18
-    REAL(DP) :: p20_epaw   ! P20
-    INTEGER(KIND=8) :: p15_need, p15_free, p15_total   ! P15
-    !
+    INTEGER, INTENT(IN) :: current_k, current_ik, nrxxs, ngmt, pblk, npairs
+    REAL(DP), INTENT(IN) :: xkp(3)
     INTEGER, POINTER :: dfftt__nl(:)
     attributes(DEVICE) :: dfftt__nl
-    INTEGER :: ibnd, iq, ikq, ik, ig, ir, nrxxs, current_ik, nocc, npairs, pblk, ntail, ngmt, nks_loc
-    INTEGER :: nbuf, nkqs_d, nr1, nr2, nr3, plan_full, plan_tail, plan_wave, istat
-    INTEGER(KIND=8) :: cache_bytes
-    LOGICAL :: sp, cache_ok
-    ! P6d
-    LOGICAL :: dev_ok, xgamma, odg1, odg2, odg3
+    INTEGER :: iq, ikq, ig, nks_loc, istat
+    INTEGER(KIND=8) :: cache_bytes, p15_free, p15_total
+    LOGICAL :: cache_ok, dev_ok, xgamma, odg1, odg2, odg3
     INTEGER :: p10_key
     REAL(DP) :: q1, q2, q3, qq, x, gf, f, xk1, xk2, xk3, nqh1, nqh2, nqh3, tpiba2_, gfac_
     REAL(DP) :: a11, a21, a31, a12, a22, a32, a13, a23, a33
     REAL(DP) :: e2_, fpi_, pi_, eps_, eps_qdiv_, exxdiv_, yuk_, erfc_, erf_, gau_
-    REAL(DP) :: xkp(3), xkq(3), omega_inv, nqs_inv, scale
-    INTEGER, EXTERNAL :: global_kpoint_index
+    REAL(DP) :: xkq(3)
     !
-    ok = .TRUE.
-    CALL start_clock( 'vexx_k_setup' )
     dfftt__nl => dfftt%nl_d
-    nrxxs = dfftt%nnr
-    nr1 = dfftt%nr1; nr2 = dfftt%nr2; nr3 = dfftt%nr3
-    ngmt = dfftt%ngm
-    current_ik = global_kpoint_index( nkstot, current_k )
-    xkp = xk(:,current_k)
-    omega_inv = 1.0_DP / omega
-    nqs_inv = 1.0_DP / nqs
-    scale = 1.0_DP / DBLE( nr1*nr2*nr3 )      ! fwfft normalisation, folded into the Coulomb kernel
-    nocc = x_nbnd_occ
-    npairs = nqs * nocc
-    ! P6e: a batch of pair densities that fits the L2 cache (~18 MB) unless QE_EXX_PBLK says otherwise
-    IF ( p6_pblk > 0 ) THEN
-       pblk = MIN( npairs, p6_pblk )
-    ELSE
-       pblk = NINT( 18.0E6_DP / ( DBLE(nrxxs) * MERGE( 8.0_DP, 16.0_DP, p6_sp_mode >= 2 ) ) )
-       pblk = MIN( npairs, MAX( 8, MIN( 128, pblk ) ) )
-    ENDIF
-    ntail = MOD( npairs, pblk )
-    nbuf = SIZE( exxbuff_d, 2 )
-    nkqs_d = SIZE( exxbuff_d, 3 )
-    sp = ( p6_sp_mode >= 2 ) .OR. ( p6_sp_mode == 1 .AND. ( p6_nbuild <= 2 .OR. exx_dexx_current > p6_sp_thr ) )
-    IF ( okvan ) sp = .FALSE.      ! P18: the augmented densities stay in double precision
-    !
-    ! P15: the runtime aborts on a failed device ALLOCATE even with STAT=, so ask first whether the batched work
-    ! arrays (and cuFFT work areas of the same size) fit; if not, this and every later call go to vexx_k_gpu
-    p15_need = 0_8
-    IF ( .NOT. ALLOCATED(p6_rhoc_d) .AND. .NOT. sp ) p15_need = p15_need + 32_8 * INT(nrxxs,8) * INT(pblk,8)
-    IF ( .NOT. ALLOCATED(p6_rhoc_s) .AND. sp )       p15_need = p15_need + 16_8 * INT(nrxxs,8) * INT(pblk,8)
-    IF ( .NOT. ALLOCATED(p6_psic_d) )                p15_need = p15_need + 48_8 * INT(nrxxs,8) * INT(m,8)
-    IF ( .NOT. ALLOCATED(p6_psi_d) )                 p15_need = p15_need + 32_8 * INT(lda*npol,8) * INT(m,8)
-    IF ( .NOT. ALLOCATED(p6_facb_d) )                p15_need = p15_need +  8_8 * INT(nrxxs,8) * INT(nqs,8)
-    IF ( p15_need > 0_8 ) THEN
-       istat = cudaMemGetInfo( p15_free, p15_total )
-       IF ( istat == 0 .AND. p15_need + 268435456_8 > p15_free ) THEN
-          CALL p15_release_work_arrays()
-          p15_fast_disabled = .TRUE.
-          WRITE( stdout, '(5X,"EXX-GPU: the batched fast path would need ",I0," MB of device memory for ",I0," bands on ",I0," grid points, ",I0," MB are free: this run continues on the original vexx_k_gpu path (P15)")' ) &
-               p15_need/1000000_8, m, nrxxs, p15_free/1000000_8
-          CALL stop_clock( 'vexx_k_setup' )
-          ok = .FALSE.
-          RETURN
-       ENDIF
-    ENDIF
-    ! ... work arrays, kept across calls
-    IF ( ALLOCATED(p6_rhoc_d) ) THEN
-       IF ( SIZE(p6_rhoc_d,1) /= nrxxs .OR. SIZE(p6_rhoc_d,2) /= pblk ) DEALLOCATE( p6_rhoc_d )
-    ENDIF
-    istat = 0   ! P15: STAT= on every work array as well (a belt to the pre-check's braces)
-    IF ( .NOT. ALLOCATED(p6_rhoc_d) .AND. .NOT. sp ) ALLOCATE( p6_rhoc_d(nrxxs,pblk), STAT=istat )
-    IF ( ALLOCATED(p6_rhoc_s) ) THEN
-       IF ( SIZE(p6_rhoc_s,1) /= nrxxs .OR. SIZE(p6_rhoc_s,2) /= pblk ) DEALLOCATE( p6_rhoc_s )
-    ENDIF
-    IF ( istat == 0 .AND. .NOT. ALLOCATED(p6_rhoc_s) .AND. sp ) ALLOCATE( p6_rhoc_s(nrxxs,pblk), STAT=istat )
-    IF ( ALLOCATED(p6_psic_d) ) THEN
-       IF ( SIZE(p6_psic_d,1) /= nrxxs .OR. SIZE(p6_psic_d,2) /= m ) DEALLOCATE( p6_psic_d, p6_res_d )
-    ENDIF
-    IF ( istat == 0 .AND. .NOT. ALLOCATED(p6_psic_d) ) ALLOCATE( p6_psic_d(nrxxs,m), p6_res_d(nrxxs,m), STAT=istat )
-    IF ( ALLOCATED(p6_psi_d) ) THEN
-       IF ( SIZE(p6_psi_d,1) /= lda*npol .OR. SIZE(p6_psi_d,2) /= m ) DEALLOCATE( p6_psi_d, p6_hpsi_d )
-    ENDIF
-    IF ( istat == 0 .AND. .NOT. ALLOCATED(p6_psi_d) ) ALLOCATE( p6_psi_d(lda*npol,m), p6_hpsi_d(lda*npol,m), STAT=istat )
+    ! ... work arrays of the kernel (the operators resize theirs themselves)
     IF ( ALLOCATED(p6_facb_d) ) THEN
        IF ( SIZE(p6_facb_d,1) /= nrxxs .OR. SIZE(p6_facb_d,2) /= nqs ) DEALLOCATE( p6_facb_d, p6_ikq_d )
     ENDIF
-    IF ( istat == 0 .AND. .NOT. ALLOCATED(p6_facb_d) ) ALLOCATE( p6_facb_d(nrxxs,nqs), p6_ikq_d(nqs), STAT=istat )
-    IF ( ALLOCATED(p6_xocc_d) ) THEN
-       IF ( SIZE(p6_xocc_d,1) /= nocc .OR. SIZE(p6_xocc_d,2) /= nqs ) DEALLOCATE( p6_xocc_d )
-    ENDIF
-    IF ( istat == 0 .AND. .NOT. ALLOCATED(p6_xocc_d) ) ALLOCATE( p6_xocc_d(nocc,nqs), STAT=istat )
-    IF ( istat /= 0 ) THEN
-       ! P15: no room for the batched work arrays. Release what this path holds, say so once, and let
-       ! vexx() redo this call (and take every later one) on the original one-band-at-a-time routine.
-       CALL p15_release_work_arrays()
-       p15_fast_disabled = .TRUE.
-       WRITE( stdout, '(5X,"EXX-GPU: no device memory for the batched fast path work arrays (",I0," bands on ",I0," grid points): this run continues on the original vexx_k_gpu path (P15)")' ) m, nrxxs
-       CALL stop_clock( 'vexx_k_setup' )
-       ok = .FALSE.
-       RETURN
-    ENDIF
-    !
-    ! ... cuFFT plans (cached)
-    p6_plan_pinned = 0                                    ! P11: pin this call's plans
-    plan_full = vexx_fast_plan( nr1, nr2, nr3, pblk, sp );  p6_plan_pinned(1) = plan_full
-    plan_tail = plan_full
-    IF ( ntail > 0 ) THEN
-       plan_tail = vexx_fast_plan( nr1, nr2, nr3, ntail, sp );  p6_plan_pinned(2) = plan_tail
-    ENDIF
-    plan_wave = vexx_fast_plan( nr1, nr2, nr3, m, .FALSE. );  p6_plan_pinned(3) = plan_wave
-    !
-    ! ... per-q data of this k-point: k+q index, occupations; Coulomb factors resident on the device
-    CALL start_clock( 'vexx_k_cfac' )
+    IF ( .NOT. ALLOCATED(p6_facb_d) ) ALLOCATE( p6_facb_d(nrxxs,nqs), p6_ikq_d(nqs) )
     ! P6d: the host cache is allocated exactly as g2_convolution_all would do it; the device cache
     !      of this k is then filled by a device kernel (or by the host routine for the vcut kernels)
     nks_loc = nks
@@ -4176,6 +4070,157 @@ end associate
           ENDDO
        ENDDO
     ENDIF
+  END SUBROUTINE vexx_fast_cfac
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE vexx_bp_k_gpu_fast( lda, n, m, psi, hpsi, ok, becpsi )
+  !-----------------------------------------------------------------------
+    !! P4/P6: batched GPU version of vexx_k for norm-conserving, collinear k-point runs with one
+    !! band group and a serial FFT grid. Same math as vexx_k_gpu: for each band i,
+    !!   V_x psi_i(r) = -exxalfa * sum_{q,j occ} x_occ(j,k+q)/nqs * phi_{j,k+q}(r) *
+    !!                   IFFT[ v(k-k-q+G) FFT[ conj(phi_{j,k+q}) psi_i / omega ] ](r)
+    !! but all (q, j) pairs of a band go through one kernel + one batched FFT at a time,
+    !! with resident Coulomb factors, persistent work arrays and own cuFFT plans (P6).
+    USE cufft
+    USE cudafor,        ONLY : cudaMemGetInfo   ! P15
+    USE cell_base,      ONLY : omega, tpiba2, at
+    USE constants,      ONLY : e2, fpi, pi
+    USE wvfct,          ONLY : npwx, current_k
+    USE klist,          ONLY : xk, nkstot, nks
+    USE exx_base,       ONLY : nqs, xkq_collect, index_xkq, index_xk, &
+                               eps_odg => eps, eps_qdiv, exxdiv, &
+                               x_gamma_extrapolation, grid_factor, yukawa, erfc_scrlen, erf_scrlen, &
+                               gau_scrlen, use_coulomb_vcut_ws, use_coulomb_vcut_spheric, nq1, nq2, nq3
+    USE exx_bp_utils,   ONLY : igk_exx_d
+    USE mp_exx,         ONLY : max_ibands
+    USE becmod,         ONLY : bec_type          ! P18
+    USE uspp,           ONLY : okvan, nkb        ! P18
+    USE paw_variables,  ONLY : okpaw             ! P18
+    USE ions_base,      ONLY : nat               ! P18
+    USE uspp_param,     ONLY : nhm               ! P18
+    USE cublas                                   ! P18: device ZGEMM for the non-local term
+    !
+    IMPLICIT NONE
+    !
+    INTEGER, INTENT(IN) :: lda, n, m
+    COMPLEX(DP), INTENT(IN)    :: psi(lda*npol,max_ibands)
+    COMPLEX(DP), INTENT(INOUT) :: hpsi(lda*npol,max_ibands)
+    LOGICAL, INTENT(OUT) :: ok   ! P15: .FALSE. when the device work arrays would not fit (nothing done)
+    TYPE(bec_type), OPTIONAL, INTENT(IN) :: becpsi   ! P18: <beta|psi> of the current k, ultrasoft/PAW runs
+    LOGICAL :: us_ok   ! P18
+    REAL(DP) :: p20_epaw   ! P20
+    INTEGER(KIND=8) :: p15_need, p15_free, p15_total   ! P15
+    !
+    INTEGER, POINTER :: dfftt__nl(:)
+    attributes(DEVICE) :: dfftt__nl
+    INTEGER :: ibnd, iq, ikq, ik, ig, ir, nrxxs, current_ik, nocc, npairs, pblk, ntail, ngmt, nks_loc
+    INTEGER :: nbuf, nkqs_d, nr1, nr2, nr3, plan_full, plan_tail, plan_wave, istat
+    INTEGER(KIND=8) :: cache_bytes
+    LOGICAL :: sp, cache_ok
+    ! P6d
+    LOGICAL :: dev_ok, xgamma, odg1, odg2, odg3
+    INTEGER :: p10_key
+    REAL(DP) :: q1, q2, q3, qq, x, gf, f, xk1, xk2, xk3, nqh1, nqh2, nqh3, tpiba2_, gfac_
+    REAL(DP) :: a11, a21, a31, a12, a22, a32, a13, a23, a33
+    REAL(DP) :: e2_, fpi_, pi_, eps_, eps_qdiv_, exxdiv_, yuk_, erfc_, erf_, gau_
+    REAL(DP) :: xkp(3), xkq(3), omega_inv, nqs_inv, scale
+    INTEGER, EXTERNAL :: global_kpoint_index
+    !
+    ok = .TRUE.
+    CALL start_clock( 'vexx_k_setup' )
+    dfftt__nl => dfftt%nl_d
+    nrxxs = dfftt%nnr
+    nr1 = dfftt%nr1; nr2 = dfftt%nr2; nr3 = dfftt%nr3
+    ngmt = dfftt%ngm
+    current_ik = global_kpoint_index( nkstot, current_k )
+    xkp = xk(:,current_k)
+    omega_inv = 1.0_DP / omega
+    nqs_inv = 1.0_DP / nqs
+    scale = 1.0_DP / DBLE( nr1*nr2*nr3 )      ! fwfft normalisation, folded into the Coulomb kernel
+    nocc = x_nbnd_occ
+    npairs = nqs * nocc
+    ! P6e: a batch of pair densities that fits the L2 cache (~18 MB) unless QE_EXX_PBLK says otherwise
+    IF ( p6_pblk > 0 ) THEN
+       pblk = MIN( npairs, p6_pblk )
+    ELSE
+       pblk = NINT( 18.0E6_DP / ( DBLE(nrxxs) * MERGE( 8.0_DP, 16.0_DP, p6_sp_mode >= 2 ) ) )
+       pblk = MIN( npairs, MAX( 8, MIN( 128, pblk ) ) )
+    ENDIF
+    ntail = MOD( npairs, pblk )
+    nbuf = SIZE( exxbuff_d, 2 )
+    nkqs_d = SIZE( exxbuff_d, 3 )
+    sp = ( p6_sp_mode >= 2 ) .OR. ( p6_sp_mode == 1 .AND. ( p6_nbuild <= 2 .OR. exx_dexx_current > p6_sp_thr ) )
+    IF ( okvan ) sp = .FALSE.      ! P18: the augmented densities stay in double precision
+    !
+    ! P15: the runtime aborts on a failed device ALLOCATE even with STAT=, so ask first whether the batched work
+    ! arrays (and cuFFT work areas of the same size) fit; if not, this and every later call go to vexx_k_gpu
+    p15_need = 0_8
+    IF ( .NOT. ALLOCATED(p6_rhoc_d) .AND. .NOT. sp ) p15_need = p15_need + 32_8 * INT(nrxxs,8) * INT(pblk,8)
+    IF ( .NOT. ALLOCATED(p6_rhoc_s) .AND. sp )       p15_need = p15_need + 16_8 * INT(nrxxs,8) * INT(pblk,8)
+    IF ( .NOT. ALLOCATED(p6_psic_d) )                p15_need = p15_need + 48_8 * INT(nrxxs,8) * INT(m,8)
+    IF ( .NOT. ALLOCATED(p6_psi_d) )                 p15_need = p15_need + 32_8 * INT(lda*npol,8) * INT(m,8)
+    IF ( .NOT. ALLOCATED(p6_facb_d) )                p15_need = p15_need +  8_8 * INT(nrxxs,8) * INT(nqs,8)
+    IF ( p15_need > 0_8 ) THEN
+       istat = cudaMemGetInfo( p15_free, p15_total )
+       IF ( istat == 0 .AND. p15_need + 268435456_8 > p15_free ) THEN
+          CALL p15_release_work_arrays()
+          p15_fast_disabled = .TRUE.
+          WRITE( stdout, '(5X,"EXX-GPU: the batched fast path would need ",I0," MB of device memory for ",I0," bands on ",I0," grid points, ",I0," MB are free: this run continues on the original vexx_k_gpu path (P15)")' ) &
+               p15_need/1000000_8, m, nrxxs, p15_free/1000000_8
+          CALL stop_clock( 'vexx_k_setup' )
+          ok = .FALSE.
+          RETURN
+       ENDIF
+    ENDIF
+    ! ... work arrays, kept across calls
+    IF ( ALLOCATED(p6_rhoc_d) ) THEN
+       IF ( SIZE(p6_rhoc_d,1) /= nrxxs .OR. SIZE(p6_rhoc_d,2) /= pblk ) DEALLOCATE( p6_rhoc_d )
+    ENDIF
+    istat = 0   ! P15: STAT= on every work array as well (a belt to the pre-check's braces)
+    IF ( .NOT. ALLOCATED(p6_rhoc_d) .AND. .NOT. sp ) ALLOCATE( p6_rhoc_d(nrxxs,pblk), STAT=istat )
+    IF ( ALLOCATED(p6_rhoc_s) ) THEN
+       IF ( SIZE(p6_rhoc_s,1) /= nrxxs .OR. SIZE(p6_rhoc_s,2) /= pblk ) DEALLOCATE( p6_rhoc_s )
+    ENDIF
+    IF ( istat == 0 .AND. .NOT. ALLOCATED(p6_rhoc_s) .AND. sp ) ALLOCATE( p6_rhoc_s(nrxxs,pblk), STAT=istat )
+    IF ( ALLOCATED(p6_psic_d) ) THEN
+       IF ( SIZE(p6_psic_d,1) /= nrxxs .OR. SIZE(p6_psic_d,2) /= m ) DEALLOCATE( p6_psic_d, p6_res_d )
+    ENDIF
+    IF ( istat == 0 .AND. .NOT. ALLOCATED(p6_psic_d) ) ALLOCATE( p6_psic_d(nrxxs,m), p6_res_d(nrxxs,m), STAT=istat )
+    IF ( ALLOCATED(p6_psi_d) ) THEN
+       IF ( SIZE(p6_psi_d,1) /= lda*npol .OR. SIZE(p6_psi_d,2) /= m ) DEALLOCATE( p6_psi_d, p6_hpsi_d )
+    ENDIF
+    IF ( istat == 0 .AND. .NOT. ALLOCATED(p6_psi_d) ) ALLOCATE( p6_psi_d(lda*npol,m), p6_hpsi_d(lda*npol,m), STAT=istat )
+    IF ( ALLOCATED(p6_facb_d) ) THEN
+       IF ( SIZE(p6_facb_d,1) /= nrxxs .OR. SIZE(p6_facb_d,2) /= nqs ) DEALLOCATE( p6_facb_d, p6_ikq_d )
+    ENDIF
+    IF ( istat == 0 .AND. .NOT. ALLOCATED(p6_facb_d) ) ALLOCATE( p6_facb_d(nrxxs,nqs), p6_ikq_d(nqs), STAT=istat )
+    IF ( ALLOCATED(p6_xocc_d) ) THEN
+       IF ( SIZE(p6_xocc_d,1) /= nocc .OR. SIZE(p6_xocc_d,2) /= nqs ) DEALLOCATE( p6_xocc_d )
+    ENDIF
+    IF ( istat == 0 .AND. .NOT. ALLOCATED(p6_xocc_d) ) ALLOCATE( p6_xocc_d(nocc,nqs), STAT=istat )
+    IF ( istat /= 0 ) THEN
+       ! P15: no room for the batched work arrays. Release what this path holds, say so once, and let
+       ! vexx() redo this call (and take every later one) on the original one-band-at-a-time routine.
+       CALL p15_release_work_arrays()
+       p15_fast_disabled = .TRUE.
+       WRITE( stdout, '(5X,"EXX-GPU: no device memory for the batched fast path work arrays (",I0," bands on ",I0," grid points): this run continues on the original vexx_k_gpu path (P15)")' ) m, nrxxs
+       CALL stop_clock( 'vexx_k_setup' )
+       ok = .FALSE.
+       RETURN
+    ENDIF
+    !
+    ! ... cuFFT plans (cached)
+    p6_plan_pinned = 0                                    ! P11: pin this call's plans
+    plan_full = vexx_fast_plan( nr1, nr2, nr3, pblk, sp );  p6_plan_pinned(1) = plan_full
+    plan_tail = plan_full
+    IF ( ntail > 0 ) THEN
+       plan_tail = vexx_fast_plan( nr1, nr2, nr3, ntail, sp );  p6_plan_pinned(2) = plan_tail
+    ENDIF
+    plan_wave = vexx_fast_plan( nr1, nr2, nr3, m, .FALSE. );  p6_plan_pinned(3) = plan_wave
+    !
+    ! ... per-q data of this k-point: k+q index, occupations; Coulomb factors resident on the device
+    CALL start_clock( 'vexx_k_cfac' )
+    CALL vexx_fast_cfac( current_k, current_ik, xkp, nrxxs, ngmt, pblk, npairs )
     ! ... k+q indices and occupations of this k (P6c host work arrays)
     IF ( ALLOCATED(p6_ikq_h) ) THEN
        IF ( SIZE(p6_ikq_h) /= nqs .OR. SIZE(p6_xocc_h,1) /= nocc .OR. SIZE(p6_xocc_h,2) /= nqs ) &
@@ -4313,6 +4358,523 @@ end associate
     CALL stop_clock( 'vexx_k_fin' )
     !
   END SUBROUTINE vexx_bp_k_gpu_fast
+  !
+  !-----------------------------------------------------------------------
+  LOGICAL FUNCTION vexx_all_path( m )
+  !-----------------------------------------------------------------------
+    !! Can V_x of an ACE build over m bands be applied to every k-point in one pass
+    !! (vexx_bp_k_all_gpu)? The conditions of the batched k-point operator, norm-conserving
+    !! pseudopotentials, one pool, the Coulomb kernels without cutoff tricks.
+    USE uspp,      ONLY : okvan
+    USE mp_pools,  ONLY : npool
+    USE wvfct,     ONLY : nbnd
+    USE exx_base,  ONLY : use_coulomb_vcut_ws, use_coulomb_vcut_spheric
+    IMPLICIT NONE
+    INTEGER, INTENT(IN) :: m
+    vexx_all_path = .FALSE.
+    IF ( ka_disabled .OR. gamma_only .OR. okvan .OR. npool /= 1 ) RETURN
+    IF ( m < x_nbnd_occ .OR. m > nbnd ) RETURN
+    IF ( use_coulomb_vcut_ws .OR. use_coulomb_vcut_spheric ) RETURN
+    CALL vexx_fast_env()
+    IF ( gf_sym_mode == 0 ) RETURN
+    vexx_all_path = vexx_fast_path()
+  END FUNCTION vexx_all_path
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE vexx_kall_pair( nrxxs, nbuf, nkqs, ebuf, ikq, ikq0, ns, si, sj, s0, np_, rho, omega_inv )
+  !-----------------------------------------------------------------------
+    !! The pair densities of slots s0+1 .. s0+np_: conj( phi_j,k' ) psi_i,k / omega, both from the buffer
+    IMPLICIT NONE
+    INTEGER, INTENT(IN) :: nrxxs, nbuf, nkqs, ikq, ikq0, ns, s0, np_
+    COMPLEX(DP), DEVICE, INTENT(IN) :: ebuf(nrxxs,nbuf,nkqs)
+    INTEGER, DEVICE, INTENT(IN) :: si(ns), sj(ns)
+    COMPLEX(DP), DEVICE, INTENT(INOUT) :: rho(nrxxs,np_)
+    REAL(DP), INTENT(IN) :: omega_inv
+    INTEGER :: s, ir
+    !$cuf kernel do (2)
+    DO s = 1, np_
+       DO ir = 1, nrxxs
+          rho(ir,s) = CONJG( ebuf(ir,sj(s0+s),ikq) ) * ebuf(ir,si(s0+s),ikq0) * omega_inv
+       ENDDO
+    ENDDO
+  END SUBROUTINE vexx_kall_pair
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE vexx_kall_kern( nrxxs, nqs, np_, rho, facb, iq, scale )
+  !-----------------------------------------------------------------------
+    !! rho(G) -> v(k-k'+G) rho(G) / N on the full grid
+    IMPLICIT NONE
+    INTEGER, INTENT(IN) :: nrxxs, nqs, np_, iq
+    COMPLEX(DP), DEVICE, INTENT(INOUT) :: rho(nrxxs,np_)
+    REAL(DP), DEVICE, INTENT(IN) :: facb(nrxxs,nqs)
+    REAL(DP), INTENT(IN) :: scale
+    INTEGER :: s, ir
+    !$cuf kernel do (2)
+    DO s = 1, np_
+       DO ir = 1, nrxxs
+          rho(ir,s) = rho(ir,s) * ( facb(ir,iq) * scale )
+       ENDDO
+    ENDDO
+  END SUBROUTINE vexx_kall_kern
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE vexx_kall_acc( nrxxs, nbuf, nkqs, ebuf, ikq, ikq0, m, res, acc, ns, si, sj, sw, s0, np_, rho, trans, &
+                            nsy, rirt, isym, tr )
+  !-----------------------------------------------------------------------
+    !! The pair potentials W_ij of slots s0+1 .. s0+np_ into the two results they serve:
+    !!   res_i += w1 phi_j,k' W_ij            (band i of this k)
+    !!   acc_j += w2 psi_i,k conj( W_ij )     (band j of the k-point k' was rotated from, when trans)
+    !! The second goes straight into the frame of that k-point: the buffer entry of k' holds
+    !! phi(ir) = psi(rir(ir,isym)), its conjugate with time reversal, so V_x psi at rir(ir,isym) is
+    !! V_x phi at ir, or its conjugate. rir is a permutation of the grid: no two points collide.
+    IMPLICIT NONE
+    INTEGER, INTENT(IN) :: nrxxs, nbuf, nkqs, ikq, ikq0, m, ns, s0, np_, nsy, isym
+    LOGICAL, INTENT(IN) :: trans, tr
+    COMPLEX(DP), DEVICE, INTENT(IN) :: ebuf(nrxxs,nbuf,nkqs), rho(nrxxs,np_)
+    INTEGER, DEVICE, INTENT(IN) :: si(ns), sj(ns), rirt(nrxxs,nsy)
+    REAL(DP), DEVICE, INTENT(IN) :: sw(2,ns)
+    COMPLEX(DP), DEVICE, INTENT(INOUT) :: res(nrxxs,m), acc(nrxxs,m)
+    INTEGER :: s, ir, i, j, jr
+    COMPLEX(DP) :: v
+    IF ( trans .AND. tr ) THEN
+       !$cuf kernel do (1)
+       DO ir = 1, nrxxs
+          jr = rirt(ir,isym)
+          DO s = 1, np_
+             i = si(s0+s)
+             j = sj(s0+s)
+             v = rho(ir,s)
+             res(ir,i) = res(ir,i) + sw(1,s0+s) * v * ebuf(ir,j,ikq)
+             acc(jr,j) = acc(jr,j) + sw(2,s0+s) * v * CONJG( ebuf(ir,i,ikq0) )
+          ENDDO
+       ENDDO
+    ELSE IF ( trans ) THEN
+       !$cuf kernel do (1)
+       DO ir = 1, nrxxs
+          jr = rirt(ir,isym)
+          DO s = 1, np_
+             i = si(s0+s)
+             j = sj(s0+s)
+             v = rho(ir,s)
+             res(ir,i) = res(ir,i) + sw(1,s0+s) * v * ebuf(ir,j,ikq)
+             acc(jr,j) = acc(jr,j) + sw(2,s0+s) * CONJG(v) * ebuf(ir,i,ikq0)
+          ENDDO
+       ENDDO
+    ELSE
+       !$cuf kernel do (1)
+       DO ir = 1, nrxxs
+          DO s = 1, np_
+             i = si(s0+s)
+             res(ir,i) = res(ir,i) + sw(1,s0+s) * rho(ir,s) * ebuf(ir,sj(s0+s),ikq)
+          ENDDO
+       ENDDO
+    ENDIF
+  END SUBROUTINE vexx_kall_acc
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE vexx_kall_same( nrxxs, nbuf, ebuf, m, psic, dmax, bmax )
+  !-----------------------------------------------------------------------
+    !! The largest difference between m orbitals in real space and the buffered ones, and the
+    !! largest buffered value.
+    IMPLICIT NONE
+    INTEGER, INTENT(IN) :: nrxxs, nbuf, m
+    COMPLEX(DP), DEVICE, INTENT(IN) :: ebuf(nrxxs,nbuf), psic(nrxxs,m)
+    REAL(DP), INTENT(OUT) :: dmax, bmax
+    INTEGER :: i, ir
+    dmax = 0.0_DP
+    bmax = 0.0_DP
+    !$cuf kernel do (2)
+    DO i = 1, m
+       DO ir = 1, nrxxs
+          dmax = MAX( dmax, ABS( psic(ir,i) - ebuf(ir,i) ) )
+          bmax = MAX( bmax, ABS( ebuf(ir,i) ) )
+       ENDDO
+    ENDDO
+  END SUBROUTINE vexx_kall_same
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE vexx_bp_k_all_gpu( lda, m, vx, ok )
+  !-----------------------------------------------------------------------
+    !! V_x|psi_ik> for the first m bands of every k-point at once, for an ACE build: the psi are
+    !! the orbitals exxinit has just buffered (checked here against the wavefunctions on file).
+    !! Working on all k-points together lets every pair potential serve twice. For the k+q point
+    !! k' of k,
+    !!    W_ij(r) = IFFT[ v(k-k'+G) FFT[ conj( phi_j,k' ) psi_i,k / omega ] ]
+    !! gives band i of k its term phi_j,k' W_ij and, since the potential of the reversed pair is
+    !! conj( W_ij ), gives band j of k' the term psi_i,k conj( W_ij ). The buffered phi_j,k' is an
+    !! orbital of a k-point k2 of this run rotated by a symmetry operation S (with or without time
+    !! reversal), so that second term, rotated back, is the contribution of the k+q point S^-1 k
+    !! to V_x|psi_j,k2>: the pair (k2, S^-1 k) need not be transformed at all. Pairs are coupled
+    !! this way only when the buffer holds S^-1 k as exactly the inverse operation applied to k
+    !! (the two grid permutations are checked to be inverse of each other); the rest are
+    !! transformed on their own, as vexx_bp_k_gpu_fast does. With as many bands as are occupied
+    !! this halves the transforms of a build; empty bands take part as psi only. The k+q points of
+    !! a k-point are visited target by target, so that the second terms of one target k-point go
+    !! back to G-space together. Where few pairs are coupled (many symmetry operations, many
+    !! empty bands) the saving does not pay for that, and the build is left to the k-point loop.
+    !! Norm-conserving, collinear, one band group, one pool, the kernels of g2_convolution
+    !! without cutoff tricks. ok = .FALSE.: nothing done, aceinit applies V_x k-point by k-point.
+    USE cufft
+    USE cudafor,        ONLY : cudaMemGetInfo
+    USE cell_base,      ONLY : omega
+    USE wvfct,          ONLY : nbnd, npwx
+    USE klist,          ONLY : xk, nkstot, nks, ngk
+    USE symm_base,      ONLY : nsym, invs
+    USE exx_base,       ONLY : nqs, index_xkq, index_xk, index_sym, rir
+    USE exx_bp_utils,   ONLY : igk_exx_d
+    USE wavefunctions,  ONLY : evc
+    USE buffers,        ONLY : get_buffer
+    USE io_files,       ONLY : nwordwfc, iunwfc
+    !
+    IMPLICIT NONE
+    !
+    INTEGER, INTENT(IN) :: lda, m
+    COMPLEX(DP), INTENT(INOUT) :: vx(lda*npol,m,nks)
+    LOGICAL, INTENT(OUT) :: ok
+    !
+    INTEGER, POINTER :: nl_d(:)
+    attributes(DEVICE) :: nl_d
+    INTEGER :: nrxxs, nr1, nr2, nr3, ngmt, nbuf, nkqs_d, nocc, pblk, cmax, npw
+    INTEGER :: ik, ikg, iq, jq, ikq, ikq2, ik2, ik2g, is, sinv, i, j, ig, ir, ib, jb, j0, np_, s, s0, ns, nstot, istat
+    INTEGER :: ncoup, nself, nsolo, nskip, jfirst, jlast, io, nord, cur, nflush
+    REAL(DP) :: work_all, work_k
+    INTEGER, ALLOCATABLE :: ord(:)
+    INTEGER(KIND=8) :: need, free_, total_
+    LOGICAL :: single, trans, tr
+    REAL(DP) :: xkp(3), omega_inv, scale, nqs_inv, dmax, bmax, wd, wt, fs
+    INTEGER, ALLOCATABLE :: ikq0(:), st(:,:), tk(:,:), seg(:)
+    LOGICAL, ALLOCATABLE :: inv_ok(:)
+    INTEGER, EXTERNAL :: global_kpoint_index
+    !
+    ok = .FALSE.
+    IF ( ka_disabled ) RETURN
+    CALL start_clock( 'vexx_ka_setup' )
+    nl_d => dfftt%nl_d
+    nrxxs = dfftt%nnr
+    nr1 = dfftt%nr1; nr2 = dfftt%nr2; nr3 = dfftt%nr3
+    ngmt = dfftt%ngm
+    nbuf = SIZE( exxbuff_d, 2 )
+    nkqs_d = SIZE( exxbuff_d, 3 )
+    nocc = x_nbnd_occ
+    omega_inv = 1.0_DP / omega
+    nqs_inv = 1.0_DP / nqs
+    scale = 1.0_DP / DBLE( nr1*nr2*nr3 )
+    single = ( nrxxs >= 350000 )
+    IF ( gf_fft1_mode >= 0 ) single = ( gf_fft1_mode == 1 )
+    IF ( p6_pblk > 0 ) THEN
+       pblk = p6_pblk
+    ELSE
+       ! the batched plans of this routine are powers of two: the largest whose pair densities fit
+       ! the L2 cache
+       pblk = 1
+       DO WHILE ( 2*pblk <= 128 .AND. 32.0_DP * DBLE(pblk) * DBLE(nrxxs) <= 28.0E6_DP )
+          pblk = 2*pblk
+       ENDDO
+       pblk = MAX( 2, pblk )
+    ENDIF
+    cmax = pblk
+    !
+    ! ... the buffer entry of each k-point itself: psi_ik in real space, with no transform
+    ALLOCATE( ikq0(nks), st(nqs,nks), tk(nqs,nks), inv_ok(nsym), seg(nqs+1), ord(nqs) )
+    ikq0 = 0
+    DO ik = 1, nks
+       ikg = global_kpoint_index( nkstot, ik )
+       DO iq = 1, nqs
+          ikq = index_xkq(ikg,iq)
+          IF ( index_xk(ikq) == ikg .AND. index_sym(ikq) == 1 ) ikq0(ik) = ikq
+       ENDDO
+    ENDDO
+    IF ( ANY( ikq0 == 0 ) .OR. nbuf < m .OR. nks /= nkstot ) THEN
+       CALL stop_clock( 'vexx_ka_setup' )
+       RETURN
+    ENDIF
+    !
+    ! ... device memory: the two accumulators, the pair block, V_x|psi> of every k, psi of one k
+    need = 0_8
+    IF ( .NOT. ALLOCATED(ka_acc_d) ) need = need + 16_8*INT(nrxxs,8)*INT(m,8) + 16_8*INT(npwx,8)*INT(m,8)*INT(nks,8) + &
+                                            4_8*INT(nrxxs,8)*INT(nsym,8)
+    IF ( .NOT. ALLOCATED(p6_res_d) )  need = need + 32_8*INT(nrxxs,8)*INT(m,8)
+    IF ( .NOT. ALLOCATED(p6_rhoc_d) ) need = need + 32_8*INT(nrxxs,8)*INT(pblk,8)
+    IF ( .NOT. ALLOCATED(p6_facb_d) ) need = need + 8_8*INT(nrxxs,8)*INT(nqs,8)
+    istat = cudaMemGetInfo( free_, total_ )
+    IF ( istat == 0 .AND. need + 268435456_8 > free_ ) THEN
+       WRITE( stdout, '(5X,"EXX-GPU: the all-k exchange build would need ",I0," MB of device memory, ",I0," MB are free: V_x is applied k-point by k-point")' ) &
+            need/1000000_8, free_/1000000_8
+       ka_disabled = .TRUE.
+       CALL stop_clock( 'vexx_ka_setup' )
+       RETURN
+    ENDIF
+    IF ( ALLOCATED(ka_acc_d) ) THEN
+       IF ( SIZE(ka_acc_d,1) /= nrxxs .OR. SIZE(ka_acc_d,2) /= m .OR. SIZE(ka_h_d,1) /= npwx .OR. SIZE(ka_h_d,3) /= nks .OR. &
+            SIZE(ka_rir_d,2) /= nsym ) DEALLOCATE( ka_acc_d, ka_h_d, ka_rir_d )
+    ENDIF
+    IF ( .NOT. ALLOCATED(ka_acc_d) ) ALLOCATE( ka_acc_d(nrxxs,m), ka_h_d(npwx,m,nks), ka_rir_d(nrxxs,nsym) )
+    IF ( ALLOCATED(p6_rhoc_d) ) THEN
+       IF ( SIZE(p6_rhoc_d,1) /= nrxxs .OR. SIZE(p6_rhoc_d,2) /= pblk ) DEALLOCATE( p6_rhoc_d )
+    ENDIF
+    IF ( .NOT. ALLOCATED(p6_rhoc_d) ) ALLOCATE( p6_rhoc_d(nrxxs,pblk) )
+    IF ( ALLOCATED(p6_psic_d) ) THEN
+       IF ( SIZE(p6_psic_d,1) /= nrxxs .OR. SIZE(p6_psic_d,2) /= m ) DEALLOCATE( p6_psic_d, p6_res_d )
+    ENDIF
+    IF ( .NOT. ALLOCATED(p6_psic_d) ) ALLOCATE( p6_psic_d(nrxxs,m), p6_res_d(nrxxs,m) )
+    IF ( ALLOCATED(p6_psi_d) ) THEN
+       IF ( SIZE(p6_psi_d,1) /= lda*npol .OR. SIZE(p6_psi_d,2) /= m ) DEALLOCATE( p6_psi_d, p6_hpsi_d )
+    ENDIF
+    IF ( .NOT. ALLOCATED(p6_psi_d) ) ALLOCATE( p6_psi_d(lda*npol,m), p6_hpsi_d(lda*npol,m) )
+    ka_rir_d = rir(1:nrxxs,1:nsym)
+    !
+    ! ... which pairs of k-points are coupled. inv_ok: the grid permutations of S and of the operation
+    !     the symmetry tables call its inverse undo each other
+    DO is = 1, nsym
+       inv_ok(is) = .TRUE.
+       DO ir = 1, nrxxs
+          IF ( rir( rir(ir,is), invs(is) ) /= ir ) THEN
+             inv_ok(is) = .FALSE.
+             EXIT
+          ENDIF
+       ENDDO
+    ENDDO
+    ! st: 0 transformed on its own, 1 transformed for both k-points, 2 served by its partner, 3 its own
+    ! partner (band pairs i <= j). tk: the k-point the buffer entry was rotated from
+    st = 0
+    ncoup = 0; nself = 0; nsolo = 0; nskip = 0
+    DO ik = 1, nks
+       ikg = global_kpoint_index( nkstot, ik )
+       DO iq = 1, nqs
+          ikq = index_xkq(ikg,iq)
+          ik2g = index_xk(ikq)
+          tk(iq,ik) = ik2g
+          IF ( st(iq,ik) /= 0 ) CYCLE
+          is = ABS( index_sym(ikq) )
+          IF ( .NOT. inv_ok(is) ) CYCLE
+          sinv = SIGN( invs(is), index_sym(ikq) )
+          ik2 = ik2g
+          jq = 0
+          DO s = 1, nqs
+             ikq2 = index_xkq(ik2g,s)
+             IF ( index_xk(ikq2) == ikg .AND. index_sym(ikq2) == sinv ) jq = s
+          ENDDO
+          IF ( jq == 0 ) CYCLE
+          IF ( ik2 == ik .AND. jq == iq ) THEN
+             st(iq,ik) = 3
+          ELSE IF ( st(jq,ik2) == 0 ) THEN
+             st(iq,ik) = 1
+             st(jq,ik2) = 2
+          ENDIF
+       ENDDO
+    ENDDO
+    ! ... is it worth it? Pair transforms of this build against those of the k-point loop (a band of
+    !     a target k-point going back to G-space counts as half a pair)
+    work_all = 0.0_DP
+    DO ik = 1, nks
+       ikg = global_kpoint_index( nkstot, ik )
+       cur = 0
+       DO iq = 1, nqs
+          IF ( st(iq,ik) == 2 ) CYCLE
+          ik2g = tk(iq,ik)
+          DO i = 1, m
+             wt = 0.0_DP
+             IF ( st(iq,ik) /= 0 ) wt = x_occupation(i,ikg)
+             jfirst = 1
+             IF ( st(iq,ik) == 3 ) jfirst = i
+             jlast = nocc
+             IF ( st(iq,ik) /= 0 .AND. ABS(wt) >= eps_occ ) jlast = m
+             DO j = jfirst, jlast
+                wd = 0.0_DP
+                IF ( j <= nocc ) wd = x_occupation(j,ik2g)
+                IF ( ABS(wd) >= eps_occ .OR. ( ABS(wt) >= eps_occ .AND. j /= i ) .OR. &
+                     ( ABS(wt) >= eps_occ .AND. st(iq,ik) == 1 ) ) work_all = work_all + 1.0_DP
+             ENDDO
+          ENDDO
+          IF ( st(iq,ik) == 1 .AND. ik2g /= ikg ) work_all = work_all + 0.5_DP * DBLE(m) / DBLE( MAX( 1, COUNT( tk(:,ik) == ik2g .AND. st(:,ik) == 1 ) ) )
+       ENDDO
+    ENDDO
+    work_k = 0.0_DP
+    DO ik = 1, nks
+       ikg = global_kpoint_index( nkstot, ik )
+       DO iq = 1, nqs
+          work_k = work_k + DBLE(m) * DBLE( COUNT( ABS( x_occupation(1:nocc,tk(iq,ik)) ) >= eps_occ ) )
+       ENDDO
+    ENDDO
+    IF ( work_all > 0.85_DP * work_k ) THEN
+       IF ( ka_banner /= -2 ) WRITE( stdout, '(5X,"EXX-GPU: the all-k exchange build would save ",I0,"% of the pair transforms of this system: V_x is applied k-point by k-point")' ) &
+            NINT( 100.0_DP * ( 1.0_DP - work_all / MAX( work_k, 1.0_DP ) ) )
+       ka_banner = -2
+       CALL stop_clock( 'vexx_ka_setup' )
+       RETURN
+    ENDIF
+    !
+    ! ... are the wavefunctions on file the buffered orbitals? (they are, right after exxinit)
+    DO ik = 1, nks
+       npw = ngk(ik)
+       IF ( nks > 1 ) CALL get_buffer( evc, nwordwfc, iunwfc, ik )
+       p6_psi_d = evc(:,1:m)
+       p6_psic_d = ( 0._DP, 0._DP )
+       !$cuf kernel do (2)
+       DO ib = 1, m
+          DO ig = 1, npw
+             p6_psic_d( nl_d(igk_exx_d(ig,ik)), ib ) = p6_psi_d(ig,ib)
+          ENDDO
+       ENDDO
+       DO j0 = 0, m - 1, pblk
+          np_ = MIN( pblk, m - j0 )
+          CALL vexx_gfast_fft_blk( nrxxs, np_, p6_psic_d(1,j0+1), nr1, nr2, nr3, single, cmax, CUFFT_INVERSE )
+       ENDDO
+       CALL vexx_kall_same( nrxxs, nbuf, exxbuff_d(1,LBOUND(exxbuff_d,2),ikq0(ik)), m, p6_psic_d, dmax, bmax )
+       IF ( dmax > 1.0E-11_DP * bmax ) THEN
+          CALL stop_clock( 'vexx_ka_setup' )
+          RETURN
+       ENDIF
+    ENDDO
+    !
+    ncoup = COUNT( st == 1 ); nself = COUNT( st == 3 ); nsolo = COUNT( st == 0 ); nskip = COUNT( st == 2 )
+    IF ( ncoup + 2*nself + 3*nsolo /= ka_banner ) THEN
+       ka_banner = ncoup + 2*nself + 3*nsolo
+       WRITE( stdout, '(5X,"EXX-GPU: V_x of the ACE build for all ",I0," k-points in one pass; of ",I0," (k, k+q) pairs ",I0," are transformed for both k-points, ",I0," pair with themselves, ",I0," stand alone: ",I0,"% fewer pair transforms")' ) &
+            nks, nks*nqs, ncoup, nself, nsolo, NINT( 100.0_DP * ( 1.0_DP - work_all / MAX( work_k, 1.0_DP ) ) )
+    ENDIF
+    ka_h_d = ( 0._DP, 0._DP )
+    ! ... room for the slots of one k-point: at most m x m per k+q point
+    nstot = nqs * m * MAX( m, 1 )
+    IF ( ALLOCATED(ka_si_h) ) THEN
+       IF ( SIZE(ka_si_h) < nstot ) DEALLOCATE( ka_si_h, ka_sj_h, ka_sw_h, ka_si_d, ka_sj_d, ka_sw_d )
+    ENDIF
+    IF ( .NOT. ALLOCATED(ka_si_h) ) ALLOCATE( ka_si_h(nstot), ka_sj_h(nstot), ka_sw_h(2,nstot), &
+                                              ka_si_d(nstot), ka_sj_d(nstot), ka_sw_d(2,nstot) )
+    CALL stop_clock( 'vexx_ka_setup' )
+    !
+    CALL start_clock( 'vexx_ka_main' )
+    fs = exxalfa * scale
+    DO ik = 1, nks
+       ikg = global_kpoint_index( nkstot, ik )
+       npw = ngk(ik)
+       xkp = xk(:,ik)
+       CALL vexx_fast_cfac( ik, ikg, xkp, nrxxs, ngmt, pblk, nqs*nocc )
+       ! ... the slots of every k+q point of this k: (band i of k, band j of k+q) with the weight of
+       !     phi_j into band i and the weight of psi_i into band j
+       ns = 0
+       DO iq = 1, nqs
+          seg(iq) = ns
+          IF ( st(iq,ik) == 2 ) CYCLE
+          ik2g = tk(iq,ik)
+          DO i = 1, m
+             wt = 0.0_DP
+             IF ( st(iq,ik) /= 0 ) wt = x_occupation(i,ikg) * nqs_inv
+             jfirst = 1
+             IF ( st(iq,ik) == 3 ) jfirst = i
+             jlast = nocc
+             IF ( st(iq,ik) /= 0 .AND. ABS(wt) >= eps_occ ) jlast = m
+             DO j = jfirst, jlast
+                wd = 0.0_DP
+                IF ( j <= nocc ) wd = x_occupation(j,ik2g) * nqs_inv
+                IF ( st(iq,ik) == 3 .AND. j == i ) THEN
+                   IF ( ABS(wd) < eps_occ ) CYCLE
+                   ns = ns + 1
+                   ka_si_h(ns) = i; ka_sj_h(ns) = j; ka_sw_h(1,ns) = wd; ka_sw_h(2,ns) = 0.0_DP
+                ELSE
+                   IF ( ABS(wd) < eps_occ .AND. ABS(wt) < eps_occ ) CYCLE
+                   ns = ns + 1
+                   ka_si_h(ns) = i; ka_sj_h(ns) = j; ka_sw_h(1,ns) = wd; ka_sw_h(2,ns) = wt
+                ENDIF
+             ENDDO
+          ENDDO
+       ENDDO
+       seg(nqs+1) = ns
+       IF ( ns > 0 ) THEN
+          ka_si_d(1:ns) = ka_si_h(1:ns)
+          ka_sj_d(1:ns) = ka_sj_h(1:ns)
+          ka_sw_d(:,1:ns) = ka_sw_h(:,1:ns)
+       ENDIF
+       p6_res_d = ( 0._DP, 0._DP )
+       ! ... the k+q points of this k: those with a transposed term first, target by target
+       nord = 0
+       DO ik2 = 1, nks
+          DO iq = 1, nqs
+             IF ( ( st(iq,ik) == 1 .OR. st(iq,ik) == 3 ) .AND. tk(iq,ik) == ik2 ) THEN
+                nord = nord + 1
+                ord(nord) = iq
+             ENDIF
+          ENDDO
+       ENDDO
+       DO iq = 1, nqs
+          IF ( st(iq,ik) == 0 ) THEN
+             nord = nord + 1
+             ord(nord) = iq
+          ENDIF
+       ENDDO
+       cur = 0            ! the target k-point whose transposed terms ka_acc_d holds
+       DO io = 1, nord
+          iq = ord(io)
+          ikq = index_xkq(ikg,iq)
+          trans = ( st(iq,ik) /= 0 )
+          is = ABS( index_sym(ikq) )
+          tr = ( index_sym(ikq) < 0 )
+          IF ( trans .AND. cur /= tk(iq,ik) ) THEN
+             cur = tk(iq,ik)
+             ka_acc_d = ( 0._DP, 0._DP )
+          ENDIF
+          DO s0 = seg(iq), seg(iq+1) - 1, pblk
+             np_ = MIN( pblk, seg(iq+1) - s0 )
+             CALL vexx_kall_pair( nrxxs, nbuf, nkqs_d, exxbuff_d, ikq, ikq0(ik), ns, ka_si_d, ka_sj_d, s0, np_, p6_rhoc_d, omega_inv )
+             CALL vexx_gfast_fft_blk( nrxxs, np_, p6_rhoc_d, nr1, nr2, nr3, single, cmax, CUFFT_FORWARD )
+             CALL vexx_kall_kern( nrxxs, nqs, np_, p6_rhoc_d, p6_facb_d, iq, scale )
+             CALL vexx_gfast_fft_blk( nrxxs, np_, p6_rhoc_d, nr1, nr2, nr3, single, cmax, CUFFT_INVERSE )
+             CALL vexx_kall_acc( nrxxs, nbuf, nkqs_d, exxbuff_d, ikq, ikq0(ik), m, p6_res_d, ka_acc_d, ns, ka_si_d, ka_sj_d, &
+                                 ka_sw_d, s0, np_, p6_rhoc_d, trans, nsym, ka_rir_d, is, tr )
+          ENDDO
+          IF ( .NOT. trans ) CYCLE
+          ! ... the last k+q point of this target: its transposed terms go where they belong
+          IF ( io < nord ) THEN
+             IF ( st(ord(io+1),ik) /= 0 .AND. tk(ord(io+1),ik) == cur ) CYCLE
+          ENDIF
+          ik2 = cur
+          IF ( ik2 == ik ) THEN
+             !$cuf kernel do (2)
+             DO jb = 1, m
+                DO ir = 1, nrxxs
+                   p6_res_d(ir,jb) = p6_res_d(ir,jb) + ka_acc_d(ir,jb)
+                ENDDO
+             ENDDO
+          ELSE
+             DO j0 = 0, m - 1, pblk
+                np_ = MIN( pblk, m - j0 )
+                CALL vexx_gfast_fft_blk( nrxxs, np_, ka_acc_d(1,j0+1), nr1, nr2, nr3, single, cmax, CUFFT_FORWARD )
+             ENDDO
+             npw = ngk(ik2)
+             !$cuf kernel do (2)
+             DO jb = 1, m
+                DO ig = 1, npw
+                   ka_h_d(ig,jb,ik2) = ka_h_d(ig,jb,ik2) - fs * ka_acc_d( nl_d(igk_exx_d(ig,ik2)), jb )
+                ENDDO
+             ENDDO
+             npw = ngk(ik)
+          ENDIF
+          cur = 0
+       ENDDO
+       ! ... the result of this k back to G-space
+       DO j0 = 0, m - 1, pblk
+          np_ = MIN( pblk, m - j0 )
+          CALL vexx_gfast_fft_blk( nrxxs, np_, p6_res_d(1,j0+1), nr1, nr2, nr3, single, cmax, CUFFT_FORWARD )
+       ENDDO
+       !$cuf kernel do (2)
+       DO ib = 1, m
+          DO ig = 1, npw
+             ka_h_d(ig,ib,ik) = ka_h_d(ig,ib,ik) - fs * p6_res_d( nl_d(igk_exx_d(ig,ik)), ib )
+          ENDDO
+       ENDDO
+    ENDDO
+    CALL stop_clock( 'vexx_ka_main' )
+    !
+    CALL start_clock( 'vexx_ka_fin' )
+    DO ik = 1, nks
+       p6_hpsi_d(1:npwx,1:m) = ka_h_d(1:npwx,1:m,ik)
+       vx(1:npwx,1:m,ik) = p6_hpsi_d(1:npwx,1:m)
+    ENDDO
+    DEALLOCATE( ikq0, st, tk, inv_ok, seg, ord )
+    ok = .TRUE.
+    CALL stop_clock( 'vexx_ka_fin' )
+    !
+  END SUBROUTINE vexx_bp_k_all_gpu
   !
   !-----------------------------------------------------------------------
   LOGICAL FUNCTION vexx_gamma_fast_path()
@@ -6120,6 +6682,8 @@ end associate
     IF ( ALLOCATED(gf_psic_d) ) DEALLOCATE( gf_psic_d, gf_res_d, gf_rho_d )
     IF ( ALLOCATED(gf_fac_d) ) DEALLOCATE( gf_fac_d, gf_facg_d )
     IF ( ALLOCATED(gf_si_h) ) DEALLOCATE( gf_si_h, gf_sj_h, gf_sx_h, gf_si_d, gf_sj_d, gf_sx_d )
+    IF ( ALLOCATED(ka_acc_d) ) DEALLOCATE( ka_acc_d, ka_h_d, ka_rir_d )
+    IF ( ALLOCATED(ka_si_h) ) DEALLOCATE( ka_si_h, ka_sj_h, ka_sw_h, ka_si_d, ka_sj_d, ka_sw_d )
     IF ( ALLOCATED(gf_f_d) ) DEALLOCATE( gf_f_d, gf_u_d, gf_aug_d, gf_vcg_d, gf_wb_d, gf_t_d, gf_cb_d )
     IF ( ALLOCATED(gf_becpsi_d) ) DEALLOCATE( gf_becpsi_d, gf_deexx_d )
     IF ( ALLOCATED(gf_bec_d) ) DEALLOCATE( gf_bec_d, gf_dpaw_d )

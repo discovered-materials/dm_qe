@@ -40,6 +40,9 @@ MODULE exx
 #if defined(__CUDA)
   ATTRIBUTES(DEVICE) :: xi_d
 #endif
+  INTEGER :: xi_d_k = -1
+  !! the k-point whose ACE projectors xi_d holds (-1: none): h_psi is applied many times to the
+  !! same k-point, and xi is uploaded when the k-point changes, not at every application
   LOGICAL :: domat
   !! 
   ! ... energy related variables
@@ -328,6 +331,7 @@ MODULE exx
     IF ( ALLOCATED(exxmat) )       DEALLOCATE( exxmat )
     IF ( ALLOCATED(xi)   )         DEALLOCATE( xi   )
     IF ( ALLOCATED(xi_d) )         DEALLOCATE( xi_d )
+    xi_d_k = -1
     IF ( ALLOCATED(evc0) )         DEALLOCATE( evc0 )
     !
     IF ( ALLOCATED(becxx) ) THEN
@@ -714,6 +718,9 @@ MODULE exx
     USE mp,                 ONLY : mp_sum
     USE wavefunctions,      ONLY : evc
     USE uspp_init,          ONLY : init_us_2
+#if defined(__CUDA)
+    USE exx_bp,             ONLY : vexx_all_path, vexx_bp_k_all_gpu
+#endif
     !
     IMPLICIT NONE
     !
@@ -727,6 +734,7 @@ MODULE exx
     REAL(DP) :: ee, eexx
     INTEGER :: ik, npw
     TYPE(bec_type) :: becpsi
+    LOGICAL :: all_k
     !
     IF (nbndproj < x_nbnd_occ .OR. nbndproj > nbnd) THEN 
        WRITE( stdout, '(3(A,I4))' ) ' occ = ', x_nbnd_occ, ' proj = ', nbndproj, &
@@ -743,6 +751,22 @@ MODULE exx
     eexx = 0.0d0
     xi = (0.0d0,0.0d0)
     !
+    ! ... where the batched device operator can, V_x|psi> of every k-point is built in one pass
+    !     (each pair potential then serves the two k-points of its pair), into xi
+    all_k = .FALSE.
+#if defined(__CUDA)
+    IF ( .NOT. gamma_only .AND. .NOT. DoLoc .AND. exx_bgrp_type /= EXX_BGRP_BANDS ) THEN
+       IF ( vexx_all_path( nbndproj ) ) THEN
+          CALL start_clock( 'aceinit' )
+          CALL start_clock( 'vexx' )
+          CALL vexx_bp_k_all_gpu( npwx, nbndproj, xi, all_k )
+          CALL stop_clock( 'vexx' )
+          CALL stop_clock( 'aceinit' )
+          IF ( .NOT. all_k ) xi = (0.0d0,0.0d0)
+       ENDIF
+    ENDIF
+#endif
+    !
     DO ik = 1, nks
        npw = ngk(ik)
        current_k = ik
@@ -755,7 +779,7 @@ MODULE exx
        IF (gamma_only) THEN
           CALL aceinit_gamma( DoLoc, npw, nbnd, evc, xi(1,1,ik), becpsi, ee )
        ELSE
-          CALL aceinit_k( DoLoc, npw, nbnd, evc, xi(1,1,ik), becpsi, ee )
+          CALL aceinit_k( DoLoc, npw, nbnd, evc, xi(1,1,ik), becpsi, ee, all_k )
        ENDIF
        eexx = eexx + ee
     ENDDO
@@ -766,6 +790,8 @@ MODULE exx
 #if defined (__CUDA)
     IF (nks == 1) xi_d(:,:) = xi(:,:,1)
 #endif
+    xi_d_k = -1      ! xi has changed: the device copy of any k-point is stale
+    IF (nks == 1) xi_d_k = 1
     !
     IF (PRESENT(exex)) exex = eexx
     IF ( okvan ) CALL deallocate_bec_type( becpsi )
@@ -970,7 +996,10 @@ MODULE exx
     ! do the ACE potential
     ALLOCATE( rmexx_d(nbndproj,nbnd), cmexx_d(nbndproj,nbnd) )
     !
-    IF ( nks > 1 ) xi_d(:,:) = xi(:,:,current_k)
+    IF ( nks > 1 .AND. xi_d_k /= current_k ) THEN
+       xi_d(:,:) = xi(:,:,current_k)
+       xi_d_k = current_k
+    ENDIF
     !
     ! <xi|phi>
     CALL matcalc_gpu( '<xi|phi>', .FALSE. , 0, nnpw, nbndproj, nbnd, xi_d, phi_d, rmexx_d, exxe )
@@ -1059,7 +1088,7 @@ MODULE exx
   !
   !
   !---------------------------------------------------------------------------------------------
-  SUBROUTINE aceinit_k( DoLoc, nnpw, nbnd, phi, xitmp, becpsi, exxe )
+  SUBROUTINE aceinit_k( DoLoc, nnpw, nbnd, phi, xitmp, becpsi, exxe, have_vx )
     !-----------------------------------------------------------------------------------------
     !! Compute xi(npw,nbndproj) for the ACE method.
     !
@@ -1085,6 +1114,8 @@ MODULE exx
     !! <beta|psi>
     REAL(DP) :: exxe
     !! exx energy
+    LOGICAL, INTENT(IN) :: have_vx
+    !! if TRUE xitmp already holds Vx[phi]|phi> on input
     !
     ! ... local variables
     !
@@ -1100,14 +1131,14 @@ MODULE exx
     IF (nbndproj<=0)   CALL errore( 'aceinit_k', 'nbndproj le 0.', 1 )
     !
     ALLOCATE( mexx(nbndproj,nbndproj) )
-    xitmp = (Zero,Zero)
+    IF ( .NOT. have_vx ) xitmp = (Zero,Zero)
     mexx  = (Zero,Zero)
     IF ( DoLoc ) THEN
       CALL vexx_loc_k( nnpw, nbndproj, xitmp, mexx, exxe )
       CALL MatSymm_k( 'S', 'L', mexx, nbndproj )
     ELSE
       ! |xi> = Vx[phi]|phi>
-      CALL vexx( npwx, nnpw, nbndproj, phi, xitmp, becpsi )
+      IF ( .NOT. have_vx ) CALL vexx( npwx, nnpw, nbndproj, phi, xitmp, becpsi )
       ! mexx = <phi|Vx[phi]|phi>
       CALL matcalc_k( 'exact', .TRUE., 0, current_k, npwx*npol, nbndproj, nbndproj, &
                       phi, xitmp, mexx, exxe )
@@ -1291,7 +1322,10 @@ MODULE exx
     ! do the ACE potential!
     ALLOCATE( cmexx_d(nbndproj,nbnd) )
     !
-    IF ( nks > 1 ) xi_d(:,:) = xi(:,:,current_k)
+    IF ( nks > 1 .AND. xi_d_k /= current_k ) THEN
+       xi_d(:,:) = xi(:,:,current_k)
+       xi_d_k = current_k
+    ENDIF
     !
     ! <xi|phi>
     CALL matcalc_k_gpu( '<xi|phi>', .FALSE., 0, current_k, npwx*npol, nbndproj, nbnd, &
