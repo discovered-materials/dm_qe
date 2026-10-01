@@ -117,6 +117,12 @@ MODULE exx_bp
   LOGICAL :: gf_us_banner = .FALSE.
   REAL(DP), ALLOCATABLE, DEVICE :: gf_bec_d(:,:), gf_becpsi_d(:,:), gf_deexx_d(:,:), gf_wb_d(:,:), gf_t_d(:,:), &
                                    gf_cb_d(:,:), gf_dpaw_d(:,:)
+  ! the same operator as the force pass of an ultrasoft / PAW run at Gamma (exx_force_us): the weight of each
+  ! band, the structure-factor force of each projector, the G vectors of the EXX grid, and (where it fits) the
+  ! sum over bands of w_i Im[ F_i conj(U_i) ] on (G, projector), contracted with G once at the end
+  LOGICAL :: gf_force_mode = .FALSE.
+  REAL(DP), ALLOCATABLE :: gf_fw_h(:)
+  REAL(DP), ALLOCATABLE, DEVICE :: gf_fa_d(:,:), gf_gt_d(:,:), gf_fd_d(:,:)
   ! exchange operator of an ACE build for every k-point in one pass (vexx_bp_k_all_gpu)
   LOGICAL :: ka_disabled = .FALSE.
   INTEGER :: ka_banner = -1
@@ -5893,6 +5899,16 @@ end associate
           CALL vexx_gfast_acc( nrxxs, nbuf, ebuf, mp, psic, m, res, ns, si, sj, sx, s0, np_, rho, sym )
           s = s + np_
        ENDDO
+       ! ... force pass: the structure-factor term of band i (F_i still carries S_a, U_i does not yet)
+       IF ( gf_force_mode ) THEN
+          IF ( gf_fw_h(i) /= 0.0_DP ) THEN
+             IF ( ALLOCATED(gf_fd_d) ) THEN
+                CALL vexx_gfast_force_acc( ngmt, nkb, f, u, kbat, gf_fw_h(i), gf_fd_d )
+             ELSE
+                CALL vexx_gfast_force( ngmt, nkb, f, u, gf_gt_d, kbat, gf_fw_h(i), gf_fa_d )
+             ENDIF
+          ENDIF
+       ENDIF
        ! ... deexx_i from U_i: conj(S_a) U_i, Q^T times it for every ultrasoft species, the (ih,jh) entries
        !$cuf kernel do (2)
        DO ikb = 1, nkb
@@ -5922,6 +5938,61 @@ end associate
        ENDDO
     ENDDO
   END SUBROUTINE vexx_gfast_main_us
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE vexx_gfast_force( ngmt, nkb, f, u, gt, kbat, w, fa )
+  !-----------------------------------------------------------------------
+    !! The structure-factor part of the exact-exchange force from band i at Gamma. The augmentation
+    !! charge of the pair (i,j) is sum_k F_i(G,k) b_phi_j(k) with F_i(G;a,ih) proportional to
+    !! e^{-iG.tau_a}, so the derivative of the exchange energy with respect to tau_a is, for each
+    !! projector k of atom a, a sum over G of -i G F_i(G,k) conj( U_i(G,k) ), U_i = sum_j x_j V_ij b_phi_j:
+    !!    fa(:,k) += w sum_{G half sphere} G Im[ F_i(G,k) conj( U_i(G,k) ) ]
+    !! (w holds 2 alpha_x omega w_i tpiba, the 2 for the other half of the sphere).
+    IMPLICIT NONE
+    INTEGER, INTENT(IN) :: ngmt, nkb
+    COMPLEX(DP), DEVICE, INTENT(IN) :: f(ngmt,nkb), u(ngmt,nkb)
+    REAL(DP), DEVICE, INTENT(IN) :: gt(3,ngmt)
+    INTEGER, DEVICE, INTENT(IN) :: kbat(nkb)
+    REAL(DP), INTENT(IN) :: w
+    REAL(DP), DEVICE, INTENT(INOUT) :: fa(3,nkb)
+    INTEGER :: ikb, ig
+    REAL(DP) :: s1, s2, s3, d
+    !$cuf kernel do (1)
+    DO ikb = 1, nkb
+       IF ( kbat(ikb) > 0 ) THEN
+          s1 = 0.0_DP; s2 = 0.0_DP; s3 = 0.0_DP
+          DO ig = 1, ngmt
+             d = AIMAG( f(ig,ikb) * CONJG( u(ig,ikb) ) )
+             s1 = s1 + gt(1,ig) * d
+             s2 = s2 + gt(2,ig) * d
+             s3 = s3 + gt(3,ig) * d
+          ENDDO
+          fa(1,ikb) = fa(1,ikb) + w * s1
+          fa(2,ikb) = fa(2,ikb) + w * s2
+          fa(3,ikb) = fa(3,ikb) + w * s3
+       ENDIF
+    ENDDO
+  END SUBROUTINE vexx_gfast_force
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE vexx_gfast_force_acc( ngmt, nkb, f, u, kbat, w, fd )
+  !-----------------------------------------------------------------------
+    !! The same term with the sum over G left for the end: fd(G,k) += w Im[ F_i(G,k) conj( U_i(G,k) ) ],
+    !! every element on its own thread (vexx_gfast_force walks G on one thread per projector).
+    IMPLICIT NONE
+    INTEGER, INTENT(IN) :: ngmt, nkb
+    COMPLEX(DP), DEVICE, INTENT(IN) :: f(ngmt,nkb), u(ngmt,nkb)
+    INTEGER, DEVICE, INTENT(IN) :: kbat(nkb)
+    REAL(DP), INTENT(IN) :: w
+    REAL(DP), DEVICE, INTENT(INOUT) :: fd(ngmt,nkb)
+    INTEGER :: ikb, ig
+    !$cuf kernel do (2)
+    DO ikb = 1, nkb
+       DO ig = 1, ngmt
+          IF ( kbat(ikb) > 0 ) fd(ig,ikb) = fd(ig,ikb) + w * AIMAG( f(ig,ikb) * CONJG( u(ig,ikb) ) )
+       ENDDO
+    ENDDO
+  END SUBROUTINE vexx_gfast_force_acc
   !
   !-----------------------------------------------------------------------
   SUBROUTINE vexx_us_vkb( npw, ik, xkp )
@@ -6355,7 +6426,7 @@ end associate
     gf_res_d = 0.0_DP
     !
     ! ... are these psi the buffered orbitals? Then every pair potential serves two bands
-    sym = ( gf_sym_mode /= 0 ) .AND. ( m <= nbb )
+    sym = ( gf_sym_mode /= 0 ) .AND. ( m <= nbb ) .AND. ( .NOT. gf_force_mode )
     IF ( sym ) THEN
        CALL vexx_gfast_same( nrxxs, nbuf, exxbuff_d(1,LBOUND(exxbuff_d,2),ikq), mp, gf_psic_d, m, dmax, bmax )
        sym = ( dmax <= 1.0E-11_DP * bmax )
@@ -6469,6 +6540,12 @@ end associate
           CALL vexx_gfast_main( nrxxs, nbuf, exxbuff_d(1,LBOUND(exxbuff_d,2),ikq), mp, gf_psic_d, m, gf_res_d, gf_fac_d, ns, gf_si_d, gf_sj_d, &
                                 gf_sx_d, bp, gf_rho_d, plan_full, plan_tail, single, sym, omega_inv, sp, p6_rhoc_s, nr1, nr2, nr3, cmax )
        ENDIF
+    ENDIF
+    !
+    IF ( gf_force_mode ) THEN
+       ! the force pass wants the exchange D matrix and the structure-factor term only, no potential
+       CALL stop_clock( 'vexx_g_main' )
+       RETURN
     ENDIF
     !
     ! ... back to G-space, two bands per transform (normalised here), and into hpsi
@@ -7780,7 +7857,8 @@ end associate
   LOGICAL FUNCTION exx_us_forces_available()
   !-----------------------------------------------------------------------
     !! P20: the exact-exchange forces of an ultrasoft / PAW hybrid run come from the device force pass, which needs
-    !! the batched path (GPU build, k-points, collinear, G-space augmentation); setup lets relax / md through when true
+    !! a batched path (GPU build, k-points or Gamma, collinear, G-space augmentation); setup lets relax / md through
+    !! when true
     USE control_flags,    ONLY : gamma_only, tqr
     USE noncollin_module, ONLY : noncolin
     USE mp_pools,         ONLY : nproc_pool
@@ -7789,7 +7867,7 @@ end associate
     LOGICAL, EXTERNAL :: check_gpu_support   ! setup.f90; use_gpu itself is set in setup_para, after setup's guard
     exx_us_forces_available = .FALSE.
 #if defined(__CUDA)
-    exx_us_forces_available = check_gpu_support() .AND. (.NOT. gamma_only) .AND. (.NOT. noncolin) .AND. (.NOT. tqr) &
+    exx_us_forces_available = check_gpu_support() .AND. (.NOT. noncolin) .AND. (.NOT. tqr) &
                               .AND. ( nproc_pool == 1 ) .AND. ( nbgrp == 1 )
 #endif
   END FUNCTION exx_us_forces_available
@@ -7798,12 +7876,15 @@ end associate
     !! P20: can the force pass run now? The structural conditions of exx_us_forces_available plus the run-time state
     !! of the batched path (device memory, exxinit done). QE_EXX_FAST switches vexx only: the force pass has no other
     !! implementation, so it runs whatever that switch says.
-    USE mp_exx, ONLY : negrp
+    USE mp_exx,   ONLY : negrp
+    USE exx_base, ONLY : nqs
     IMPLICIT NONE
 #if defined(__CUDA)
     exx_force_path_ok = exx_us_forces_available() .AND. (.NOT. p15_fast_disabled) .AND. (x_nbnd_occ > 0) .AND. (negrp == 1) &
                         .AND. (dfftt%nproc == 1) .AND. (dfftt%nr1x == dfftt%nr1) .AND. (dfftt%nr2x == dfftt%nr2) &
                         .AND. (dfftt%nr3x == dfftt%nr3) .AND. (dfftt%nnr == dfftt%nr1*dfftt%nr2*dfftt%nr3)
+    ! at Gamma the pass is the batched Gamma operator: one q-point
+    IF ( gamma_only ) exx_force_path_ok = exx_force_path_ok .AND. ( nqs == 1 )
 #else
     exx_force_path_ok = .FALSE.
 #endif
@@ -7819,7 +7900,7 @@ end associate
     !! pair and the exchange D matrix of every band; the projector term is 2 alpha_x w_i Re[conj(<d beta|psi_i>) D_i]
     !! (the factor 2 stands for the derivative through the other orbital of each pair, see the patch header).
     USE ions_base,        ONLY : nat, ityp
-    USE cell_base,        ONLY : tpiba
+    USE cell_base,        ONLY : tpiba, omega
     USE klist,            ONLY : nks, nkstot, ngk, igk_k, xk
     USE wvfct,            ONLY : npwx, wg, current_k
     USE wavefunctions,    ONLY : evc
@@ -7839,13 +7920,18 @@ end associate
     USE noncollin_module, ONLY : npol
     USE control_flags,    ONLY : lbfgs, lmd
     USE xc_lib,           ONLY : exx_is_active
+#if defined(__CUDA)
+    USE cudafor,          ONLY : cudaMemGetInfo
+#endif
     IMPLICIT NONE
     REAL(DP), INTENT(OUT) :: forcex(3,nat)
 #if defined(__CUDA)
     INTEGER, EXTERNAL :: global_kpoint_index
     TYPE(bec_type) :: becpsi, dbec(3)
     COMPLEX(DP), ALLOCATABLE :: vkb1(:,:), hdum(:,:), deexx_h(:,:)
-    REAL(DP), ALLOCATABLE :: fa_h(:,:), xkq_h(:,:)
+    REAL(DP), ALLOCATABLE :: fa_h(:,:), xkq_h(:,:), deexx_r(:,:)
+    INTEGER :: istat
+    INTEGER(KIND=8) :: free_, total_
     INTEGER :: ik, ipol, ig, ikb, m, npw, current_ik, iq, ia, na, nt, ih, ibnd, ngmt, k_save
     REAL(DP) :: wi
     LOGICAL :: ok, okall
@@ -7914,6 +8000,58 @@ end associate
        p20_xkq_d = xkq_h
        p20_wg_h(1:m) = wg(1:m,ik)
        p20_wg_d = p20_wg_h
+       IF ( gamma_only ) THEN
+          ! the batched Gamma operator in force mode: the D matrix of every band and the structure-factor term
+          ! of every projector, fa(:,k) = 2 alpha_x omega w_i tpiba sum_{G half sphere} G Im[ F_i conj(U_i) ]
+          IF ( ALLOCATED(gf_fw_h) ) DEALLOCATE( gf_fw_h )
+          ALLOCATE( gf_fw_h(m) )
+          gf_fw_h(1:m) = 2.0_DP * exxalfa * omega * tpiba * wg(1:m,ik)
+          IF ( ALLOCATED(gf_fa_d) ) DEALLOCATE( gf_fa_d )
+          ALLOCATE( gf_fa_d(3,nkb) )
+          gf_fa_d = 0.0_DP
+          IF ( ALLOCATED(gf_gt_d) ) DEALLOCATE( gf_gt_d )
+          ALLOCATE( gf_gt_d(3,ngmt) )
+          gf_gt_d = gt(1:3,1:ngmt)
+          ! (the sum over bands on (G, projector) where the device has room for it next to the work arrays)
+          IF ( ALLOCATED(gf_fd_d) ) DEALLOCATE( gf_fd_d )
+          istat = cudaMemGetInfo( free_, total_ )
+          IF ( istat == 0 .AND. 56_8*INT(ngmt,8)*INT(nkb,8) + 1073741824_8 < free_ ) THEN
+             ALLOCATE( gf_fd_d(ngmt,nkb) )
+             gf_fd_d = 0.0_DP
+          ENDIF
+          gf_force_mode = .TRUE.
+          CALL vexx_bp_gamma_gpu_fast( npwx, npw, m, evc, hdum, ok )
+          gf_force_mode = .FALSE.
+          IF ( .NOT. ok ) THEN
+             okall = .FALSE.
+             EXIT
+          ENDIF
+          IF ( ALLOCATED(gf_fd_d) ) THEN
+             CALL MYDGEMM( 'N', 'N', 3, nkb, ngmt, 1.0_DP, gf_gt_d, 3, gf_fd_d, ngmt, 1.0_DP, gf_fa_d, 3 )
+             DEALLOCATE( gf_fd_d )
+          ENDIF
+          ALLOCATE( fa_h(3,nkb), deexx_r(nkb,m) )
+          fa_h = gf_fa_d
+          deexx_r = gf_deexx_d
+          DO na = 1, nat
+             nt = ityp(na)
+             IF ( .NOT. upf(nt)%tvanp ) CYCLE
+             DO ih = 1, nh(nt)
+                ikb = ofsbeta(na) + ih
+                forcex(:,na) = forcex(:,na) + fa_h(:,ikb)
+                ! ... projector term: 2 alpha_x w_i <d beta_m/d tau|psi_i> D_m,i
+                DO ibnd = 1, m
+                   wi = wg(ibnd,ik)
+                   IF ( wi == 0.0_DP ) CYCLE
+                   DO ipol = 1, 3
+                      forcex(ipol,na) = forcex(ipol,na) + 2.0_DP * exxalfa * wi * dbec(ipol)%r(ikb,ibnd) * deexx_r(ikb,ibnd)
+                   ENDDO
+                ENDDO
+             ENDDO
+          ENDDO
+          DEALLOCATE( fa_h, deexx_r )
+          CYCLE
+       ENDIF
        ! the fast path in force mode: pair densities, D matrix, structure-factor term
        p20_force_mode = .TRUE.
        CALL vexx_bp_k_gpu_fast( npwx, npw, m, evc, hdum, ok, becpsi )
@@ -7961,7 +8099,11 @@ end associate
        ! the k sum ran over the irreducible wedge: symmetrise, as force_us and addusforce do for their terms
        CALL symvector( nat, forcex )
        exx_us_forces_done = .TRUE.
-       WRITE( stdout, '(5X,"EXX-GPU: exact-exchange forces of the ultrasoft/PAW run on the device (P20); exchange energy of the force pass ",F17.8," Ry")' ) p20_ex
+       IF ( gamma_only ) THEN
+          WRITE( stdout, '(5X,"EXX-GPU: exact-exchange forces of the ultrasoft/PAW run on the device, from the batched Gamma operator")' )
+       ELSE
+          WRITE( stdout, '(5X,"EXX-GPU: exact-exchange forces of the ultrasoft/PAW run on the device (P20); exchange energy of the force pass ",F17.8," Ry")' ) p20_ex
+       ENDIF
     ENDIF
     CALL deallocate_bec_type( becpsi )
     DO ipol = 1, 3
@@ -7975,6 +8117,10 @@ end associate
     IF ( ALLOCATED(p20_gt_d) ) DEALLOCATE( p20_gt_d )
     IF ( ALLOCATED(p20_wg_d) ) DEALLOCATE( p20_wg_d )
     IF ( ALLOCATED(p20_wg_h) ) DEALLOCATE( p20_wg_h )
+    IF ( ALLOCATED(gf_fa_d) ) DEALLOCATE( gf_fa_d )
+    IF ( ALLOCATED(gf_gt_d) ) DEALLOCATE( gf_gt_d )
+    IF ( ALLOCATED(gf_fd_d) ) DEALLOCATE( gf_fd_d )
+    IF ( ALLOCATED(gf_fw_h) ) DEALLOCATE( gf_fw_h )
     CALL stop_clock( 'exx_force' )
 #else
     forcex = 0.0_DP
