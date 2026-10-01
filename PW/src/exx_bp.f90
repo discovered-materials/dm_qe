@@ -95,6 +95,8 @@ MODULE exx_bp
   !! QE_EXX_SYM: 1 (default) each unordered orbital pair is transformed once when psi is the buffered set, 0 never
   INTEGER :: gf_fft1_mode = -1
   !! QE_EXX_FFT1: 1 single-grid cuFFT plans, 0 batched plans, -1 (default) chosen by the grid size
+  INTEGER :: ku_env_mode = -1
+  !! QE_EXX_KUS: 1 the all-k build takes every ultrasoft / PAW k-point run it can, 0 none, -1 (default) by size
   INTEGER :: gf_banner_last = -1
   LOGICAL :: gf_keep = .FALSE.
   COMPLEX(DP), ALLOCATABLE, DEVICE :: gf_psic_d(:,:), gf_rho_d(:,:)
@@ -116,6 +118,12 @@ MODULE exx_bp
   REAL(DP), ALLOCATABLE, DEVICE :: ka_sw_d(:,:)
   INTEGER, ALLOCATABLE :: ka_si_h(:), ka_sj_h(:)
   REAL(DP), ALLOCATABLE :: ka_sw_h(:,:)
+  ! its ultrasoft / PAW augmentation: the complex counterparts of the Gamma factors, <beta|psi> and the exchange
+  ! D matrix of every k-point
+  INTEGER :: ku_build = -1, ku_mode = -1
+  COMPLEX(DP), ALLOCATABLE, DEVICE :: ku_f_d(:,:), ku_u_d(:,:), ku_aug_d(:,:), ku_vcg_d(:,:), ku_cb_d(:,:), ku_wb_d(:,:), &
+                                       ku_t_d(:,:), ku_bq_d(:,:), ku_dx_d(:,:,:), ku_bpsi_d(:,:,:), ku_dpaw_d(:,:,:), &
+                                       ku_eigq_d(:)
   INTEGER :: gf_ntu = 0
   INTEGER, ALLOCATABLE :: gf_tkb0(:), gf_tnkb(:), gf_tq0(:), gf_tnq(:)
   !! the ultrasoft species: first projector - 1, projectors, first Q column - 1, Q columns
@@ -3664,6 +3672,11 @@ end associate
              gf_fft1_mode = -1
           ENDIF
        ENDIF
+       CALL GET_ENVIRONMENT_VARIABLE( 'QE_EXX_KUS', val, lenv, stat )
+       IF (stat == 0 .AND. lenv > 0) THEN
+          IF ( val(1:1) == '0' ) ku_env_mode = 0
+          IF ( val(1:1) == '1' ) ku_env_mode = 1
+       ENDIF
        IF (p6_sp_mode == 1) WRITE( stdout, '(5X,"EXX: single-precision pair FFTs while dexx >",1PE9.1," Ry")' ) p6_sp_thr
        IF (p6_sp_mode >= 2) WRITE( stdout, '(5X,"EXX: single-precision pair FFTs in every ACE build")' )
     ENDIF
@@ -4363,17 +4376,22 @@ end associate
   LOGICAL FUNCTION vexx_all_path( m )
   !-----------------------------------------------------------------------
     !! Can V_x of an ACE build over m bands be applied to every k-point in one pass
-    !! (vexx_bp_k_all_gpu)? The conditions of the batched k-point operator, norm-conserving
-    !! pseudopotentials, one pool, the Coulomb kernels without cutoff tricks.
-    USE uspp,      ONLY : okvan
+    !! (vexx_bp_k_all_gpu)? The conditions of the batched k-point operator, one pool, the
+    !! Coulomb kernels without cutoff tricks; with ultrasoft augmentation, cells large enough.
+    USE uspp,      ONLY : okvan, nkb
     USE mp_pools,  ONLY : npool
     USE wvfct,     ONLY : nbnd
     USE exx_base,  ONLY : use_coulomb_vcut_ws, use_coulomb_vcut_spheric
     IMPLICIT NONE
     INTEGER, INTENT(IN) :: m
     vexx_all_path = .FALSE.
-    IF ( ka_disabled .OR. gamma_only .OR. okvan .OR. npool /= 1 ) RETURN
+    IF ( ka_disabled .OR. gamma_only .OR. npool /= 1 ) RETURN
     IF ( m < x_nbnd_occ .OR. m > nbnd ) RETURN
+    ! small cells with ultrasoft augmentation: the dense Q(G, atom pair) of the k-point operator has few
+    ! columns, and a product per band and k+q point costs more than it saves
+    CALL vexx_fast_env()
+    IF ( okvan .AND. ku_env_mode == 0 ) RETURN
+    IF ( okvan .AND. ku_env_mode < 0 .AND. DBLE(dfftt%ngm) * DBLE(nkb) < 3.0E5_DP ) RETURN
     IF ( use_coulomb_vcut_ws .OR. use_coulomb_vcut_spheric ) RETURN
     CALL vexx_fast_env()
     IF ( gf_sym_mode == 0 ) RETURN
@@ -4493,6 +4511,162 @@ end associate
   END SUBROUTINE vexx_kall_same
   !
   !-----------------------------------------------------------------------
+  SUBROUTINE vexx_kall_us_setup( lda, m, ngmt, pblk, ok )
+  !-----------------------------------------------------------------------
+    !! What the ultrasoft / PAW augmentation of the all-k build needs on the device for every
+    !! k-point: the pair tables and the species layout, the structure factors, <beta|phi> of every
+    !! buffered k+q orbital, the PAW one-centre matrix of every k (rebuilt after every exxinit),
+    !! the work arrays. ok = .FALSE.: no room; the k-point loop takes over.
+    USE cudafor,       ONLY : cudaMemGetInfo
+    USE ions_base,     ONLY : nat, ityp
+    USE uspp,          ONLY : nkb, ofsbeta
+    USE uspp_param,    ONLY : upf, nh, nhm
+    USE gvect,         ONLY : eigts1, eigts2, eigts3, mill
+    USE paw_variables, ONLY : okpaw
+    USE paw_exx,       ONLY : ke
+    USE wvfct,         ONLY : nbnd, npwx
+    USE klist,         ONLY : nks, nkstot
+    USE exx_base,      ONLY : nqs, index_xkq, index_xk
+    USE us_exx,        ONLY : becxx
+    IMPLICIT NONE
+    INTEGER, INTENT(IN) :: lda, m, ngmt, pblk
+    LOGICAL, INTENT(OUT) :: ok
+    INTEGER :: na, nt, ih, jh, oh, uh, jb, ig, ik, ikg, iq, ikq, ikx, o, nkqs_d, istat
+    INTEGER(KIND=8) :: need, free_, total_
+    REAL(DP) :: w
+    COMPLEX(DP) :: z
+    COMPLEX(DP), ALLOCATABLE :: dpaw_h(:,:), rhoa(:,:)
+    INTEGER, EXTERNAL :: global_kpoint_index
+    !
+    ok = .TRUE.
+    nkqs_d = SIZE( exxbuff_d, 3 )
+    CALL p18_tables()
+    CALL vexx_us_species()
+    need = 0_8
+    IF ( .NOT. ALLOCATED(ku_f_d) ) need = need + 32_8*INT(ngmt,8)*INT(nkb,8) + 32_8*INT(ngmt,8)*INT(pblk,8) + &
+                                          16_8*INT(nkb,8)*INT( p18_nij + 2*pblk + m + 2*m*nks + nkb*nks, 8 )
+    IF ( .NOT. ALLOCATED(p18_becxx_d) ) need = need + 16_8*INT(nkb,8)*INT(nbnd,8)*INT(nkqs_d,8)
+    IF ( .NOT. ALLOCATED(p18_sf_d) ) need = need + 16_8*INT(ngmt,8)*INT(nat,8)
+    IF ( .NOT. ALLOCATED(p18_qgm_acc) ) need = need + 16_8*INT(ngmt,8)*INT(p18_nij,8)
+    IF ( .NOT. ALLOCATED(p18_vkb_d) ) need = need + 16_8*INT(npwx,8)*INT(nkb,8)
+    istat = cudaMemGetInfo( free_, total_ )
+    IF ( istat == 0 .AND. need + 268435456_8 > free_ ) THEN
+       WRITE( stdout, '(5X,"EXX-GPU: the ultrasoft augmentation of the all-k exchange build would need ",I0," MB of device memory, ",I0," MB are free: V_x is applied k-point by k-point")' ) &
+            need/1000000_8, free_/1000000_8
+       ok = .FALSE.
+       RETURN
+    ENDIF
+    IF ( ALLOCATED(ku_f_d) ) THEN
+       IF ( SIZE(ku_f_d,1) /= ngmt .OR. SIZE(ku_f_d,2) /= nkb .OR. SIZE(ku_aug_d,2) /= pblk .OR. SIZE(ku_cb_d,1) /= p18_nij .OR. &
+            SIZE(ku_bq_d,2) /= m .OR. SIZE(ku_dx_d,3) /= nks ) &
+          DEALLOCATE( ku_f_d, ku_u_d, ku_aug_d, ku_vcg_d, ku_cb_d, ku_wb_d, ku_t_d, ku_bq_d, ku_dx_d, ku_bpsi_d, ku_dpaw_d, ku_eigq_d )
+    ENDIF
+    IF ( .NOT. ALLOCATED(ku_f_d) ) THEN
+       ALLOCATE( ku_f_d(ngmt,nkb), ku_u_d(ngmt,nkb), ku_aug_d(ngmt,pblk), ku_vcg_d(ngmt,pblk), ku_cb_d(p18_nij,nkb), &
+                 ku_wb_d(nkb,pblk), ku_t_d(nkb,pblk), ku_bq_d(nkb,m), ku_dx_d(nkb,m,nks), ku_bpsi_d(nkb,m,nks), &
+                 ku_dpaw_d(nkb,nkb,nks), ku_eigq_d(nat) )
+       ku_build = -1
+    ENDIF
+    IF ( ALLOCATED(p18_becxx_d) ) THEN
+       IF ( SIZE(p18_becxx_d,1) /= nkb .OR. SIZE(p18_becxx_d,2) /= nbnd .OR. SIZE(p18_becxx_d,3) /= nkqs_d ) THEN
+          DEALLOCATE( p18_becxx_d )
+          ku_build = -1
+       ENDIF
+    ENDIF
+    IF ( .NOT. ALLOCATED(p18_becxx_d) ) THEN
+       ALLOCATE( p18_becxx_d(nkb,nbnd,nkqs_d) )
+       ku_build = -1
+    ENDIF
+    IF ( ALLOCATED(p18_sf_d) ) THEN
+       IF ( SIZE(p18_sf_d,1) /= ngmt .OR. SIZE(p18_sf_d,2) /= nat ) THEN
+          DEALLOCATE( p18_sf_d )
+          ku_build = -1
+       ENDIF
+    ENDIF
+    IF ( .NOT. ALLOCATED(p18_sf_d) ) THEN
+       ALLOCATE( p18_sf_d(ngmt,nat) )
+       ku_build = -1
+    ENDIF
+    IF ( ALLOCATED(p18_sf_h) ) THEN
+       IF ( SIZE(p18_sf_h,1) /= ngmt .OR. SIZE(p18_sf_h,2) /= nat ) DEALLOCATE( p18_sf_h )
+    ENDIF
+    IF ( .NOT. ALLOCATED(p18_sf_h) ) ALLOCATE( p18_sf_h(ngmt,nat) )
+    IF ( ALLOCATED(p18_qgm_acc) ) THEN
+       IF ( SIZE(p18_qgm_acc,1) /= ngmt .OR. SIZE(p18_qgm_acc,2) /= p18_nij ) THEN
+          !$acc exit data delete( p18_qgm_acc )
+          DEALLOCATE( p18_qgm_acc )
+       ENDIF
+    ENDIF
+    IF ( .NOT. ALLOCATED(p18_qgm_acc) ) THEN
+       ALLOCATE( p18_qgm_acc(ngmt,p18_nij) )
+       !$acc enter data create( p18_qgm_acc )
+    ENDIF
+    IF ( ALLOCATED(p18_vkb_h) ) THEN
+       IF ( SIZE(p18_vkb_h,1) /= npwx .OR. SIZE(p18_vkb_h,2) /= nkb ) DEALLOCATE( p18_vkb_h, p18_vkb_d )
+    ENDIF
+    IF ( .NOT. ALLOCATED(p18_vkb_h) ) ALLOCATE( p18_vkb_h(npwx,nkb), p18_vkb_d(npwx,nkb) )
+    !
+    IF ( ku_build /= p6_nbuild ) THEN
+       ! ... structure factors e^{-iG.tau} on the EXX G list, <beta|phi> of every k+q orbital
+       CALL start_clock( 'p18_bec' )
+       DO na = 1, nat
+          DO ig = 1, ngmt
+             p18_sf_h(ig,na) = eigts1(mill(1,ig),na) * eigts2(mill(2,ig),na) * eigts3(mill(3,ig),na)
+          ENDDO
+       ENDDO
+       p18_sf_d = p18_sf_h
+       DO ikq = 1, nkqs_d
+          p18_becxx_d(:,:,ikq) = becxx(ikq)%k(1:nkb,1:nbnd)
+       ENDDO
+       p18_bec_build = -1; p18_sf_build = -1      ! the k-point operator keeps its own stamps
+       CALL stop_clock( 'p18_bec' )
+       ! ... PAW: D_k(ih,oh) = 1/2 sum_{jh,uh} K(ih,jh,oh,uh) sum_{q,j} x_j/nqs b_j(jh) conj( b_j(uh) )
+       IF ( okpaw ) THEN
+          CALL start_clock( 'p18_paw' )
+          ALLOCATE( dpaw_h(nkb,nkb), rhoa(nhm,nhm) )
+          DO ik = 1, nks
+             ikg = global_kpoint_index( nkstot, ik )
+             dpaw_h = ( 0.0_DP, 0.0_DP )
+             DO na = 1, nat
+                nt = ityp(na)
+                IF ( .NOT. upf(nt)%tpawp ) CYCLE
+                o = ofsbeta(na)
+                rhoa = ( 0.0_DP, 0.0_DP )
+                DO iq = 1, nqs
+                   ikq = index_xkq(ikg,iq)
+                   ikx = index_xk(ikq)
+                   DO jb = 1, nbnd
+                      w = x_occupation(jb,ikx) / DBLE(nqs)
+                      IF ( w == 0.0_DP ) CYCLE
+                      DO uh = 1, nh(nt)
+                         DO jh = 1, nh(nt)
+                            rhoa(jh,uh) = rhoa(jh,uh) + w * becxx(ikq)%k(o+jh,jb) * CONJG( becxx(ikq)%k(o+uh,jb) )
+                         ENDDO
+                      ENDDO
+                   ENDDO
+                ENDDO
+                DO oh = 1, nh(nt)
+                   DO ih = 1, nh(nt)
+                      z = ( 0.0_DP, 0.0_DP )
+                      DO uh = 1, nh(nt)
+                         DO jh = 1, nh(nt)
+                            z = z + ke(nt)%k(ih,jh,oh,uh) * rhoa(jh,uh)
+                         ENDDO
+                      ENDDO
+                      dpaw_h(o+ih,o+oh) = 0.5_DP * z
+                   ENDDO
+                ENDDO
+             ENDDO
+             ku_dpaw_d(:,:,ik) = dpaw_h
+          ENDDO
+          DEALLOCATE( dpaw_h, rhoa )
+          CALL stop_clock( 'p18_paw' )
+       ENDIF
+       ku_build = p6_nbuild
+    ENDIF
+  END SUBROUTINE vexx_kall_us_setup
+  !
+  !-----------------------------------------------------------------------
   SUBROUTINE vexx_bp_k_all_gpu( lda, m, vx, ok )
   !-----------------------------------------------------------------------
     !! V_x|psi_ik> for the first m bands of every k-point at once, for an ACE build: the psi are
@@ -4512,8 +4686,18 @@ end associate
     !! a k-point are visited target by target, so that the second terms of one target k-point go
     !! back to G-space together. Where few pairs are coupled (many symmetry operations, many
     !! empty bands) the saving does not pay for that, and the build is left to the k-point loop.
-    !! Norm-conserving, collinear, one band group, one pool, the kernels of g2_convolution
-    !! without cutoff tricks. ok = .FALSE.: nothing done, aceinit applies V_x k-point by k-point.
+    !! Collinear, one band group, one pool, the kernels of g2_convolution without cutoff tricks.
+    !! Ultrasoft and PAW: the augmentation charges and the exchange D matrix are matrix products
+    !! over the projectors, as in vexx_gfast_main_us but complex. With q = k-k', e_a = e^{-iq.tau_a}
+    !! and the projector index K = (atom a, ih), band i of k has for the k+q point k'
+    !!    F_i(G,K) = e_a S_a(G) sum_jh Q_{ih,jh}(q+G) b_psi_i(a,jh)
+    !!    aug_ij(G) = sum_K F_i(G,K) conj( b_phi_j(K) )                  augmentation charge of pair (i,j)
+    !!    U_i(G,K)  = sum_j x_j V_ij(G) b_phi_j(K)
+    !!    deexx_i(K) += omega sum_G conj( e_a S_a(G) ) sum_jh conj( Q_{ih,jh}(q+G) ) U_i(G;a,jh)
+    !! and the reversed pair gets  deexx_j(K) += x_i omega conj( sum_G conj( F_i(G,K) ) V_ij(G) ).
+    !! Pairs are coupled only through the identity operation (with or without time reversal),
+    !! where the projectors of the two k-points are the same functions (complex conjugates).
+    !! ok = .FALSE.: nothing done, aceinit applies V_x k-point by k-point.
     USE cufft
     USE cudafor,        ONLY : cudaMemGetInfo
     USE cell_base,      ONLY : omega
@@ -4525,6 +4709,14 @@ end associate
     USE wavefunctions,  ONLY : evc
     USE buffers,        ONLY : get_buffer
     USE io_files,       ONLY : nwordwfc, iunwfc
+    USE uspp,           ONLY : okvan, nkb
+    USE uspp_param,     ONLY : nhm
+    USE uspp_init,      ONLY : init_us_2
+    USE paw_variables,  ONLY : okpaw
+    USE ions_base,      ONLY : nat, tau
+    USE constants,      ONLY : tpi
+    USE exx_base,       ONLY : xkq_collect
+    USE exx_bp_utils,   ONLY : igk_exx
     !
     IMPLICIT NONE
     !
@@ -4539,6 +4731,11 @@ end associate
     INTEGER :: ncoup, nself, nsolo, nskip, jfirst, jlast, io, nord, cur, nflush
     REAL(DP) :: work_all, work_k
     INTEGER, ALLOCATABLE :: ord(:)
+    LOGICAL :: us, us_ok, first
+    INTEGER :: se, ikb, a_, ih_, jh_, o_, c_, it, ikx
+    REAL(DP) :: arg, nfft
+    COMPLEX(DP) :: z, beta
+    COMPLEX(DP), ALLOCATABLE :: eigq_h(:)
     INTEGER(KIND=8) :: need, free_, total_
     LOGICAL :: single, trans, tr
     REAL(DP) :: xkp(3), omega_inv, scale, nqs_inv, dmax, bmax, wd, wt, fs
@@ -4549,6 +4746,8 @@ end associate
     ok = .FALSE.
     IF ( ka_disabled ) RETURN
     CALL start_clock( 'vexx_ka_setup' )
+    us = okvan
+    nfft = DBLE( dfftt%nr1 ) * DBLE( dfftt%nr2 ) * DBLE( dfftt%nr3 )
     nl_d => dfftt%nl_d
     nrxxs = dfftt%nnr
     nr1 = dfftt%nr1; nr2 = dfftt%nr2; nr3 = dfftt%nr3
@@ -4573,6 +4772,9 @@ end associate
        pblk = MAX( 2, pblk )
     ENDIF
     cmax = pblk
+    ! with ultrasoft augmentation the matrix products over the projectors dominate: a whole band of
+    ! a k+q point per block where a gigabyte of pair densities holds it
+    IF ( us .AND. p6_pblk <= 0 ) pblk = MAX( pblk, MIN( m, 256, INT( 1.0E9_DP / ( 16.0_DP * DBLE(nrxxs) ) ) ) )
     !
     ! ... the buffer entry of each k-point itself: psi_ik in real space, with no transform
     ALLOCATE( ikq0(nks), st(nqs,nks), tk(nqs,nks), inv_ok(nsym), seg(nqs+1), ord(nqs) )
@@ -4622,6 +4824,15 @@ end associate
     ENDIF
     IF ( .NOT. ALLOCATED(p6_psi_d) ) ALLOCATE( p6_psi_d(lda*npol,m), p6_hpsi_d(lda*npol,m) )
     ka_rir_d = rir(1:nrxxs,1:nsym)
+    IF ( us ) THEN
+       CALL vexx_kall_us_setup( lda, m, ngmt, pblk, us_ok )
+       IF ( .NOT. us_ok ) THEN
+          ka_disabled = .TRUE.
+          CALL stop_clock( 'vexx_ka_setup' )
+          RETURN
+       ENDIF
+       ALLOCATE( eigq_h(nat) )
+    ENDIF
     !
     ! ... which pairs of k-points are coupled. inv_ok: the grid permutations of S and of the operation
     !     the symmetry tables call its inverse undo each other
@@ -4647,6 +4858,7 @@ end associate
           IF ( st(iq,ik) /= 0 ) CYCLE
           is = ABS( index_sym(ikq) )
           IF ( .NOT. inv_ok(is) ) CYCLE
+          IF ( us .AND. is /= 1 ) CYCLE
           sinv = SIGN( invs(is), index_sym(ikq) )
           ik2 = ik2g
           jq = 0
@@ -4696,7 +4908,7 @@ end associate
           work_k = work_k + DBLE(m) * DBLE( COUNT( ABS( x_occupation(1:nocc,tk(iq,ik)) ) >= eps_occ ) )
        ENDDO
     ENDDO
-    IF ( work_all > 0.85_DP * work_k ) THEN
+    IF ( work_all > 0.85_DP * work_k .AND. .NOT. us ) THEN
        IF ( ka_banner /= -2 ) WRITE( stdout, '(5X,"EXX-GPU: the all-k exchange build would save ",I0,"% of the pair transforms of this system: V_x is applied k-point by k-point")' ) &
             NINT( 100.0_DP * ( 1.0_DP - work_all / MAX( work_k, 1.0_DP ) ) )
        ka_banner = -2
@@ -4725,6 +4937,30 @@ end associate
           CALL stop_clock( 'vexx_ka_setup' )
           RETURN
        ENDIF
+       IF ( us ) THEN
+          ! <beta|psi> of this k from the device copies, and its agreement with the buffered <beta|phi>
+          CALL start_clock( 'p18_vkb' )
+          p18_vkb_h = ( 0.0_DP, 0.0_DP )
+          CALL init_us_2( npw, igk_exx(1:npw,ik), xk(:,ik), p18_vkb_h )
+          p18_vkb_d = p18_vkb_h
+          CALL stop_clock( 'p18_vkb' )
+          CALL MYZGEMM( 'C', 'N', nkb, m, npw, (1.0_DP,0.0_DP), p18_vkb_d, npwx, p6_psi_d, lda*npol, (0.0_DP,0.0_DP), &
+                        ku_bpsi_d(1,1,ik), nkb )
+          ikq = ikq0(ik)
+          dmax = 0.0_DP
+          bmax = 0.0_DP
+          !$cuf kernel do (2)
+          DO ib = 1, m
+             DO ikb = 1, nkb
+                dmax = MAX( dmax, ABS( ku_bpsi_d(ikb,ib,ik) - p18_becxx_d(ikb,ib,ikq) ) )
+                bmax = MAX( bmax, ABS( p18_becxx_d(ikb,ib,ikq) ) )
+             ENDDO
+          ENDDO
+          IF ( dmax > 1.0E-9_DP * bmax ) THEN
+             CALL stop_clock( 'vexx_ka_setup' )
+             RETURN
+          ENDIF
+       ENDIF
     ENDDO
     !
     ncoup = COUNT( st == 1 ); nself = COUNT( st == 3 ); nsolo = COUNT( st == 0 ); nskip = COUNT( st == 2 )
@@ -4734,6 +4970,7 @@ end associate
             nks, nks*nqs, ncoup, nself, nsolo, NINT( 100.0_DP * ( 1.0_DP - work_all / MAX( work_k, 1.0_DP ) ) )
     ENDIF
     ka_h_d = ( 0._DP, 0._DP )
+    IF ( us ) ku_dx_d = ( 0._DP, 0._DP )
     ! ... room for the slots of one k-point: at most m x m per k+q point
     nstot = nqs * m * MAX( m, 1 )
     IF ( ALLOCATED(ka_si_h) ) THEN
@@ -4813,6 +5050,7 @@ end associate
              cur = tk(iq,ik)
              ka_acc_d = ( 0._DP, 0._DP )
           ENDIF
+          IF ( .NOT. us ) THEN
           DO s0 = seg(iq), seg(iq+1) - 1, pblk
              np_ = MIN( pblk, seg(iq+1) - s0 )
              CALL vexx_kall_pair( nrxxs, nbuf, nkqs_d, exxbuff_d, ikq, ikq0(ik), ns, ka_si_d, ka_sj_d, s0, np_, p6_rhoc_d, omega_inv )
@@ -4822,6 +5060,157 @@ end associate
              CALL vexx_kall_acc( nrxxs, nbuf, nkqs_d, exxbuff_d, ikq, ikq0(ik), m, p6_res_d, ka_acc_d, ns, ka_si_d, ka_sj_d, &
                                  ka_sw_d, s0, np_, p6_rhoc_d, trans, nsym, ka_rir_d, is, tr )
           ENDDO
+          ELSE IF ( seg(iq+1) > seg(iq) ) THEN
+          ! ... ultrasoft: Q_ij(k-k'+G) and the phases e^{-i(k-k').tau} of this k+q point, conj( <beta|phi> )
+          CALL start_clock( 'p18_q' )
+          CALL p18_qgm_build( ngmt, xkq_collect(:,ikq), xkp )
+          DO a_ = 1, nat
+             arg = tpi * SUM( ( xkp(:) - xkq_collect(:,ikq) ) * tau(:,a_) )
+             eigq_h(a_) = CMPLX( COS(arg), -SIN(arg), KIND=DP )
+          ENDDO
+          ku_eigq_d = eigq_h
+          CALL stop_clock( 'p18_q' )
+          !$cuf kernel do (2)
+          DO jb = 1, m
+             DO ikb = 1, nkb
+                ku_bq_d(ikb,jb) = CONJG( p18_becxx_d(ikb,jb,ikq) )
+             ENDDO
+          ENDDO
+          ik2 = tk(iq,ik)
+          s = seg(iq) + 1
+          DO WHILE ( s <= seg(iq+1) )
+             i = ka_si_h(s)
+             se = s
+             DO WHILE ( se < seg(iq+1) )
+                IF ( ka_si_h(se+1) /= i ) EXIT
+                se = se + 1
+             ENDDO
+             ! ... F_i: the coefficient matrix of band i, Q times it for every ultrasoft species, the phases
+             !$cuf kernel do (2)
+             DO ikb = 1, nkb
+                DO c_ = 1, p18_nij
+                   ku_cb_d(c_,ikb) = ( 0.0_DP, 0.0_DP )
+                ENDDO
+             ENDDO
+             !$cuf kernel do (1)
+             DO ikb = 1, nkb
+                a_ = p18_kbat_d(ikb)
+                IF ( a_ > 0 ) THEN
+                   ih_ = p18_kbih_d(ikb)
+                   o_ = p18_ofs_d(a_)
+                   DO jh_ = 1, p18_nhat_d(a_)
+                      ku_cb_d( p18_acol_d(p18_aof_d(ih_,jh_,a_)), ikb ) = ku_bpsi_d(o_+jh_,i,ik)
+                   ENDDO
+                ENDIF
+             ENDDO
+             !$acc host_data use_device( p18_qgm_acc )
+             DO it = 1, gf_ntu
+                CALL MYZGEMM( 'N', 'N', ngmt, gf_tnkb(it), gf_tnq(it), (1.0_DP,0.0_DP), p18_qgm_acc(1,gf_tq0(it)+1), ngmt, &
+                              ku_cb_d(gf_tq0(it)+1,gf_tkb0(it)+1), p18_nij, (0.0_DP,0.0_DP), ku_f_d(1,gf_tkb0(it)+1), ngmt )
+             ENDDO
+             !$acc end host_data
+             !$cuf kernel do (2)
+             DO ikb = 1, nkb
+                DO ig = 1, ngmt
+                   a_ = p18_kbat_d(ikb)
+                   IF ( a_ > 0 ) THEN
+                      ku_f_d(ig,ikb) = ku_f_d(ig,ikb) * ( p18_sf_d(ig,a_) * ku_eigq_d(a_) )
+                   ELSE
+                      ku_f_d(ig,ikb) = ( 0.0_DP, 0.0_DP )
+                   ENDIF
+                ENDDO
+             ENDDO
+             first = .TRUE.
+             DO WHILE ( s <= se )
+                ! ... a block: consecutive bands j of this k+q point
+                np_ = 1
+                DO WHILE ( s + np_ <= se .AND. np_ < pblk )
+                   IF ( ka_sj_h(s+np_) /= ka_sj_h(s+np_-1) + 1 ) EXIT
+                   np_ = np_ + 1
+                ENDDO
+                s0 = s - 1
+                j0 = ka_sj_h(s)
+                CALL vexx_kall_pair( nrxxs, nbuf, nkqs_d, exxbuff_d, ikq, ikq0(ik), ns, ka_si_d, ka_sj_d, s0, np_, p6_rhoc_d, omega_inv )
+                CALL vexx_gfast_fft_blk( nrxxs, np_, p6_rhoc_d, nr1, nr2, nr3, single, cmax, CUFFT_FORWARD )
+                ! ... the augmentation charges of the block (addusxx_g)
+                CALL MYZGEMM( 'N', 'N', ngmt, np_, nkb, (1.0_DP,0.0_DP), ku_f_d, ngmt, ku_bq_d(1,j0), nkb, (0.0_DP,0.0_DP), ku_aug_d, ngmt )
+                !$cuf kernel do (2)
+                DO jb = 1, np_
+                   DO ig = 1, ngmt
+                      p6_rhoc_d( nl_d(ig), jb ) = p6_rhoc_d( nl_d(ig), jb ) + nfft * ku_aug_d(ig,jb)
+                   ENDDO
+                ENDDO
+                CALL vexx_kall_kern( nrxxs, nqs, np_, p6_rhoc_d, p6_facb_d, iq, scale )
+                ! ... the Fock potentials on the G sphere; U_i += x_j V_ij b_phi_j
+                !$cuf kernel do (2)
+                DO jb = 1, np_
+                   DO ig = 1, ngmt
+                      ku_vcg_d(ig,jb) = p6_rhoc_d( nl_d(ig), jb )
+                   ENDDO
+                ENDDO
+                !$cuf kernel do (2)
+                DO jb = 1, np_
+                   DO ikb = 1, nkb
+                      ku_wb_d(ikb,jb) = ka_sw_d(1,s0+jb) * p18_becxx_d(ikb,j0+jb-1,ikq)
+                   ENDDO
+                ENDDO
+                beta = ( 1.0_DP, 0.0_DP )
+                IF ( first ) beta = ( 0.0_DP, 0.0_DP )
+                first = .FALSE.
+                CALL MYZGEMM( 'N', 'T', ngmt, nkb, np_, (1.0_DP,0.0_DP), ku_vcg_d, ngmt, ku_wb_d, nkb, beta, ku_u_d, ngmt )
+                IF ( trans ) THEN
+                   ! ... the reversed pairs: deexx of band j of the k-point this buffer entry is (its conjugate)
+                   CALL MYZGEMM( 'C', 'N', nkb, np_, ngmt, (1.0_DP,0.0_DP), ku_f_d, ngmt, ku_vcg_d, ngmt, (0.0_DP,0.0_DP), ku_t_d, nkb )
+                   IF ( tr ) THEN
+                      !$cuf kernel do (2)
+                      DO jb = 1, np_
+                         DO ikb = 1, nkb
+                            ku_dx_d(ikb,j0+jb-1,ik2) = ku_dx_d(ikb,j0+jb-1,ik2) + ka_sw_d(2,s0+jb) * omega * ku_t_d(ikb,jb)
+                         ENDDO
+                      ENDDO
+                   ELSE
+                      !$cuf kernel do (2)
+                      DO jb = 1, np_
+                         DO ikb = 1, nkb
+                            ku_dx_d(ikb,j0+jb-1,ik2) = ku_dx_d(ikb,j0+jb-1,ik2) + ka_sw_d(2,s0+jb) * omega * CONJG( ku_t_d(ikb,jb) )
+                         ENDDO
+                      ENDDO
+                   ENDIF
+                ENDIF
+                CALL vexx_gfast_fft_blk( nrxxs, np_, p6_rhoc_d, nr1, nr2, nr3, single, cmax, CUFFT_INVERSE )
+                CALL vexx_kall_acc( nrxxs, nbuf, nkqs_d, exxbuff_d, ikq, ikq0(ik), m, p6_res_d, ka_acc_d, ns, ka_si_d, ka_sj_d, &
+                                    ka_sw_d, s0, np_, p6_rhoc_d, trans, nsym, ka_rir_d, is, tr )
+                s = s + np_
+             ENDDO
+             ! ... deexx_i of this k from U_i: conj( e_a S_a ) U_i, Q^H times it, the (ih,jh) entries
+             !$cuf kernel do (2)
+             DO ikb = 1, nkb
+                DO ig = 1, ngmt
+                   a_ = p18_kbat_d(ikb)
+                   IF ( a_ > 0 ) ku_u_d(ig,ikb) = ku_u_d(ig,ikb) * CONJG( p18_sf_d(ig,a_) * ku_eigq_d(a_) )
+                ENDDO
+             ENDDO
+             !$acc host_data use_device( p18_qgm_acc )
+             DO it = 1, gf_ntu
+                CALL MYZGEMM( 'C', 'N', gf_tnq(it), gf_tnkb(it), ngmt, (1.0_DP,0.0_DP), p18_qgm_acc(1,gf_tq0(it)+1), ngmt, &
+                              ku_u_d(1,gf_tkb0(it)+1), ngmt, (0.0_DP,0.0_DP), ku_cb_d(gf_tq0(it)+1,gf_tkb0(it)+1), p18_nij )
+             ENDDO
+             !$acc end host_data
+             !$cuf kernel do (1)
+             DO ikb = 1, nkb
+                a_ = p18_kbat_d(ikb)
+                IF ( a_ > 0 ) THEN
+                   ih_ = p18_kbih_d(ikb)
+                   o_ = p18_ofs_d(a_)
+                   z = ( 0.0_DP, 0.0_DP )
+                   DO jh_ = 1, p18_nhat_d(a_)
+                      z = z + ku_cb_d( p18_acol_d(p18_aof_d(ih_,jh_,a_)), o_+jh_ )
+                   ENDDO
+                   ku_dx_d(ikb,i,ik) = ku_dx_d(ikb,i,ik) + omega * z
+                ENDIF
+             ENDDO
+          ENDDO
+          ENDIF
           IF ( .NOT. trans ) CYCLE
           ! ... the last k+q point of this target: its transposed terms go where they belong
           IF ( io < nord ) THEN
@@ -4863,6 +5252,28 @@ end associate
           ENDDO
        ENDDO
     ENDDO
+    IF ( us ) THEN
+       ! ... deexx += D_k b_psi (PAW), then the non-local part sum_I |beta_I> deexx_Ii of every k (add_nlxx_pot)
+       DO ik = 1, nks
+          npw = ngk(ik)
+          IF ( okpaw ) CALL MYZGEMM( 'N', 'N', nkb, m, nkb, (1.0_DP,0.0_DP), ku_dpaw_d(1,1,ik), nkb, ku_bpsi_d(1,1,ik), nkb, &
+                                     (1.0_DP,0.0_DP), ku_dx_d(1,1,ik), nkb )
+          !$cuf kernel do (2)
+          DO ib = 1, m
+             DO ikb = 1, nkb
+                IF ( ABS( ku_dx_d(ikb,ib,ik) ) < eps_occ ) ku_dx_d(ikb,ib,ik) = ( 0.0_DP, 0.0_DP )
+             ENDDO
+          ENDDO
+          CALL start_clock( 'p18_vkb' )
+          p18_vkb_h = ( 0.0_DP, 0.0_DP )
+          CALL init_us_2( npw, igk_exx(1:npw,ik), xk(:,ik), p18_vkb_h )
+          p18_vkb_d = p18_vkb_h
+          CALL stop_clock( 'p18_vkb' )
+          CALL MYZGEMM( 'N', 'N', npw, m, nkb, CMPLX(-exxalfa,0.0_DP,KIND=DP), p18_vkb_d, npwx, ku_dx_d(1,1,ik), nkb, &
+                        (1.0_DP,0.0_DP), ka_h_d(1,1,ik), npwx )
+       ENDDO
+       DEALLOCATE( eigq_h )
+    ENDIF
     CALL stop_clock( 'vexx_ka_main' )
     !
     CALL start_clock( 'vexx_ka_fin' )
@@ -5271,6 +5682,43 @@ end associate
   END SUBROUTINE vexx_gfast_main_us
   !
   !-----------------------------------------------------------------------
+  SUBROUTINE vexx_us_species()
+  !-----------------------------------------------------------------------
+    !! The layout of the ultrasoft species for the matrix products of the augmentation: first
+    !! projector - 1 and number of projectors, first Q column - 1 and number of Q columns.
+    USE ions_base,     ONLY : nat, ityp, ntyp => nsp
+    USE uspp,          ONLY : nkb, ofsbeta
+    USE uspp_param,    ONLY : upf, nh
+    IMPLICIT NONE
+    INTEGER :: na, nt
+    ! ... the ultrasoft species: their projectors are consecutive (species by species, atom by atom), and so
+    !     are their Q columns
+    IF ( ALLOCATED(gf_tkb0) ) DEALLOCATE( gf_tkb0, gf_tnkb, gf_tq0, gf_tnq )
+    ALLOCATE( gf_tkb0(ntyp), gf_tnkb(ntyp), gf_tq0(ntyp), gf_tnq(ntyp) )
+    gf_ntu = 0
+    DO nt = 1, ntyp
+       IF ( .NOT. upf(nt)%tvanp ) CYCLE
+       gf_ntu = gf_ntu + 1
+       gf_tnkb(gf_ntu) = 0
+       gf_tkb0(gf_ntu) = nkb
+       DO na = 1, nat
+          IF ( ityp(na) /= nt ) CYCLE
+          gf_tkb0(gf_ntu) = MIN( gf_tkb0(gf_ntu), ofsbeta(na) )
+          gf_tnkb(gf_ntu) = gf_tnkb(gf_ntu) + nh(nt)
+       ENDDO
+       gf_tq0(gf_ntu) = p18_nijt_h(nt)
+       gf_tnq(gf_ntu) = ( nh(nt)*(nh(nt)+1) )/2
+       ! a species without atoms, or projectors that are not consecutive: not the layout of init_us
+       DO na = 1, nat
+          IF ( ityp(na) /= nt ) CYCLE
+          IF ( ofsbeta(na) < gf_tkb0(gf_ntu) .OR. ofsbeta(na) + nh(nt) > gf_tkb0(gf_ntu) + gf_tnkb(gf_ntu) ) &
+             CALL errore( 'vexx_gfast_us_setup', 'projectors of a species are not consecutive', nt )
+       ENDDO
+       IF ( gf_tnkb(gf_ntu) == 0 ) gf_ntu = gf_ntu - 1
+    ENDDO
+  END SUBROUTINE vexx_us_species
+  !
+  !-----------------------------------------------------------------------
   SUBROUTINE vexx_gfast_us_setup( current_k, ikq, ik, lda, n, m, ngmt, pblk, xkp, nbe, ok )
   !-----------------------------------------------------------------------
     !! Everything the ultrasoft / PAW augmentation of the batched Gamma operator needs on the device:
@@ -5331,31 +5779,7 @@ end associate
     ENDIF
     IF ( .NOT. ALLOCATED(gf_f_d) ) ALLOCATE( gf_f_d(ngmt,nkb), gf_u_d(ngmt,nkb), gf_aug_d(ngmt,2*pblk), gf_vcg_d(ngmt,2*pblk), &
                                              gf_wb_d(nkb,2*pblk), gf_t_d(nkb,2*pblk), gf_cb_d(p18_nij,nkb) )
-    ! ... the ultrasoft species: their projectors are consecutive (species by species, atom by atom), and so
-    !     are their Q columns
-    IF ( ALLOCATED(gf_tkb0) ) DEALLOCATE( gf_tkb0, gf_tnkb, gf_tq0, gf_tnq )
-    ALLOCATE( gf_tkb0(ntyp), gf_tnkb(ntyp), gf_tq0(ntyp), gf_tnq(ntyp) )
-    gf_ntu = 0
-    DO nt = 1, ntyp
-       IF ( .NOT. upf(nt)%tvanp ) CYCLE
-       gf_ntu = gf_ntu + 1
-       gf_tnkb(gf_ntu) = 0
-       gf_tkb0(gf_ntu) = nkb
-       DO na = 1, nat
-          IF ( ityp(na) /= nt ) CYCLE
-          gf_tkb0(gf_ntu) = MIN( gf_tkb0(gf_ntu), ofsbeta(na) )
-          gf_tnkb(gf_ntu) = gf_tnkb(gf_ntu) + nh(nt)
-       ENDDO
-       gf_tq0(gf_ntu) = p18_nijt_h(nt)
-       gf_tnq(gf_ntu) = ( nh(nt)*(nh(nt)+1) )/2
-       ! a species without atoms, or projectors that are not consecutive: not the layout of init_us
-       DO na = 1, nat
-          IF ( ityp(na) /= nt ) CYCLE
-          IF ( ofsbeta(na) < gf_tkb0(gf_ntu) .OR. ofsbeta(na) + nh(nt) > gf_tkb0(gf_ntu) + gf_tnkb(gf_ntu) ) &
-             CALL errore( 'vexx_gfast_us_setup', 'projectors of a species are not consecutive', nt )
-       ENDDO
-       IF ( gf_tnkb(gf_ntu) == 0 ) gf_ntu = gf_ntu - 1
-    ENDDO
+    CALL vexx_us_species()
     IF ( ALLOCATED(gf_becpsi_d) ) THEN
        IF ( SIZE(gf_becpsi_d,1) /= nkb .OR. SIZE(gf_becpsi_d,2) /= m ) DEALLOCATE( gf_becpsi_d, gf_deexx_d )
     ENDIF
@@ -5834,15 +6258,27 @@ end associate
     IMPLICIT NONE
     INTEGER, INTENT(IN) :: ngms
     REAL(DP), INTENT(IN) :: xkq(3), xkp(3)
-    REAL(DP), ALLOCATABLE :: ylmk0(:,:), qmod(:), q(:,:), qq(:)
+    ! the work arrays stay, on the host and on the device: this routine is called for every k+q point of
+    ! every k-point by the all-k exchange build
+    REAL(DP), ALLOCATABLE, SAVE :: ylmk0(:,:), qmod(:), q(:,:), qq(:)
     INTEGER :: ig
-    ALLOCATE( q(3,ngms), qq(ngms), qmod(ngms), ylmk0(ngms,lmaxq*lmaxq) )
+    IF ( ALLOCATED(q) ) THEN
+       IF ( SIZE(q,2) /= ngms .OR. SIZE(ylmk0,2) /= lmaxq*lmaxq ) THEN
+          !$acc exit data delete( q, qq, qmod, ylmk0 )
+          DEALLOCATE( q, qq, qmod, ylmk0 )
+       ENDIF
+    ENDIF
+    IF ( .NOT. ALLOCATED(q) ) THEN
+       ALLOCATE( q(3,ngms), qq(ngms), qmod(ngms), ylmk0(ngms,lmaxq*lmaxq) )
+       !$acc enter data create( q, qq, qmod, ylmk0 )
+    ENDIF
     DO ig = 1, ngms
        q(:,ig) = xkp(:) - xkq(:) + g(:,ig)
        qq(ig)  = SUM( q(:,ig)**2 )
        qmod(ig) = SQRT( qq(ig) ) * tpiba
     ENDDO
-    !$acc data copyin( q, qq, qmod ) create( ylmk0 ) present( p18_qgm_acc, tab_qrad )
+    !$acc update device( q, qq, qmod )
+    !$acc data present( q, qq, qmod, ylmk0, p18_qgm_acc, tab_qrad )
     CALL ylmr2( lmaxq*lmaxq, ngms, q, qq, ylmk0 )
     !$acc host_data use_device( qmod, ylmk0, tab_qrad, p18_qgm_acc )
     CALL p18_qvan_all( ngms, p18_nij, lmaxq*lmaxq, SIZE(tab_qrad,1), SIZE(tab_qrad,2), SIZE(tab_qrad,3), SIZE(tab_qrad,4), &
@@ -5850,7 +6286,6 @@ end associate
                        p18_qc_lp_d, p18_qc_l_d, p18_qc_ind_d, p18_qc_coef_d, p18_qgm_acc )
     !$acc end host_data
     !$acc end data
-    DEALLOCATE( q, qq, qmod, ylmk0 )
   END SUBROUTINE p18_qgm_build
   !
   !-----------------------------------------------------------------------
@@ -6684,6 +7119,9 @@ end associate
     IF ( ALLOCATED(gf_si_h) ) DEALLOCATE( gf_si_h, gf_sj_h, gf_sx_h, gf_si_d, gf_sj_d, gf_sx_d )
     IF ( ALLOCATED(ka_acc_d) ) DEALLOCATE( ka_acc_d, ka_h_d, ka_rir_d )
     IF ( ALLOCATED(ka_si_h) ) DEALLOCATE( ka_si_h, ka_sj_h, ka_sw_h, ka_si_d, ka_sj_d, ka_sw_d )
+    IF ( ALLOCATED(ku_f_d) ) DEALLOCATE( ku_f_d, ku_u_d, ku_aug_d, ku_vcg_d, ku_cb_d, ku_wb_d, ku_t_d, ku_bq_d, ku_dx_d, ku_bpsi_d, &
+                                         ku_dpaw_d, ku_eigq_d )
+    ku_build = -1
     IF ( ALLOCATED(gf_f_d) ) DEALLOCATE( gf_f_d, gf_u_d, gf_aug_d, gf_vcg_d, gf_wb_d, gf_t_d, gf_cb_d )
     IF ( ALLOCATED(gf_becpsi_d) ) DEALLOCATE( gf_becpsi_d, gf_deexx_d )
     IF ( ALLOCATED(gf_bec_d) ) DEALLOCATE( gf_bec_d, gf_dpaw_d )
