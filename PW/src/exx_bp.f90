@@ -49,7 +49,7 @@ MODULE exx_bp
   ! P6: persistent state of the batched fast path (vexx_k_gpu_fast)
   INTEGER, PARAMETER :: p6_nplans = 16   ! P11: was 8
   INTEGER :: p6_plans(p6_nplans) = 0, p6_plan_key(5,p6_nplans) = -1, p6_plan_next = 1
-  INTEGER :: p6_plan_pinned(3) = 0    ! P11: plans handed to the running vexx_k_gpu_fast call (never evicted)
+  INTEGER :: p6_plan_pinned(5) = 0    ! P11: plans handed to the running vexx_k_gpu_fast call (never evicted)
   LOGICAL :: p6_checked = .FALSE.
   INTEGER :: p6_sp_mode = 0, p6_pblk = -1, p6_nbuild = 0   ! P6e: pair block < 1 means automatic
   REAL(DP) :: p6_sp_thr = 1.0E-6_DP
@@ -88,6 +88,20 @@ MODULE exx_bp
                                        p18_c_d(:,:), p18_aug_d(:,:), p18_vcg_d(:,:), p18_y_d(:,:), p18_deexx_d(:,:), &
                                        p18_vkb_d(:,:), p18_dpaw_d(:,:,:), p18_eigq_d(:,:)
   COMPLEX(DP), ALLOCATABLE :: p18_qgm_acc(:,:), p18_dpaw_h(:,:), p18_vkb_h(:,:), p18_eigq_h(:,:), p18_sf_h(:,:)
+  ! batched Gamma-point operator (vexx_bp_gamma_gpu_fast): switches, work arrays and the slot list
+  LOGICAL :: p6_env_off = .FALSE.
+  !! QE_EXX_FAST=0: every batched operator is switched off
+  INTEGER :: gf_sym_mode = 1
+  !! QE_EXX_SYM: 1 (default) each unordered orbital pair is transformed once when psi is the buffered set, 0 never
+  INTEGER :: gf_fft1_mode = -1
+  !! QE_EXX_FFT1: 1 single-grid cuFFT plans, 0 batched plans, -1 (default) chosen by the grid size
+  INTEGER :: gf_banner_last = -1
+  LOGICAL :: gf_keep = .FALSE.
+  COMPLEX(DP), ALLOCATABLE, DEVICE :: gf_psic_d(:,:), gf_rho_d(:,:)
+  REAL(DP), ALLOCATABLE, DEVICE :: gf_res_d(:,:), gf_fac_d(:), gf_facg_d(:), gf_sx_d(:,:)
+  INTEGER, ALLOCATABLE, DEVICE :: gf_si_d(:), gf_sj_d(:)
+  INTEGER, ALLOCATABLE :: gf_si_h(:), gf_sj_h(:)
+  REAL(DP), ALLOCATABLE :: gf_sx_h(:,:)
 #endif
   !
  CONTAINS
@@ -750,7 +764,16 @@ MODULE exx_bp
     IF ( gamma_only ) THEN
        IF (negrp == 1)THEN
           IF (.not. use_gpu) CALL vexx_bp_gamma( lda, n, m, psi, hpsi, becpsi )
+#if defined(__CUDA)
+          IF ( use_gpu .AND. vexx_gamma_fast_path() ) THEN
+             CALL vexx_bp_gamma_gpu_fast( lda, n, m, psi, hpsi, fast_ok )
+             IF ( .NOT. fast_ok ) CALL vexx_bp_gamma_gpu( lda, n, m, psi, hpsi, becpsi )
+          ELSE IF ( use_gpu ) THEN
+             CALL vexx_bp_gamma_gpu( lda, n, m, psi, hpsi, becpsi )
+          ENDIF
+#else
           IF (      use_gpu) CALL vexx_bp_gamma_gpu( lda, n, m, psi, hpsi, becpsi )
+#endif
        ELSE
           IF (.not. use_gpu) CALL vexx_bp_gamma( lda, n, m, psi_exx, hpsi_exx, becpsi )
           IF (      use_gpu) CALL vexx_bp_gamma_gpu( lda, n, m, psi_exx, hpsi_exx, becpsi )
@@ -3571,22 +3594,17 @@ end associate
   END FUNCTION p14_is_off
   !
   !-----------------------------------------------------------------------
-  LOGICAL FUNCTION vexx_fast_path()
+  SUBROUTINE vexx_fast_env()
   !-----------------------------------------------------------------------
-    !! P4: can the batched norm-conserving collinear fast path be used?
-    USE uspp,           ONLY : okvan
-    USE paw_variables,  ONLY : okpaw
-    USE mp_exx,         ONLY : negrp
+    !! The QE_EXX_* environment switches of the batched operators, read once.
     IMPLICIT NONE
-    LOGICAL, SAVE :: checked = .FALSE., env_off = .FALSE.
     CHARACTER(LEN=16) :: val
     INTEGER :: lenv, stat, ios
-    CHARACTER(LEN=128) :: why
-    IF (.NOT. checked) THEN
+    IF (.NOT. p6_checked) THEN
        CALL GET_ENVIRONMENT_VARIABLE( 'QE_EXX_FAST', val, lenv, stat )
-       env_off = ( stat == 0 .AND. lenv > 0 .AND. ( val(1:1) == '0' .OR. p14_is_off( val ) ) )   ! P14
-       checked = .TRUE.
-       IF (env_off) WRITE( stdout, '(5X,"EXX: batched fast path disabled by QE_EXX_FAST=",A)' ) TRIM(val)
+       p6_env_off = ( stat == 0 .AND. lenv > 0 .AND. ( val(1:1) == '0' .OR. p14_is_off( val ) ) )   ! P14
+       p6_checked = .TRUE.
+       IF (p6_env_off) WRITE( stdout, '(5X,"EXX: batched fast path disabled by QE_EXX_FAST=",A)' ) TRIM(val)
        ! P6: precision mode and pair block. P14: whole numbers only; a rejected value keeps the default and is
        ! reported (a list-directed READ truncates "2.5" to 2, which used to switch single precision on)
        CALL GET_ENVIRONMENT_VARIABLE( 'QE_EXX_SP', val, lenv, stat )
@@ -3615,9 +3633,36 @@ end associate
              p6_pblk = -1
           ENDIF
        ENDIF
+       ! pair symmetry and the cuFFT plan flavour of the Gamma-point operator
+       CALL GET_ENVIRONMENT_VARIABLE( 'QE_EXX_SYM', val, lenv, stat )
+       IF (stat == 0 .AND. lenv > 0) THEN
+          IF ( val(1:1) == '0' .OR. p14_is_off( val ) ) gf_sym_mode = 0
+       ENDIF
+       CALL GET_ENVIRONMENT_VARIABLE( 'QE_EXX_FFT1', val, lenv, stat )
+       IF (stat == 0 .AND. lenv > 0) THEN
+          IF ( p14_is_int( val ) ) READ( val, *, IOSTAT=ios ) gf_fft1_mode
+          IF ( .NOT. p14_is_int( val ) .OR. gf_fft1_mode < 0 .OR. gf_fft1_mode > 1 ) THEN
+             WRITE( stdout, '(5X,"EXX: QE_EXX_FFT1=",A," not understood (0 or 1): chosen by the grid size")' ) TRIM(val)
+             gf_fft1_mode = -1
+          ENDIF
+       ENDIF
        IF (p6_sp_mode == 1) WRITE( stdout, '(5X,"EXX: single-precision pair FFTs while dexx >",1PE9.1," Ry")' ) p6_sp_thr
        IF (p6_sp_mode >= 2) WRITE( stdout, '(5X,"EXX: single-precision pair FFTs in every ACE build")' )
     ENDIF
+  END SUBROUTINE vexx_fast_env
+  !
+  !-----------------------------------------------------------------------
+  LOGICAL FUNCTION vexx_fast_path()
+  !-----------------------------------------------------------------------
+    !! P4: can the batched norm-conserving collinear fast path be used?
+    USE uspp,           ONLY : okvan
+    USE paw_variables,  ONLY : okpaw
+    USE mp_exx,         ONLY : negrp
+    IMPLICIT NONE
+    LOGICAL :: env_off
+    CHARACTER(LEN=128) :: why
+    CALL vexx_fast_env()
+    env_off = p6_env_off
     vexx_fast_path = use_gpu .AND. (.NOT. env_off) .AND. (.NOT. p15_fast_disabled) .AND. (.NOT. gamma_only) .AND. (.NOT. noncolin) &
                      .AND. (.NOT. (okvan .AND. tqr)) .AND. (negrp == 1) &      ! P18: USPP/PAW on the fast path, tqr on the original
                      .AND. (dfftt%nproc == 1) .AND. (x_nbnd_occ > 0) &
@@ -4258,6 +4303,431 @@ end associate
     CALL stop_clock( 'vexx_k_fin' )
     !
   END SUBROUTINE vexx_bp_k_gpu_fast
+  !
+  !-----------------------------------------------------------------------
+  LOGICAL FUNCTION vexx_gamma_fast_path()
+  !-----------------------------------------------------------------------
+    !! Can the batched Gamma-point operator (vexx_bp_gamma_gpu_fast) be used? Norm-conserving
+    !! pseudopotentials, one band group, one q-point, a serial FFT grid held undistributed.
+    USE uspp,      ONLY : okvan
+    USE mp_exx,    ONLY : negrp
+    USE exx_base,  ONLY : nqs
+    IMPLICIT NONE
+    CALL vexx_fast_env()
+    vexx_gamma_fast_path = use_gpu .AND. gamma_only .AND. (.NOT. p6_env_off) .AND. (.NOT. p15_fast_disabled) &
+                           .AND. (.NOT. okvan) .AND. (negrp == 1) .AND. (nqs == 1) &
+                           .AND. (dfftt%nproc == 1) .AND. (x_nbnd_occ > 0) &
+                           .AND. (dfftt%nr1x == dfftt%nr1) .AND. (dfftt%nr2x == dfftt%nr2) &
+                           .AND. (dfftt%nr3x == dfftt%nr3) .AND. (dfftt%nnr == dfftt%nr1*dfftt%nr2*dfftt%nr3)
+  END FUNCTION vexx_gamma_fast_path
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE vexx_gfast_fft( nrxxs, nblk, a, plan, single, dir )
+  !-----------------------------------------------------------------------
+    !! Transform nblk grids in place: one batched cuFFT plan, or a single-grid plan grid by grid
+    !! (on large grids cuFFT runs a single-grid 3-D plan faster per point than a batched one).
+    USE cufft
+    IMPLICIT NONE
+    INTEGER, INTENT(IN) :: nrxxs, nblk, plan, dir
+    LOGICAL, INTENT(IN) :: single
+    COMPLEX(DP), DEVICE, INTENT(INOUT) :: a(nrxxs,nblk)
+    INTEGER :: s, istat
+    IF ( single ) THEN
+       DO s = 1, nblk
+          istat = cufftExecZ2Z( plan, a(1,s), a(1,s), dir )
+          IF ( istat /= 0 ) CALL errore( 'vexx_bp_gamma_gpu_fast', 'cuFFT exec failed', ABS(istat) )
+       ENDDO
+    ELSE
+       istat = cufftExecZ2Z( plan, a(1,1), a(1,1), dir )
+       IF ( istat /= 0 ) CALL errore( 'vexx_bp_gamma_gpu_fast', 'cuFFT exec failed', ABS(istat) )
+    ENDIF
+  END SUBROUTINE vexx_gfast_fft
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE vexx_gfast_same( nrxxs, nbuf, ebuf, mp, psic, m, dmax, bmax )
+  !-----------------------------------------------------------------------
+    !! The largest difference between the psi of this call and the buffered orbitals of the same
+    !! index, and the largest buffered value, over the whole grid.
+    IMPLICIT NONE
+    INTEGER, INTENT(IN) :: nrxxs, nbuf, mp, m
+    COMPLEX(DP), DEVICE, INTENT(IN) :: ebuf(nrxxs,nbuf), psic(nrxxs,mp)
+    REAL(DP), INTENT(OUT) :: dmax, bmax
+    INTEGER :: i, ir
+    REAL(DP) :: a, b
+    dmax = 0.0_DP
+    bmax = 0.0_DP
+    !$cuf kernel do (2)
+    DO i = 1, m
+       DO ir = 1, nrxxs
+          IF ( MOD(i,2) == 1 ) THEN
+             a = DBLE( psic(ir,(i+1)/2) )
+             b = DBLE( ebuf(ir,(i+1)/2) )
+          ELSE
+             a = AIMAG( psic(ir,(i+1)/2) )
+             b = AIMAG( ebuf(ir,(i+1)/2) )
+          ENDIF
+          dmax = MAX( dmax, ABS( a - b ) )
+          bmax = MAX( bmax, ABS( b ) )
+       ENDDO
+    ENDDO
+  END SUBROUTINE vexx_gfast_same
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE vexx_gfast_main( nrxxs, nbuf, ebuf, mp, psic, m, res, fac, ns, si, sj, sx, pblk, rho, &
+                              plan_full, plan_tail, single, sym, omega_inv )
+  !-----------------------------------------------------------------------
+    !! The pair loop of the batched Gamma-point operator, a block of slots at a time. A slot is
+    !! (band i, buffer pair jp): rho = (phi_j1 + i phi_j2) psi_i holds two real pair densities, its
+    !! Fock potential v two real pair potentials. sx(1:2,s) weigh phi_j1, phi_j2 into band i;
+    !! sx(3:4,s) weigh psi_i into bands j1, j2 (the transposed term of a symmetric build).
+    USE cufft
+    IMPLICIT NONE
+    INTEGER, INTENT(IN) :: nrxxs, nbuf, mp, m, ns, pblk, plan_full, plan_tail
+    LOGICAL, INTENT(IN) :: single, sym
+    COMPLEX(DP), DEVICE, INTENT(IN) :: ebuf(nrxxs,nbuf), psic(nrxxs,mp)
+    REAL(DP), DEVICE, INTENT(IN) :: fac(nrxxs), sx(4,ns)
+    INTEGER, DEVICE, INTENT(IN) :: si(ns), sj(ns)
+    COMPLEX(DP), DEVICE, INTENT(INOUT) :: rho(nrxxs,pblk)
+    REAL(DP), DEVICE, INTENT(INOUT) :: res(nrxxs,m)
+    REAL(DP), INTENT(IN) :: omega_inv
+    INTEGER :: s0, np_, plan, s, ir, i, jp
+    REAL(DP) :: p
+    COMPLEX(DP) :: v, b
+    !
+    DO s0 = 0, ns - 1, pblk
+       np_ = MIN( pblk, ns - s0 )
+       plan = plan_full
+       IF ( np_ /= pblk ) plan = plan_tail
+       !$cuf kernel do (2)
+       DO s = 1, np_
+          DO ir = 1, nrxxs
+             i = si(s0+s)
+             IF ( MOD(i,2) == 1 ) THEN
+                p = DBLE( psic(ir,(i+1)/2) )
+             ELSE
+                p = AIMAG( psic(ir,(i+1)/2) )
+             ENDIF
+             rho(ir,s) = ebuf(ir,sj(s0+s)) * ( p * omega_inv )
+          ENDDO
+       ENDDO
+       CALL vexx_gfast_fft( nrxxs, np_, rho, plan, single, CUFFT_FORWARD )
+       !$cuf kernel do (2)
+       DO s = 1, np_
+          DO ir = 1, nrxxs
+             rho(ir,s) = rho(ir,s) * fac(ir)
+          ENDDO
+       ENDDO
+       CALL vexx_gfast_fft( nrxxs, np_, rho, plan, single, CUFFT_INVERSE )
+       IF ( sym ) THEN
+          !$cuf kernel do (1)
+          DO ir = 1, nrxxs
+             DO s = 1, np_
+                i = si(s0+s)
+                jp = sj(s0+s)
+                v = rho(ir,s)
+                b = ebuf(ir,jp)
+                IF ( MOD(i,2) == 1 ) THEN
+                   p = DBLE( psic(ir,(i+1)/2) )
+                ELSE
+                   p = AIMAG( psic(ir,(i+1)/2) )
+                ENDIF
+                res(ir,i) = res(ir,i) + sx(1,s0+s) * DBLE(v) * DBLE(b) + sx(2,s0+s) * AIMAG(v) * AIMAG(b)
+                IF ( 2*jp-1 <= m ) res(ir,2*jp-1) = res(ir,2*jp-1) + sx(3,s0+s) * DBLE(v) * p
+                IF ( 2*jp <= m )   res(ir,2*jp)   = res(ir,2*jp)   + sx(4,s0+s) * AIMAG(v) * p
+             ENDDO
+          ENDDO
+       ELSE
+          !$cuf kernel do (1)
+          DO ir = 1, nrxxs
+             DO s = 1, np_
+                i = si(s0+s)
+                v = rho(ir,s)
+                b = ebuf(ir,sj(s0+s))
+                res(ir,i) = res(ir,i) + sx(1,s0+s) * DBLE(v) * DBLE(b) + sx(2,s0+s) * AIMAG(v) * AIMAG(b)
+             ENDDO
+          ENDDO
+       ENDIF
+    ENDDO
+  END SUBROUTINE vexx_gfast_main
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE vexx_bp_gamma_gpu_fast( lda, n, m, psi, hpsi, ok )
+  !-----------------------------------------------------------------------
+    !! Batched GPU version of vexx_gamma for norm-conserving runs with one band group and a serial
+    !! FFT grid. Same math as vexx_bp_gamma_gpu: with real orbitals,
+    !!   V_x psi_i(r) = -exxalfa * sum_{j occ} x_occ(j) phi_j(r) IFFT[ v(G) FFT[ phi_j psi_i / omega ] ](r)
+    !! and two pair densities share one complex transform (the Gamma trick; phi_j + i phi_j+1 is how
+    !! the orbital buffer stores them). What changes is how the work is laid out on the device:
+    !!  - the pair transforms run on own cuFFT plans, the normalisation folded into a dense Coulomb
+    !!    kernel, in blocks of (band, buffer pair) slots: one kernel per block instead of one per pair;
+    !!  - when the psi are the buffered orbitals themselves, as in every ACE build, the pair potential
+    !!    is symmetric, W_ij = W_ji, so each unordered pair is transformed once and added to both
+    !!    bands: about half the transforms of a build;
+    !!  - psi go to real space, and the result comes back, two bands per transform.
+    USE cufft
+    USE cudafor,        ONLY : cudaMemGetInfo
+    USE cell_base,      ONLY : omega
+    USE wvfct,          ONLY : current_k, nbnd
+    USE klist,          ONLY : xk, nkstot
+    USE exx_base,       ONLY : xkq_collect, index_xkq, index_xk
+    USE exx_bp_utils,   ONLY : igk_exx_d
+    USE mp_exx,         ONLY : max_ibands
+    !
+    IMPLICIT NONE
+    !
+    INTEGER, INTENT(IN) :: lda, n, m
+    COMPLEX(DP), INTENT(IN)    :: psi(lda*npol,max_ibands)
+    COMPLEX(DP), INTENT(INOUT) :: hpsi(lda*npol,max_ibands)
+    LOGICAL, INTENT(OUT) :: ok   ! .FALSE. when the device work arrays would not fit (nothing done)
+    !
+    INTEGER, POINTER :: nl_d(:), nlm_d(:)
+    attributes(DEVICE) :: nl_d, nlm_d
+    INTEGER :: nrxxs, nr1, nr2, nr3, ngmt, current_ik, ikq, ik, nocc, nbb, nbuf, mp, pblk, bp, bw, ns
+    INTEGER :: plan_full, plan_tail, plan_wfull, plan_wtail, istat, i, ig, ir, ip, p0, np_, plan
+    INTEGER :: jp, j1, j2, jlast, pass, key
+    INTEGER(KIND=8) :: need, free_, total_
+    LOGICAL :: sym, single
+    REAL(DP) :: xkp(3), xkq(3), omega_inv, scale, dmax, bmax, fs, w(4)
+    COMPLEX(DP) :: c1, c2
+    CHARACTER(LEN=48) :: why, plans
+    INTEGER, EXTERNAL :: global_kpoint_index
+    !
+    ok = .TRUE.
+    CALL start_clock( 'vexx_g_setup' )
+    nl_d  => dfftt%nl_d
+    nlm_d => dfftt%nlm_d
+    nrxxs = dfftt%nnr
+    nr1 = dfftt%nr1; nr2 = dfftt%nr2; nr3 = dfftt%nr3
+    ngmt = dfftt%ngm
+    current_ik = global_kpoint_index( nkstot, current_k )
+    ikq = index_xkq(current_ik,1)
+    ik  = index_xk(ikq)
+    xkp = xk(:,current_k)
+    xkq = xkq_collect(:,ikq)
+    omega_inv = 1.0_DP / omega
+    scale = 1.0_DP / DBLE( nr1*nr2*nr3 )      ! fwfft normalisation, folded into the Coulomb kernel
+    nocc = x_nbnd_occ
+    nbuf = SIZE( exxbuff_d, 2 )
+    nbb  = MIN( nbnd, 2*nbuf )                ! bands held by the orbital buffer
+    mp   = (m+1)/2
+    ! single-grid cuFFT plans from about 70^3 points on, batched plans below
+    single = ( nrxxs >= 350000 )
+    IF ( gf_fft1_mode >= 0 ) single = ( gf_fft1_mode == 1 )
+    ! a block of slots that fits the L2 cache (~18 MB) unless QE_EXX_PBLK says otherwise
+    IF ( p6_pblk > 0 ) THEN
+       pblk = p6_pblk
+    ELSE
+       pblk = MAX( 4, MIN( 128, NINT( 18.0E6_DP / ( 16.0_DP * DBLE(nrxxs) ) ) ) )
+    ENDIF
+    !
+    ! ... the device work arrays: ask first whether they fit (the runtime aborts on a failed device
+    !     ALLOCATE even with STAT=); if not, this and every later call go to vexx_bp_gamma_gpu
+    need = 0_8
+    IF ( .NOT. ALLOCATED(gf_psic_d) ) need = need + 16_8*INT(nrxxs,8)*INT(mp,8) + 8_8*INT(nrxxs,8)*INT(m,8) + &
+                                             32_8*INT(nrxxs,8)*INT(pblk,8) + 8_8*INT(nrxxs,8)
+    IF ( .NOT. ALLOCATED(p6_psi_d) )  need = need + 32_8*INT(lda*npol,8)*INT(m,8)
+    IF ( need > 0_8 ) THEN
+       istat = cudaMemGetInfo( free_, total_ )
+       IF ( istat == 0 .AND. need + 268435456_8 > free_ ) THEN
+          CALL p15_release_work_arrays()
+          p15_fast_disabled = .TRUE.
+          WRITE( stdout, '(5X,"EXX-GPU: the batched Gamma operator would need ",I0," MB of device memory for ",I0," bands on ",I0," grid points, ",I0," MB are free: this run continues on the original vexx_gamma_gpu path")' ) &
+               need/1000000_8, m, nrxxs, free_/1000000_8
+          CALL stop_clock( 'vexx_g_setup' )
+          ok = .FALSE.
+          RETURN
+       ENDIF
+    ENDIF
+    IF ( ALLOCATED(gf_psic_d) ) THEN
+       IF ( SIZE(gf_psic_d,1) /= nrxxs .OR. SIZE(gf_psic_d,2) /= mp .OR. SIZE(gf_res_d,2) /= m .OR. &
+            SIZE(gf_rho_d,2) /= pblk ) DEALLOCATE( gf_psic_d, gf_res_d, gf_rho_d )
+    ENDIF
+    istat = 0
+    IF ( .NOT. ALLOCATED(gf_psic_d) ) ALLOCATE( gf_psic_d(nrxxs,mp), gf_res_d(nrxxs,m), gf_rho_d(nrxxs,pblk), STAT=istat )
+    IF ( ALLOCATED(gf_fac_d) ) THEN
+       IF ( SIZE(gf_fac_d) /= nrxxs .OR. SIZE(gf_facg_d) /= ngmt ) DEALLOCATE( gf_fac_d, gf_facg_d )
+    ENDIF
+    IF ( istat == 0 .AND. .NOT. ALLOCATED(gf_fac_d) ) ALLOCATE( gf_fac_d(nrxxs), gf_facg_d(ngmt), STAT=istat )
+    IF ( ALLOCATED(p6_psi_d) ) THEN
+       IF ( SIZE(p6_psi_d,1) /= lda*npol .OR. SIZE(p6_psi_d,2) /= m ) DEALLOCATE( p6_psi_d, p6_hpsi_d )
+    ENDIF
+    IF ( istat == 0 .AND. .NOT. ALLOCATED(p6_psi_d) ) ALLOCATE( p6_psi_d(lda*npol,m), p6_hpsi_d(lda*npol,m), STAT=istat )
+    IF ( istat /= 0 ) THEN
+       CALL p15_release_work_arrays()
+       p15_fast_disabled = .TRUE.
+       WRITE( stdout, '(5X,"EXX-GPU: no device memory for the batched Gamma operator work arrays (",I0," bands on ",I0," grid points): this run continues on the original vexx_gamma_gpu path")' ) m, nrxxs
+       CALL stop_clock( 'vexx_g_setup' )
+       ok = .FALSE.
+       RETURN
+    ENDIF
+    ! the work arrays of a small system stay for the next call, those of a large one are returned
+    gf_keep = ( 16_8*INT(nrxxs,8)*INT(mp,8) + 8_8*INT(nrxxs,8)*INT(m,8) + 16_8*INT(nrxxs,8)*INT(pblk,8) <= 536870912_8 )
+    !
+    ! ... the Coulomb kernel on the full grid, both halves of the G sphere, times the FFT normalisation
+    CALL g2_convolution_all( ngmt, gt, xkp, xkq, 1, current_k )
+    gf_facg_d = coulomb_fac(1:ngmt,1,current_k)
+    gf_fac_d = 0.0_DP
+    !$cuf kernel do (1)
+    DO ig = 1, ngmt
+       gf_fac_d( nl_d(ig) )  = gf_facg_d(ig) * scale
+       gf_fac_d( nlm_d(ig) ) = gf_facg_d(ig) * scale
+    ENDDO
+    !
+    ! ... psi -> device -> real space on the EXX grid, two bands per transform
+    bw = MIN( pblk, mp )
+    p6_plan_pinned = 0
+    IF ( single ) THEN
+       plan_wfull = vexx_fast_plan( nr1, nr2, nr3, 1, .FALSE. );  p6_plan_pinned(1) = plan_wfull
+       plan_wtail = plan_wfull
+    ELSE
+       plan_wfull = vexx_fast_plan( nr1, nr2, nr3, bw, .FALSE. );  p6_plan_pinned(1) = plan_wfull
+       plan_wtail = plan_wfull
+       IF ( MOD(mp,bw) > 0 ) THEN
+          plan_wtail = vexx_fast_plan( nr1, nr2, nr3, MOD(mp,bw), .FALSE. );  p6_plan_pinned(2) = plan_wtail
+       ENDIF
+    ENDIF
+    p6_psi_d  = psi(:,1:m)
+    p6_hpsi_d = hpsi(:,1:m)
+    gf_psic_d = ( 0._DP, 0._DP )
+    !$cuf kernel do (2)
+    DO ip = 1, mp
+       DO ig = 1, n
+          i = 2*ip - 1
+          IF ( i + 1 <= m ) THEN
+             gf_psic_d( nl_d(igk_exx_d(ig,current_k)),  ip ) = p6_psi_d(ig,i) + ( 0._DP, 1._DP ) * p6_psi_d(ig,i+1)
+             gf_psic_d( nlm_d(igk_exx_d(ig,current_k)), ip ) = CONJG( p6_psi_d(ig,i) ) + ( 0._DP, 1._DP ) * CONJG( p6_psi_d(ig,i+1) )
+          ELSE
+             gf_psic_d( nl_d(igk_exx_d(ig,current_k)),  ip ) = p6_psi_d(ig,i)
+             gf_psic_d( nlm_d(igk_exx_d(ig,current_k)), ip ) = CONJG( p6_psi_d(ig,i) )
+          ENDIF
+       ENDDO
+    ENDDO
+    DO p0 = 1, mp, bw
+       np_ = MIN( bw, mp - p0 + 1 )
+       plan = plan_wfull
+       IF ( np_ /= bw ) plan = plan_wtail
+       CALL vexx_gfast_fft( nrxxs, np_, gf_psic_d(1,p0), plan, single, CUFFT_INVERSE )
+    ENDDO
+    gf_res_d = 0.0_DP
+    !
+    ! ... are these psi the buffered orbitals? Then every pair potential serves two bands
+    sym = ( gf_sym_mode /= 0 ) .AND. ( m <= nbb )
+    IF ( sym ) THEN
+       CALL vexx_gfast_same( nrxxs, nbuf, exxbuff_d(1,LBOUND(exxbuff_d,2),ikq), mp, gf_psic_d, m, dmax, bmax )
+       sym = ( dmax <= 1.0E-11_DP * bmax )
+    ENDIF
+    !
+    ! ... the slot list. General: band i with every occupied buffer pair. Symmetric: band i with the
+    !     pairs holding a band j >= i, the transposed weights sending psi_i into bands j > i
+    IF ( sym ) THEN
+       jlast = MIN( MAX( m, nocc ), nbb )
+    ELSE
+       jlast = MIN( nocc, nbb )
+    ENDIF
+    DO pass = 1, 2
+       ns = 0
+       DO i = 1, m
+          DO jp = 1, (jlast+1)/2
+             j1 = 2*jp - 1
+             j2 = 2*jp
+             w = 0.0_DP
+             IF ( sym ) THEN
+                IF ( j2 < i ) CYCLE
+                IF ( j1 >= i ) w(1) = x_occupation(j1,ik)
+                IF ( j2 >= i .AND. j2 <= jlast ) w(2) = x_occupation(j2,ik)
+                IF ( j1 > i .AND. j1 <= m ) w(3) = x_occupation(i,ik)
+                IF ( j2 > i .AND. j2 <= m ) w(4) = x_occupation(i,ik)
+             ELSE
+                w(1) = x_occupation(j1,ik)
+                IF ( j2 <= jlast ) w(2) = x_occupation(j2,ik)
+             ENDIF
+             IF ( ALL( ABS(w) < eps_occ ) ) CYCLE
+             ns = ns + 1
+             IF ( pass == 2 ) THEN
+                gf_si_h(ns) = i
+                gf_sj_h(ns) = jp
+                gf_sx_h(:,ns) = w
+             ENDIF
+          ENDDO
+       ENDDO
+       IF ( pass == 1 ) THEN
+          IF ( ALLOCATED(gf_si_h) ) THEN
+             IF ( SIZE(gf_si_h) < ns ) DEALLOCATE( gf_si_h, gf_sj_h, gf_sx_h, gf_si_d, gf_sj_d, gf_sx_d )
+          ENDIF
+          IF ( .NOT. ALLOCATED(gf_si_h) ) ALLOCATE( gf_si_h(MAX(ns,1)), gf_sj_h(MAX(ns,1)), gf_sx_h(4,MAX(ns,1)), &
+                                                    gf_si_d(MAX(ns,1)), gf_sj_d(MAX(ns,1)), gf_sx_d(4,MAX(ns,1)) )
+       ENDIF
+    ENDDO
+    ! say which shape the Gamma operator takes (once, and again whenever it changes)
+    key = MERGE( 2, 0, sym ) + MERGE( 1, 0, single )
+    IF ( key /= gf_banner_last ) THEN
+       gf_banner_last = key
+       why = 'all pairs'
+       IF ( sym ) why = 'symmetric pairs (psi = buffered orbitals)'
+       plans = 'batched'
+       IF ( single ) plans = 'single-grid'
+       WRITE( stdout, '(5X,"EXX-GPU: vexx takes the batched Gamma path; ",A,", ",A," cuFFT plans, block ",I0," of ",I0," slots for ",I0," bands")' ) &
+            TRIM(why), TRIM(plans), MIN( pblk, MAX( ns, 1 ) ), ns, m
+    ENDIF
+    CALL stop_clock( 'vexx_g_setup' )
+    !
+    CALL start_clock( 'vexx_g_main' )
+    IF ( ns > 0 ) THEN
+       gf_si_d(1:ns) = gf_si_h(1:ns)
+       gf_sj_d(1:ns) = gf_sj_h(1:ns)
+       gf_sx_d(:,1:ns) = gf_sx_h(:,1:ns)
+       bp = MIN( pblk, ns )
+       IF ( single ) THEN
+          plan_full = plan_wfull
+          plan_tail = plan_wfull
+       ELSE
+          plan_full = vexx_fast_plan( nr1, nr2, nr3, bp, .FALSE. );  p6_plan_pinned(3) = plan_full
+          plan_tail = plan_full
+          IF ( MOD(ns,bp) > 0 ) THEN
+             plan_tail = vexx_fast_plan( nr1, nr2, nr3, MOD(ns,bp), .FALSE. );  p6_plan_pinned(4) = plan_tail
+          ENDIF
+       ENDIF
+       CALL vexx_gfast_main( nrxxs, nbuf, exxbuff_d(1,LBOUND(exxbuff_d,2),ikq), mp, gf_psic_d, m, gf_res_d, gf_fac_d, ns, gf_si_d, gf_sj_d, &
+                             gf_sx_d, bp, gf_rho_d, plan_full, plan_tail, single, sym, omega_inv )
+    ENDIF
+    !
+    ! ... back to G-space, two bands per transform (normalised here), and into hpsi
+    fs = 0.5_DP * exxalfa * scale
+    DO p0 = 1, mp, bw
+       np_ = MIN( bw, mp - p0 + 1 )
+       plan = plan_wfull
+       IF ( np_ /= bw ) plan = plan_wtail
+       !$cuf kernel do (2)
+       DO ip = 1, np_
+          DO ir = 1, nrxxs
+             i = 2*(p0+ip-1) - 1
+             IF ( i + 1 <= m ) THEN
+                gf_rho_d(ir,ip) = CMPLX( gf_res_d(ir,i), gf_res_d(ir,i+1), KIND=DP )
+             ELSE
+                gf_rho_d(ir,ip) = CMPLX( gf_res_d(ir,i), 0.0_DP, KIND=DP )
+             ENDIF
+          ENDDO
+       ENDDO
+       CALL vexx_gfast_fft( nrxxs, np_, gf_rho_d, plan, single, CUFFT_FORWARD )
+       !$cuf kernel do (2)
+       DO ip = 1, np_
+          DO ig = 1, n
+             i = 2*(p0+ip-1) - 1
+             c1 = gf_rho_d( nl_d(igk_exx_d(ig,current_k)), ip )
+             c2 = CONJG( gf_rho_d( nlm_d(igk_exx_d(ig,current_k)), ip ) )
+             p6_hpsi_d(ig,i) = p6_hpsi_d(ig,i) - fs * ( c1 + c2 )
+             IF ( i + 1 <= m ) p6_hpsi_d(ig,i+1) = p6_hpsi_d(ig,i+1) - fs * ( 0._DP, -1._DP ) * ( c1 - c2 )
+          ENDDO
+       ENDDO
+    ENDDO
+    CALL stop_clock( 'vexx_g_main' )
+    !
+    CALL start_clock( 'vexx_g_fin' )
+    hpsi(:,1:m) = p6_hpsi_d
+    IF ( .NOT. gf_keep ) DEALLOCATE( gf_psic_d, gf_res_d, gf_rho_d )
+    CALL stop_clock( 'vexx_g_fin' )
+    !
+  END SUBROUTINE vexx_bp_gamma_gpu_fast
   !
   !-----------------------------------------------------------------------
   SUBROUTINE p18_qgm_build( ngms, xkq, xkp )
@@ -5099,6 +5569,9 @@ end associate
     IF ( ALLOCATED(p6_ikq_d) ) DEALLOCATE( p6_ikq_d )
     IF ( ALLOCATED(p6_xocc_d) ) DEALLOCATE( p6_xocc_d )
     IF ( ALLOCATED(cfac_all_d) ) DEALLOCATE( cfac_all_d )
+    IF ( ALLOCATED(gf_psic_d) ) DEALLOCATE( gf_psic_d, gf_res_d, gf_rho_d )
+    IF ( ALLOCATED(gf_fac_d) ) DEALLOCATE( gf_fac_d, gf_facg_d )
+    IF ( ALLOCATED(gf_si_h) ) DEALLOCATE( gf_si_h, gf_sj_h, gf_sx_h, gf_si_d, gf_sj_d, gf_sx_d )
     CALL p18_release()   ! P18
   END SUBROUTINE p15_release_work_arrays
 #endif
