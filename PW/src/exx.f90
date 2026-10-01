@@ -136,6 +136,8 @@ MODULE exx
        ! ... no band parallelization: exx grid is a subgrid of general grid
        !
        lpara = ( nproc_bgrp > 1 )
+       IF ( use_gpu .AND. negrp == 1 .AND. exx_bgrp_type /= EXX_BGRP_BANDS .AND. .NOT. lpara .AND. .NOT. tqr ) &
+          CALL exx_device_grid()
        CALL fft_type_init( dfftt, smap, "rho", gamma_only, lpara,         &
                            intra_bgrp_comm, at, bg, gcutmt, gcutmt/gkcut, &
                            fft_fact=fft_fact, nyfft=nyfft, nmany=nmany_,  &
@@ -174,6 +176,95 @@ MODULE exx
     RETURN
     !
   END SUBROUTINE exx_fft_create
+  !
+  !------------------------------------------------------------------------
+  SUBROUTINE exx_device_grid()
+    !------------------------------------------------------------------------
+    !! The transforms of the EXX grid of a GPU run are cuFFT's, which is faster on a grid size
+    !! 4*7*2^a*3^b*5^c (28, 56, 84, 112, 140, 168, ...) than on the next size with factors 2, 3 and 5
+    !! only that good_fft_order would take: 84 against 90, 112 against 120, 168 against 180. Where
+    !! such a size holds the transforms, set it before fft_type_init chooses.
+    !! The exchange operator does not depend on the choice: the pair densities and their Fock
+    !! potentials are band limited, so every grid of n >= nrho + 2*nwfc + 1 points per direction
+    !! (nrho, nwfc the largest Miller indices of the spheres of the pair densities and of the
+    !! wavefunctions) gives the same V_x|psi> on the wavefunction sphere, aliasing included.
+    !! Nothing is set when no direction gains, when a direction would need more points than the
+    !! standard grid has, or when the grid would not go with a symmetry operation.
+    !
+    USE gvect,        ONLY : ngm, gg, mill
+    USE symm_base,    ONLY : nsym, s, ft, fft_fact
+    USE mp_bands,     ONLY : intra_bgrp_comm
+    USE mp,           ONLY : mp_max
+    USE fft_support,  ONLY : good_fft_order
+    !
+    IMPLICIT NONE
+    !
+    INTEGER :: nrho(3), nwfc(3), nstd(3), nr(3), i, ig, n, m, isym, lenv, stat
+    REAL(DP) :: ftn(3)
+    LOGICAL :: good
+    CHARACTER(LEN=8) :: val
+    !
+    IF ( dfftt%nr1 /= 0 .OR. dfftt%nr2 /= 0 .OR. dfftt%nr3 /= 0 ) RETURN
+    CALL GET_ENVIRONMENT_VARIABLE( 'QE_EXX_GRID7', val, lenv, stat )
+    IF ( stat == 0 .AND. lenv > 0 ) THEN
+       IF ( val(1:1) == '0' ) RETURN
+    ENDIF
+    !
+    nrho = 0
+    nwfc = 0
+    DO ig = 1, ngm
+       IF ( gg(ig) > gcutmt ) EXIT
+       nrho(:) = MAX( nrho(:), ABS( mill(:,ig) ) )
+       IF ( gg(ig) <= gkcut ) nwfc(:) = MAX( nwfc(:), ABS( mill(:,ig) ) )
+    ENDDO
+    CALL mp_max( nrho, intra_bgrp_comm )
+    CALL mp_max( nwfc, intra_bgrp_comm )
+    !
+    good = .FALSE.
+    DO i = 1, 3
+       nstd(i) = good_fft_order( 2*nrho(i) + 1, fft_fact(i) )
+       nr(i) = nstd(i)
+       ! the smallest size 28 * 2^a 3^b 5^c that holds the transforms and goes with fft_fact
+       DO n = MAX( 2*nrho(i) + 1, nrho(i) + 2*nwfc(i) + 1 ), nstd(i) - 1
+          IF ( MOD( n, 28 ) /= 0 .OR. MOD( n, 49 ) == 0 .OR. MOD( n, fft_fact(i) ) /= 0 ) CYCLE
+          m = n / 28
+          DO WHILE ( MOD( m, 2 ) == 0 )
+             m = m / 2
+          ENDDO
+          DO WHILE ( MOD( m, 3 ) == 0 )
+             m = m / 3
+          ENDDO
+          DO WHILE ( MOD( m, 5 ) == 0 )
+             m = m / 5
+          ENDDO
+          IF ( m == 1 ) THEN
+             nr(i) = n
+             good = .TRUE.
+             EXIT
+          ENDIF
+       ENDDO
+       ! the standard size must hold the transforms too, or the choice is left to fft_type_init
+       IF ( nstd(i) < nrho(i) + 2*nwfc(i) + 1 ) RETURN
+    ENDDO
+    IF ( .NOT. good ) RETURN
+    !
+    ! ... the rotations must send the grid into itself and the fractional translations must be
+    !     grid vectors (the tests of scale_sym_ops, which exx_set_symm will apply to this grid)
+    DO isym = 1, nsym
+       IF ( MOD( s(2,1,isym)*nr(1), nr(2) ) /= 0 .OR. MOD( s(3,1,isym)*nr(1), nr(3) ) /= 0 .OR. &
+            MOD( s(1,2,isym)*nr(2), nr(1) ) /= 0 .OR. MOD( s(3,2,isym)*nr(2), nr(3) ) /= 0 .OR. &
+            MOD( s(1,3,isym)*nr(3), nr(1) ) /= 0 .OR. MOD( s(2,3,isym)*nr(3), nr(2) ) /= 0 ) RETURN
+       ftn(:) = ft(:,isym) * nr(:)
+       IF ( ANY( ABS( ftn(:) - NINT( ftn(:) ) ) / nr(:) > 1.0E-5_DP ) ) RETURN
+    ENDDO
+    !
+    dfftt%nr1 = nr(1)
+    dfftt%nr2 = nr(2)
+    dfftt%nr3 = nr(3)
+    WRITE( stdout, '(5X,"EXX-GPU: EXX grid ",I0," x ",I0," x ",I0," for cuFFT (standard ",I0," x ",I0," x ",I0,")")' ) &
+         nr(1), nr(2), nr(3), nstd(1), nstd(2), nstd(3)
+    !
+  END SUBROUTINE exx_device_grid
   !
   !------------------------------------------------------------------------
   SUBROUTINE exx_gvec_reinit( at_old )
