@@ -45,7 +45,7 @@ SUBROUTINE electrons()
   USE paw_symmetry,         ONLY : PAW_symmetrize_ddd
   USE ions_base,            ONLY : nat
   USE exx_base,             ONLY : exxbuff_to_device, exxbuff_sync_host
-  USE exx_bp,               ONLY : exx_dexx_current
+  USE exx_bp,               ONLY : exx_dexx_current, exx_sp_adaptive, exx_sp_last, exx_sp_latched
   USE loc_scdm,             ONLY : use_scdm, localize_orbitals
   USE loc_scdm_k,           ONLY : localize_orbitals_k
   !
@@ -76,12 +76,15 @@ SUBROUTINE electrons()
   LOGICAL :: first, exst
   REAL(DP) :: etot_cmp_paw(nat,2,2)
   LOGICAL :: DoLoc
+  LOGICAL :: exx_conv
+  !! the exact-exchange loop has converged
   !
   !
   DoLoc = local_thr.gt.0.0d0
   exxen = 0.0d0
   iter = 0
   first = .true.
+  exx_sp_latched = .FALSE.    ! adaptive single precision of the device exchange operator: a new loop
   tr2_final = tr2
   IF ( xclib_dft_is('hybrid') ) THEN
      !printout = 0  ! do not print etot and energy components at each scf step
@@ -301,13 +304,22 @@ SUBROUTINE electrons()
         ENDIF
         exx_dexx_current = dexx
         !
+        ! with adaptive precision (QE_EXX_SP=1) the device exchange operator of this cycle may have
+        ! been built with single-precision pair transforms. Convergence is declared on a
+        ! double-precision operator only: otherwise one more cycle, in double precision from now on
+        exx_conv = ( dexx < tr2_final )
+        IF ( exx_conv .AND. exx_sp_adaptive .AND. exx_sp_last ) THEN
+           exx_sp_latched = .TRUE.
+           exx_conv = .FALSE.
+        ENDIF
+        !
         !   remove the estimate exchange energy exxen used in the inner SCF
         !
         etot = etot + exxen + 0.5D0*fock2 - fock1
         hwf_energy = hwf_energy + exxen + 0.5D0*fock2 - fock1 ! [LP]
         exxen = 0.5D0*fock2 
         !
-        IF ( dexx < tr2_final ) THEN
+        IF ( exx_conv ) THEN
            WRITE( stdout, 9066 ) '!!', etot, hwf_energy
         ELSE
            WRITE( stdout, 9066 ) '  ', etot, hwf_energy
@@ -325,7 +337,7 @@ SUBROUTINE electrons()
            WRITE( stdout, 9064 ) 0.5D0*fock2
         ENDIF
         !
-        IF ( dexx < tr2_final ) THEN
+        IF ( exx_conv ) THEN
            IF ( do_makov_payne ) CALL makov_payne( etot, tau, &
                 rho%of_r(:,1), rho%of_g(:,1), strf, vloc, gamma_only,&
                 etot_in_hartree = .false., output_in_hartree = .false., &

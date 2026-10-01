@@ -45,6 +45,13 @@ MODULE exx_bp
   LOGICAL :: exx_us_forces_done = .FALSE.
   !! forces.f90 prints the exact-exchange US/PAW term only when it was computed
   LOGICAL :: p15_fast_disabled = .FALSE.   ! P15: the fast path's device work arrays did not fit; original path from then on
+  LOGICAL :: exx_sp_adaptive = .FALSE.
+  !! QE_EXX_SP=1: single-precision pair transforms while the exchange energy still changes
+  LOGICAL :: exx_sp_last = .FALSE.
+  !! the exchange operator in use was built with single-precision pair transforms
+  LOGICAL :: exx_sp_latched = .FALSE.
+  !! adaptive precision: double precision for the rest of this exact-exchange loop (set when the
+  !! change of the exchange energy first falls below the threshold; electrons resets it)
 #if defined(__CUDA)
   ! P6: persistent state of the batched fast path (vexx_k_gpu_fast)
   INTEGER, PARAMETER :: p6_nplans = 16   ! P11: was 8
@@ -115,7 +122,7 @@ MODULE exx_bp
   INTEGER :: ka_banner = -1
   COMPLEX(DP), ALLOCATABLE, DEVICE :: ka_acc_d(:,:), ka_h_d(:,:,:)
   INTEGER, ALLOCATABLE, DEVICE :: ka_rir_d(:,:), ka_si_d(:), ka_sj_d(:)
-  REAL(DP), ALLOCATABLE, DEVICE :: ka_sw_d(:,:)
+  REAL(DP), ALLOCATABLE, DEVICE :: ka_sw_d(:,:), ka_fac_d(:)
   INTEGER, ALLOCATABLE :: ka_si_h(:), ka_sj_h(:)
   REAL(DP), ALLOCATABLE :: ka_sw_h(:,:)
   ! its ultrasoft / PAW augmentation: the complex counterparts of the Gamma factors, <beta|psi> and the exchange
@@ -3720,10 +3727,35 @@ end associate
           IF ( val(1:1) == '0' ) ku_env_mode = 0
           IF ( val(1:1) == '1' ) ku_env_mode = 1
        ENDIF
+       exx_sp_adaptive = ( p6_sp_mode == 1 )
        IF (p6_sp_mode == 1) WRITE( stdout, '(5X,"EXX: single-precision pair FFTs while dexx >",1PE9.1," Ry")' ) p6_sp_thr
        IF (p6_sp_mode >= 2) WRITE( stdout, '(5X,"EXX: single-precision pair FFTs in every ACE build")' )
     ENDIF
   END SUBROUTINE vexx_fast_env
+  !
+  !-----------------------------------------------------------------------
+  LOGICAL FUNCTION vexx_sp_now( allowed )
+  !-----------------------------------------------------------------------
+    !! QE_EXX_SP: are the pair transforms of this call single precision? Mode 2: always. Mode 1
+    !! (adaptive): in the first two builds and while the exchange energy still changes by more
+    !! than the threshold, and then no more in this exact-exchange loop. The two precisions differ
+    !! by a small systematic amount of the exchange energy (about 1.6e-7 of it), and going back
+    !! and forth shows up as an exchange error of that size at every switch: the loop would
+    !! return to single precision and could stop there. allowed = .FALSE. (ultrasoft
+    !! augmentation): double precision.
+    IMPLICIT NONE
+    LOGICAL, INTENT(IN) :: allowed
+    vexx_sp_now = .FALSE.
+    IF ( allowed ) THEN
+       IF ( p6_sp_mode >= 2 ) THEN
+          vexx_sp_now = .TRUE.
+       ELSE IF ( p6_sp_mode == 1 .AND. .NOT. exx_sp_latched ) THEN
+          vexx_sp_now = ( p6_nbuild <= 2 .OR. exx_dexx_current > p6_sp_thr )
+          IF ( .NOT. vexx_sp_now ) exx_sp_latched = .TRUE.
+       ENDIF
+    ENDIF
+    exx_sp_last = vexx_sp_now
+  END FUNCTION vexx_sp_now
   !
   !-----------------------------------------------------------------------
   LOGICAL FUNCTION vexx_fast_path()
@@ -4205,8 +4237,7 @@ end associate
     ntail = MOD( npairs, pblk )
     nbuf = SIZE( exxbuff_d, 2 )
     nkqs_d = SIZE( exxbuff_d, 3 )
-    sp = ( p6_sp_mode >= 2 ) .OR. ( p6_sp_mode == 1 .AND. ( p6_nbuild <= 2 .OR. exx_dexx_current > p6_sp_thr ) )
-    IF ( okvan ) sp = .FALSE.      ! P18: the augmented densities stay in double precision
+    sp = vexx_sp_now( .NOT. okvan )      ! P18: the augmented densities stay in double precision
     !
     ! P15: the runtime aborts on a failed device ALLOCATE even with STAT=, so ask first whether the batched work
     ! arrays (and cuFFT work areas of the same size) fit; if not, this and every later call go to vexx_k_gpu
@@ -4834,7 +4865,7 @@ end associate
     INTEGER :: ncoup, nself, nsolo, nskip, jfirst, jlast, io, nord, cur, nflush
     REAL(DP) :: work_all, work_k
     INTEGER, ALLOCATABLE :: ord(:)
-    LOGICAL :: us, us_ok, first
+    LOGICAL :: us, us_ok, first, sp
     INTEGER :: se, ikb, a_, ih_, jh_, o_, c_, it, ikx, nrt, ng0, ipl
     REAL(DP) :: arg, nfft
     COMPLEX(DP) :: z, beta
@@ -4852,6 +4883,8 @@ end associate
     us = okvan
     nfft = DBLE( dfftt%nr1 ) * DBLE( dfftt%nr2 ) * DBLE( dfftt%nr3 )
     nrt = dfftt%nnr * npol         ! an orbital in the buffer: npol spinor components, one after the other
+    ! QE_EXX_SP, as in the k-point operator (never with ultrasoft augmentation)
+    sp = vexx_sp_now( .NOT. us )
     nl_d => dfftt%nl_d
     nrxxs = dfftt%nnr
     nr1 = dfftt%nr1; nr2 = dfftt%nr2; nr3 = dfftt%nr3
@@ -4915,10 +4948,18 @@ end associate
             SIZE(ka_rir_d,1) /= nrxxs .OR. SIZE(ka_rir_d,2) /= nsym ) DEALLOCATE( ka_acc_d, ka_h_d, ka_rir_d )
     ENDIF
     IF ( .NOT. ALLOCATED(ka_acc_d) ) ALLOCATE( ka_acc_d(nrt,m), ka_h_d(npwx*npol,m,nks), ka_rir_d(nrxxs,nsym) )
+    IF ( ALLOCATED(ka_fac_d) ) THEN
+       IF ( SIZE(ka_fac_d) /= nrxxs ) DEALLOCATE( ka_fac_d )
+    ENDIF
+    IF ( .NOT. ALLOCATED(ka_fac_d) ) ALLOCATE( ka_fac_d(nrxxs) )
     IF ( ALLOCATED(p6_rhoc_d) ) THEN
        IF ( SIZE(p6_rhoc_d,1) /= nrxxs .OR. SIZE(p6_rhoc_d,2) /= pblk ) DEALLOCATE( p6_rhoc_d )
     ENDIF
     IF ( .NOT. ALLOCATED(p6_rhoc_d) ) ALLOCATE( p6_rhoc_d(nrxxs,pblk) )
+    IF ( ALLOCATED(p6_rhoc_s) ) THEN
+       IF ( SIZE(p6_rhoc_s,1) /= nrxxs .OR. SIZE(p6_rhoc_s,2) /= pblk ) DEALLOCATE( p6_rhoc_s )
+    ENDIF
+    IF ( sp .AND. .NOT. ALLOCATED(p6_rhoc_s) ) ALLOCATE( p6_rhoc_s(nrxxs,pblk) )
     IF ( ALLOCATED(p6_psic_d) ) THEN
        IF ( SIZE(p6_psic_d,1) /= nrt .OR. SIZE(p6_psic_d,2) /= m ) DEALLOCATE( p6_psic_d, p6_res_d )
     ENDIF
@@ -5073,6 +5114,7 @@ end associate
        ka_banner = ncoup + 2*nself + 3*nsolo
        WRITE( stdout, '(5X,"EXX-GPU: V_x of the ACE build for all ",I0," k-points in one pass; of ",I0," (k, k+q) pairs ",I0," are transformed for both k-points, ",I0," pair with themselves, ",I0," stand alone: ",I0,"% fewer pair transforms")' ) &
             nks, nks*nqs, ncoup, nself, nsolo, NINT( 100.0_DP * ( 1.0_DP - work_all / MAX( work_k, 1.0_DP ) ) )
+       IF ( p6_sp_mode /= 0 .AND. .NOT. us ) WRITE( stdout, '(5X,"EXX-GPU: its pair transforms follow QE_EXX_SP mode ",I0)' ) p6_sp_mode
     ENDIF
     ka_h_d = ( 0._DP, 0._DP )
     IF ( us ) ku_dx_d = ( 0._DP, 0._DP )
@@ -5159,9 +5201,18 @@ end associate
           DO s0 = seg(iq), seg(iq+1) - 1, pblk
              np_ = MIN( pblk, seg(iq+1) - s0 )
              CALL vexx_kall_pair( nrxxs, npol, nbuf, nkqs_d, exxbuff_d, ikq, ikq0(ik), ns, ka_si_d, ka_sj_d, s0, np_, p6_rhoc_d, omega_inv )
-             CALL vexx_gfast_fft_blk( nrxxs, np_, p6_rhoc_d, nr1, nr2, nr3, single, cmax, CUFFT_FORWARD )
-             CALL vexx_kall_kern( nrxxs, nqs, np_, p6_rhoc_d, p6_facb_d, iq, scale )
-             CALL vexx_gfast_fft_blk( nrxxs, np_, p6_rhoc_d, nr1, nr2, nr3, single, cmax, CUFFT_INVERSE )
+             IF ( sp ) THEN
+                ! (the kernel of this k+q point with the FFT normalisation, as vexx_sp_potential wants it)
+                !$cuf kernel do (1)
+                DO ir = 1, nrxxs
+                   ka_fac_d(ir) = p6_facb_d(ir,iq) * scale
+                ENDDO
+                CALL vexx_sp_potential( nrxxs, np_, p6_rhoc_d, p6_rhoc_s, ka_fac_d, nr1, nr2, nr3, single, cmax )
+             ELSE
+                CALL vexx_gfast_fft_blk( nrxxs, np_, p6_rhoc_d, nr1, nr2, nr3, single, cmax, CUFFT_FORWARD )
+                CALL vexx_kall_kern( nrxxs, nqs, np_, p6_rhoc_d, p6_facb_d, iq, scale )
+                CALL vexx_gfast_fft_blk( nrxxs, np_, p6_rhoc_d, nr1, nr2, nr3, single, cmax, CUFFT_INVERSE )
+             ENDIF
              CALL vexx_kall_acc( nrxxs, npol, nbuf, nkqs_d, exxbuff_d, ikq, ikq0(ik), m, p6_res_d, ka_acc_d, ns, ka_si_d, ka_sj_d, &
                                  ka_sw_d, s0, np_, p6_rhoc_d, trans, nsym, ka_rir_d, is, tr )
           ENDDO
@@ -5503,6 +5554,75 @@ end associate
   END SUBROUTINE vexx_gfast_fft_blk
   !
   !-----------------------------------------------------------------------
+  SUBROUTINE vexx_sp_fft_blk( nrxxs, nblk, a, nr1, nr2, nr3, single, cmax, dir )
+  !-----------------------------------------------------------------------
+    !! vexx_gfast_fft_blk for single-precision grids: the single-grid plan grid by grid, or
+    !! batched plans of the powers of two, cmax at most, that add up to nblk.
+    USE cufft
+    IMPLICIT NONE
+    INTEGER, INTENT(IN) :: nrxxs, nblk, nr1, nr2, nr3, cmax, dir
+    LOGICAL, INTENT(IN) :: single
+    COMPLEX(4), DEVICE, INTENT(INOUT) :: a(nrxxs,nblk)
+    INTEGER :: off, c, plan, istat, s
+    IF ( single ) THEN
+       plan = vexx_fast_plan( nr1, nr2, nr3, 1, .TRUE. )
+       DO s = 1, nblk
+          istat = cufftExecC2C( plan, a(1,s), a(1,s), dir )
+          IF ( istat /= 0 ) CALL errore( 'vexx_sp_fft_blk', 'cuFFT exec failed', ABS(istat) )
+       ENDDO
+    ELSE
+       off = 0
+       DO WHILE ( off < nblk )
+          c = 1
+          DO WHILE ( 2*c <= nblk - off .AND. 2*c <= cmax )
+             c = 2*c
+          ENDDO
+          plan = vexx_fast_plan( nr1, nr2, nr3, c, .TRUE. )
+          istat = cufftExecC2C( plan, a(1,off+1), a(1,off+1), dir )
+          IF ( istat /= 0 ) CALL errore( 'vexx_sp_fft_blk', 'cuFFT exec failed', ABS(istat) )
+          off = off + c
+       ENDDO
+    ENDIF
+  END SUBROUTINE vexx_sp_fft_blk
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE vexx_sp_potential( nrxxs, np_, rho, rho_s, fac, nr1, nr2, nr3, single, cmax )
+  !-----------------------------------------------------------------------
+    !! The Fock potentials of a block of pair densities with the two transforms and the Coulomb
+    !! multiplication in single precision: rho is rounded to rho_s, transformed, multiplied by the
+    !! kernel (which carries the FFT normalisation), transformed back and widened into rho again.
+    !! What is accumulated from them stays double precision.
+    USE cufft
+    IMPLICIT NONE
+    INTEGER, INTENT(IN) :: nrxxs, np_, nr1, nr2, nr3, cmax
+    LOGICAL, INTENT(IN) :: single
+    COMPLEX(DP), DEVICE, INTENT(INOUT) :: rho(nrxxs,np_)
+    COMPLEX(4), DEVICE, INTENT(INOUT) :: rho_s(nrxxs,np_)
+    REAL(DP), DEVICE, INTENT(IN) :: fac(nrxxs)
+    INTEGER :: s, ir
+    !$cuf kernel do (2)
+    DO s = 1, np_
+       DO ir = 1, nrxxs
+          rho_s(ir,s) = CMPLX( rho(ir,s), KIND=4 )
+       ENDDO
+    ENDDO
+    CALL vexx_sp_fft_blk( nrxxs, np_, rho_s, nr1, nr2, nr3, single, cmax, CUFFT_FORWARD )
+    !$cuf kernel do (2)
+    DO s = 1, np_
+       DO ir = 1, nrxxs
+          rho_s(ir,s) = rho_s(ir,s) * REAL( fac(ir), KIND=4 )
+       ENDDO
+    ENDDO
+    CALL vexx_sp_fft_blk( nrxxs, np_, rho_s, nr1, nr2, nr3, single, cmax, CUFFT_INVERSE )
+    !$cuf kernel do (2)
+    DO s = 1, np_
+       DO ir = 1, nrxxs
+          rho(ir,s) = CMPLX( rho_s(ir,s), KIND=DP )
+       ENDDO
+    ENDDO
+  END SUBROUTINE vexx_sp_potential
+  !
+  !-----------------------------------------------------------------------
   SUBROUTINE vexx_gfast_pair( nrxxs, nbuf, ebuf, mp, psic, ns, si, sj, s0, np_, rho, omega_inv )
   !-----------------------------------------------------------------------
     !! The pair densities of slots s0+1 .. s0+np_: rho = (phi_j1 + i phi_j2) psi_i / omega
@@ -5593,7 +5713,7 @@ end associate
   !
   !-----------------------------------------------------------------------
   SUBROUTINE vexx_gfast_main( nrxxs, nbuf, ebuf, mp, psic, m, res, fac, ns, si, sj, sx, pblk, rho, &
-                              plan_full, plan_tail, single, sym, omega_inv )
+                              plan_full, plan_tail, single, sym, omega_inv, sp, rho_s, nr1, nr2, nr3, cmax )
   !-----------------------------------------------------------------------
     !! The pair loop of the batched Gamma-point operator, a block of slots at a time. A slot is
     !! (band i, buffer pair jp): rho = (phi_j1 + i phi_j2) psi_i holds two real pair densities, its
@@ -5601,12 +5721,13 @@ end associate
     !! sx(3:4,s) weigh psi_i into bands j1, j2 (the transposed term of a symmetric build).
     USE cufft
     IMPLICIT NONE
-    INTEGER, INTENT(IN) :: nrxxs, nbuf, mp, m, ns, pblk, plan_full, plan_tail
-    LOGICAL, INTENT(IN) :: single, sym
+    INTEGER, INTENT(IN) :: nrxxs, nbuf, mp, m, ns, pblk, plan_full, plan_tail, nr1, nr2, nr3, cmax
+    LOGICAL, INTENT(IN) :: single, sym, sp
     COMPLEX(DP), DEVICE, INTENT(IN) :: ebuf(nrxxs,nbuf), psic(nrxxs,mp)
     REAL(DP), DEVICE, INTENT(IN) :: fac(nrxxs), sx(4,ns)
     INTEGER, DEVICE, INTENT(IN) :: si(ns), sj(ns)
     COMPLEX(DP), DEVICE, INTENT(INOUT) :: rho(nrxxs,pblk)
+    COMPLEX(4), DEVICE, INTENT(INOUT) :: rho_s(nrxxs,*)      ! used when sp
     REAL(DP), DEVICE, INTENT(INOUT) :: res(nrxxs,m)
     REAL(DP), INTENT(IN) :: omega_inv
     INTEGER :: s0, np_, plan
@@ -5616,9 +5737,13 @@ end associate
        plan = plan_full
        IF ( np_ /= pblk ) plan = plan_tail
        CALL vexx_gfast_pair( nrxxs, nbuf, ebuf, mp, psic, ns, si, sj, s0, np_, rho, omega_inv )
-       CALL vexx_gfast_fft( nrxxs, np_, rho, plan, single, CUFFT_FORWARD )
-       CALL vexx_gfast_kern( nrxxs, np_, rho, fac )
-       CALL vexx_gfast_fft( nrxxs, np_, rho, plan, single, CUFFT_INVERSE )
+       IF ( sp ) THEN
+          CALL vexx_sp_potential( nrxxs, np_, rho, rho_s, fac, nr1, nr2, nr3, single, cmax )
+       ELSE
+          CALL vexx_gfast_fft( nrxxs, np_, rho, plan, single, CUFFT_FORWARD )
+          CALL vexx_gfast_kern( nrxxs, np_, rho, fac )
+          CALL vexx_gfast_fft( nrxxs, np_, rho, plan, single, CUFFT_INVERSE )
+       ENDIF
        CALL vexx_gfast_acc( nrxxs, nbuf, ebuf, mp, psic, m, res, ns, si, sj, sx, s0, np_, rho, sym )
     ENDDO
   END SUBROUTINE vexx_gfast_main
@@ -6083,7 +6208,7 @@ end associate
     COMPLEX(DP), INTENT(INOUT) :: hpsi(lda*npol,max_ibands)
     LOGICAL, INTENT(OUT) :: ok   ! .FALSE. when the device work arrays would not fit (nothing done)
     INTEGER :: nbe, ikb, cmax
-    LOGICAL :: us_ok
+    LOGICAL :: us_ok, sp
     !
     INTEGER, POINTER :: nl_d(:), nlm_d(:)
     attributes(DEVICE) :: nl_d, nlm_d
@@ -6125,6 +6250,9 @@ end associate
        pblk = MAX( 4, MIN( 128, NINT( 18.0E6_DP / ( 16.0_DP * DBLE(nrxxs) ) ) ) )
     ENDIF
     cmax = MAX( 1, NINT( 28.0E6_DP / ( 16.0_DP * DBLE(nrxxs) ) ) )
+    ! QE_EXX_SP: single-precision pair transforms in every build, or while the exchange energy still
+    ! changes by more than the threshold (never with ultrasoft augmentation)
+    sp = vexx_sp_now( .NOT. okvan )
     ! with ultrasoft augmentation the matrix products over the projectors dominate, and they want
     ! many pairs at a time: a whole band where a gigabyte of pair densities holds it (the batched
     ! transforms keep to L2-sized chunks of the block)
@@ -6154,6 +6282,12 @@ end associate
     ENDIF
     istat = 0
     IF ( .NOT. ALLOCATED(gf_psic_d) ) ALLOCATE( gf_psic_d(nrxxs,mp), gf_res_d(nrxxs,m), gf_rho_d(nrxxs,pblk), STAT=istat )
+    ! (the single-precision block is an argument of the pair loop: it exists, if only as one element)
+    IF ( ALLOCATED(p6_rhoc_s) .AND. sp ) THEN
+       IF ( SIZE(p6_rhoc_s,1) /= nrxxs .OR. SIZE(p6_rhoc_s,2) /= pblk ) DEALLOCATE( p6_rhoc_s )
+    ENDIF
+    IF ( istat == 0 .AND. sp .AND. .NOT. ALLOCATED(p6_rhoc_s) ) ALLOCATE( p6_rhoc_s(nrxxs,pblk), STAT=istat )
+    IF ( istat == 0 .AND. .NOT. ALLOCATED(p6_rhoc_s) ) ALLOCATE( p6_rhoc_s(1,1), STAT=istat )
     IF ( ALLOCATED(gf_fac_d) ) THEN
        IF ( SIZE(gf_fac_d) /= nrxxs .OR. SIZE(gf_facg_d) /= ngmt ) DEALLOCATE( gf_fac_d, gf_facg_d )
     ENDIF
@@ -6293,13 +6427,14 @@ end associate
        ENDIF
     ENDDO
     ! say which shape the Gamma operator takes (once, and again whenever it changes)
-    key = MERGE( 2, 0, sym ) + MERGE( 1, 0, single )
+    key = MERGE( 2, 0, sym ) + MERGE( 1, 0, single ) + MERGE( 4, 0, sp )
     IF ( key /= gf_banner_last ) THEN
        gf_banner_last = key
        why = 'all pairs'
        IF ( sym ) why = 'symmetric pairs (psi = buffered orbitals)'
        plans = 'batched'
        IF ( single ) plans = 'single-grid'
+       IF ( sp ) plans = TRIM(plans) // ' single-precision'
        WRITE( stdout, '(5X,"EXX-GPU: vexx takes the batched Gamma path; ",A,", ",A," cuFFT plans, block ",I0," of ",I0," slots for ",I0," bands")' ) &
             TRIM(why), TRIM(plans), MIN( pblk, MAX( ns, 1 ) ), ns, m
     ENDIF
@@ -6332,7 +6467,7 @@ end associate
           !$acc end host_data
        ELSE
           CALL vexx_gfast_main( nrxxs, nbuf, exxbuff_d(1,LBOUND(exxbuff_d,2),ikq), mp, gf_psic_d, m, gf_res_d, gf_fac_d, ns, gf_si_d, gf_sj_d, &
-                                gf_sx_d, bp, gf_rho_d, plan_full, plan_tail, single, sym, omega_inv )
+                                gf_sx_d, bp, gf_rho_d, plan_full, plan_tail, single, sym, omega_inv, sp, p6_rhoc_s, nr1, nr2, nr3, cmax )
        ENDIF
     ENDIF
     !
@@ -6382,6 +6517,7 @@ end associate
     hpsi(:,1:m) = p6_hpsi_d
     IF ( .NOT. gf_keep ) THEN
        DEALLOCATE( gf_psic_d, gf_res_d, gf_rho_d )
+       IF ( ALLOCATED(p6_rhoc_s) ) DEALLOCATE( p6_rhoc_s )
        IF ( ALLOCATED(gf_f_d) ) DEALLOCATE( gf_f_d, gf_u_d, gf_aug_d, gf_vcg_d, gf_wb_d, gf_t_d, gf_cb_d )
     ENDIF
     CALL stop_clock( 'vexx_g_fin' )
@@ -7262,6 +7398,7 @@ end associate
     IF ( ALLOCATED(gf_fac_d) ) DEALLOCATE( gf_fac_d, gf_facg_d )
     IF ( ALLOCATED(gf_si_h) ) DEALLOCATE( gf_si_h, gf_sj_h, gf_sx_h, gf_si_d, gf_sj_d, gf_sx_d )
     IF ( ALLOCATED(ka_acc_d) ) DEALLOCATE( ka_acc_d, ka_h_d, ka_rir_d )
+    IF ( ALLOCATED(ka_fac_d) ) DEALLOCATE( ka_fac_d )
     IF ( ALLOCATED(ka_si_h) ) DEALLOCATE( ka_si_h, ka_sj_h, ka_sw_h, ka_si_d, ka_sj_d, ka_sw_d )
     IF ( ALLOCATED(ku_f_d) ) DEALLOCATE( ku_f_d, ku_u_d, ku_aug_d, ku_vcg_d, ku_cb_d, ku_wb_d, ku_t_d, ku_bq_d, ku_dx_d, ku_bpsi_d, &
                                          ku_dpaw_d, ku_eigq_d )
