@@ -124,6 +124,9 @@ MODULE exx_bp
   COMPLEX(DP), ALLOCATABLE, DEVICE :: ku_f_d(:,:), ku_u_d(:,:), ku_aug_d(:,:), ku_vcg_d(:,:), ku_cb_d(:,:), ku_wb_d(:,:), &
                                        ku_t_d(:,:), ku_bq_d(:,:), ku_dx_d(:,:,:), ku_bpsi_d(:,:,:), ku_dpaw_d(:,:,:), &
                                        ku_eigq_d(:)
+  COMPLEX(DP), ALLOCATABLE :: gf_vkb(:,:)
+  !! the projectors of one k-point, kept on the device (OpenACC): init_us_2 fills a device-resident
+  !! array in place, with no copy to the host and back
   INTEGER :: gf_ntu = 0
   INTEGER, ALLOCATABLE :: gf_tkb0(:), gf_tnkb(:), gf_tq0(:), gf_tnq(:)
   !! the ultrasoft species: first projector - 1, projectors, first Q column - 1, Q columns
@@ -4548,7 +4551,7 @@ end associate
     IF ( .NOT. ALLOCATED(p18_becxx_d) ) need = need + 16_8*INT(nkb,8)*INT(nbnd,8)*INT(nkqs_d,8)
     IF ( .NOT. ALLOCATED(p18_sf_d) ) need = need + 16_8*INT(ngmt,8)*INT(nat,8)
     IF ( .NOT. ALLOCATED(p18_qgm_acc) ) need = need + 16_8*INT(ngmt,8)*INT(p18_nij,8)
-    IF ( .NOT. ALLOCATED(p18_vkb_d) ) need = need + 16_8*INT(npwx,8)*INT(nkb,8)
+    IF ( .NOT. ALLOCATED(gf_vkb) ) need = need + 16_8*INT(npwx,8)*INT(nkb,8)
     istat = cudaMemGetInfo( free_, total_ )
     IF ( istat == 0 .AND. need + 268435456_8 > free_ ) THEN
        WRITE( stdout, '(5X,"EXX-GPU: the ultrasoft augmentation of the all-k exchange build would need ",I0," MB of device memory, ",I0," MB are free: V_x is applied k-point by k-point")' ) &
@@ -4601,10 +4604,6 @@ end associate
        ALLOCATE( p18_qgm_acc(ngmt,p18_nij) )
        !$acc enter data create( p18_qgm_acc )
     ENDIF
-    IF ( ALLOCATED(p18_vkb_h) ) THEN
-       IF ( SIZE(p18_vkb_h,1) /= npwx .OR. SIZE(p18_vkb_h,2) /= nkb ) DEALLOCATE( p18_vkb_h, p18_vkb_d )
-    ENDIF
-    IF ( .NOT. ALLOCATED(p18_vkb_h) ) ALLOCATE( p18_vkb_h(npwx,nkb), p18_vkb_d(npwx,nkb) )
     !
     IF ( ku_build /= p6_nbuild ) THEN
        ! ... structure factors e^{-iG.tau} on the EXX G list, <beta|phi> of every k+q orbital
@@ -4939,13 +4938,11 @@ end associate
        ENDIF
        IF ( us ) THEN
           ! <beta|psi> of this k from the device copies, and its agreement with the buffered <beta|phi>
-          CALL start_clock( 'p18_vkb' )
-          p18_vkb_h = ( 0.0_DP, 0.0_DP )
-          CALL init_us_2( npw, igk_exx(1:npw,ik), xk(:,ik), p18_vkb_h )
-          p18_vkb_d = p18_vkb_h
-          CALL stop_clock( 'p18_vkb' )
-          CALL MYZGEMM( 'C', 'N', nkb, m, npw, (1.0_DP,0.0_DP), p18_vkb_d, npwx, p6_psi_d, lda*npol, (0.0_DP,0.0_DP), &
+          CALL vexx_us_vkb( npw, ik, xk(:,ik) )
+          !$acc host_data use_device( gf_vkb )
+          CALL MYZGEMM( 'C', 'N', nkb, m, npw, (1.0_DP,0.0_DP), gf_vkb, npwx, p6_psi_d, lda*npol, (0.0_DP,0.0_DP), &
                         ku_bpsi_d(1,1,ik), nkb )
+          !$acc end host_data
           ikq = ikq0(ik)
           dmax = 0.0_DP
           bmax = 0.0_DP
@@ -5264,13 +5261,11 @@ end associate
                 IF ( ABS( ku_dx_d(ikb,ib,ik) ) < eps_occ ) ku_dx_d(ikb,ib,ik) = ( 0.0_DP, 0.0_DP )
              ENDDO
           ENDDO
-          CALL start_clock( 'p18_vkb' )
-          p18_vkb_h = ( 0.0_DP, 0.0_DP )
-          CALL init_us_2( npw, igk_exx(1:npw,ik), xk(:,ik), p18_vkb_h )
-          p18_vkb_d = p18_vkb_h
-          CALL stop_clock( 'p18_vkb' )
-          CALL MYZGEMM( 'N', 'N', npw, m, nkb, CMPLX(-exxalfa,0.0_DP,KIND=DP), p18_vkb_d, npwx, ku_dx_d(1,1,ik), nkb, &
+          CALL vexx_us_vkb( npw, ik, xk(:,ik) )
+          !$acc host_data use_device( gf_vkb )
+          CALL MYZGEMM( 'N', 'N', npw, m, nkb, CMPLX(-exxalfa,0.0_DP,KIND=DP), gf_vkb, npwx, ku_dx_d(1,1,ik), nkb, &
                         (1.0_DP,0.0_DP), ka_h_d(1,1,ik), npwx )
+          !$acc end host_data
        ENDDO
        DEALLOCATE( eigq_h )
     ENDIF
@@ -5282,6 +5277,16 @@ end associate
        vx(1:npwx,1:m,ik) = p6_hpsi_d(1:npwx,1:m)
     ENDDO
     DEALLOCATE( ikq0, st, tk, inv_ok, seg, ord )
+    ! the work arrays of a small system stay for the next build, those of a large one are returned
+    need = 48_8*INT(nrxxs,8)*INT(m,8) + 16_8*INT(nrxxs,8)*INT(pblk,8) + 16_8*INT(npwx,8)*INT(m,8)*INT(nks,8)
+    IF ( us ) need = need + 32_8*INT(ngmt,8)*INT(nkb,8)
+    IF ( need > 536870912_8 ) THEN
+       DEALLOCATE( ka_acc_d, ka_h_d, ka_rir_d, p6_psic_d, p6_res_d, p6_rhoc_d )
+       IF ( us ) THEN
+          DEALLOCATE( ku_f_d, ku_u_d, ku_aug_d, ku_vcg_d, ku_cb_d, ku_wb_d, ku_t_d, ku_bq_d, ku_dx_d, ku_bpsi_d, ku_dpaw_d, ku_eigq_d )
+          ku_build = -1
+       ENDIF
+    ENDIF
     ok = .TRUE.
     CALL stop_clock( 'vexx_ka_fin' )
     !
@@ -5682,6 +5687,33 @@ end associate
   END SUBROUTINE vexx_gfast_main_us
   !
   !-----------------------------------------------------------------------
+  SUBROUTINE vexx_us_vkb( npw, ik, xkp )
+  !-----------------------------------------------------------------------
+    !! The projectors of k-point ik (the ordering of igk_exx, as add_nlxx_pot uses) into gf_vkb,
+    !! on the device only: rows 1 .. npw of the device copy are set, the host copy is not.
+    USE wvfct,         ONLY : npwx
+    USE uspp,          ONLY : nkb
+    USE uspp_init,     ONLY : init_us_2
+    USE exx_bp_utils,  ONLY : igk_exx
+    IMPLICIT NONE
+    INTEGER, INTENT(IN) :: npw, ik
+    REAL(DP), INTENT(IN) :: xkp(3)
+    CALL start_clock( 'p18_vkb' )
+    IF ( ALLOCATED(gf_vkb) ) THEN
+       IF ( SIZE(gf_vkb,1) /= npwx .OR. SIZE(gf_vkb,2) /= nkb ) THEN
+          !$acc exit data delete( gf_vkb )
+          DEALLOCATE( gf_vkb )
+       ENDIF
+    ENDIF
+    IF ( .NOT. ALLOCATED(gf_vkb) ) THEN
+       ALLOCATE( gf_vkb(npwx,nkb) )
+       !$acc enter data create( gf_vkb )
+    ENDIF
+    CALL init_us_2( npw, igk_exx(1:npw,ik), xkp, gf_vkb, .TRUE. )
+    CALL stop_clock( 'p18_vkb' )
+  END SUBROUTINE vexx_us_vkb
+  !
+  !-----------------------------------------------------------------------
   SUBROUTINE vexx_us_species()
   !-----------------------------------------------------------------------
     !! The layout of the ultrasoft species for the matrix products of the augmentation: first
@@ -5758,7 +5790,7 @@ end associate
     ELSE IF ( SIZE(gf_f_d,1) /= ngmt .OR. SIZE(gf_f_d,2) /= nkb .OR. SIZE(gf_aug_d,2) /= 2*pblk ) THEN
        need = need + 32_8*INT(ngmt,8)*INT(nkb,8) + 64_8*INT(ngmt,8)*INT(pblk,8) + 8_8*INT(p18_nij,8)*INT(nkb,8)
     ENDIF
-    IF ( .NOT. ALLOCATED(p18_vkb_d) ) need = need + 16_8*INT(npwx,8)*INT(nkb,8)
+    IF ( .NOT. ALLOCATED(gf_vkb) ) need = need + 16_8*INT(npwx,8)*INT(nkb,8)
     IF ( .NOT. ALLOCATED(p18_sf_d) ) need = need + 16_8*INT(ngmt,8)*INT(nat,8)
     IF ( .NOT. ALLOCATED(p18_qgm_acc) ) need = need + 16_8*INT(ngmt,8)*INT(p18_nij,8)
     IF ( .NOT. ALLOCATED(gf_bec_d) ) need = need + 8_8*INT(nkb,8)*INT(nbe + 2*m + nkb + 4*pblk,8)
@@ -5884,17 +5916,11 @@ end associate
     !
     ! ... projectors of this k (the ordering of igk_exx, as add_nlxx_pot uses) and <beta|psi> from the
     !     device copies (calbec at Gamma: twice the real part, the G = 0 term once)
-    IF ( ALLOCATED(p18_vkb_h) ) THEN
-       IF ( SIZE(p18_vkb_h,1) /= npwx .OR. SIZE(p18_vkb_h,2) /= nkb ) DEALLOCATE( p18_vkb_h, p18_vkb_d )
-    ENDIF
-    IF ( .NOT. ALLOCATED(p18_vkb_h) ) ALLOCATE( p18_vkb_h(npwx,nkb), p18_vkb_d(npwx,nkb) )
-    CALL start_clock( 'p18_vkb' )
-    p18_vkb_h = ( 0.0_DP, 0.0_DP )
-    CALL init_us_2( n, igk_exx(1:n,current_k), xkp, p18_vkb_h )
-    p18_vkb_d = p18_vkb_h
-    CALL stop_clock( 'p18_vkb' )
-    CALL MYDGEMM( 'T', 'N', nkb, m, 2*n, 2.0_DP, p18_vkb_d, 2*npwx, p6_psi_d, 2*lda, 0.0_DP, gf_becpsi_d, nkb )
-    IF ( gstart == 2 ) CALL MYDGER( nkb, m, -1.0_DP, p18_vkb_d, 2*npwx, p6_psi_d, 2*lda, gf_becpsi_d, nkb )
+    CALL vexx_us_vkb( n, current_k, xkp )
+    !$acc host_data use_device( gf_vkb )
+    CALL MYDGEMM( 'T', 'N', nkb, m, 2*n, 2.0_DP, gf_vkb, 2*npwx, p6_psi_d, 2*lda, 0.0_DP, gf_becpsi_d, nkb )
+    IF ( gstart == 2 ) CALL MYDGER( nkb, m, -1.0_DP, gf_vkb, 2*npwx, p6_psi_d, 2*lda, gf_becpsi_d, nkb )
+    !$acc end host_data
     !
     ! ... the exchange D matrix starts from the PAW one-centre term, D b_psi
     IF ( okpaw ) THEN
@@ -6097,6 +6123,7 @@ end associate
           ok = .FALSE.
           RETURN
        ENDIF
+       gf_keep = gf_keep .AND. ( 32_8*INT(ngmt,8)*INT(nkb,8) <= 536870912_8 )
        IF ( sym ) THEN
           ! the projections of the two sets must agree as well
           dmax = 0.0_DP
@@ -6233,13 +6260,18 @@ end associate
              IF ( ABS( gf_deexx_d(ikb,i) ) < eps_occ ) gf_deexx_d(ikb,i) = 0.0_DP
           ENDDO
        ENDDO
-       CALL MYDGEMM( 'N', 'N', 2*n, m, nkb, -exxalfa, p18_vkb_d, 2*SIZE(p18_vkb_d,1), gf_deexx_d, nkb, 1.0_DP, p6_hpsi_d, 2*lda*npol )
+       !$acc host_data use_device( gf_vkb )
+       CALL MYDGEMM( 'N', 'N', 2*n, m, nkb, -exxalfa, gf_vkb, 2*SIZE(gf_vkb,1), gf_deexx_d, nkb, 1.0_DP, p6_hpsi_d, 2*lda*npol )
+       !$acc end host_data
     ENDIF
     CALL stop_clock( 'vexx_g_main' )
     !
     CALL start_clock( 'vexx_g_fin' )
     hpsi(:,1:m) = p6_hpsi_d
-    IF ( .NOT. gf_keep ) DEALLOCATE( gf_psic_d, gf_res_d, gf_rho_d )
+    IF ( .NOT. gf_keep ) THEN
+       DEALLOCATE( gf_psic_d, gf_res_d, gf_rho_d )
+       IF ( ALLOCATED(gf_f_d) ) DEALLOCATE( gf_f_d, gf_u_d, gf_aug_d, gf_vcg_d, gf_wb_d, gf_t_d, gf_cb_d )
+    ENDIF
     CALL stop_clock( 'vexx_g_fin' )
     !
   END SUBROUTINE vexx_bp_gamma_gpu_fast
@@ -7125,6 +7157,10 @@ end associate
     IF ( ALLOCATED(gf_f_d) ) DEALLOCATE( gf_f_d, gf_u_d, gf_aug_d, gf_vcg_d, gf_wb_d, gf_t_d, gf_cb_d )
     IF ( ALLOCATED(gf_becpsi_d) ) DEALLOCATE( gf_becpsi_d, gf_deexx_d )
     IF ( ALLOCATED(gf_bec_d) ) DEALLOCATE( gf_bec_d, gf_dpaw_d )
+    IF ( ALLOCATED(gf_vkb) ) THEN
+       !$acc exit data delete( gf_vkb )
+       DEALLOCATE( gf_vkb )
+    ENDIF
     gf_us_build = -1
     CALL p18_release()   ! P18
   END SUBROUTINE p15_release_work_arrays
@@ -7134,7 +7170,7 @@ end associate
   LOGICAL FUNCTION exx_stress_fast_path()
   !-----------------------------------------------------------------------
     !! P17: can the exchange stress be computed on the device? The conditions of the vexx fast path
-    !! (norm-conserving, collinear, k-points, one band group, serial unpadded EXX grid), one pool, and
+    !! (norm-conserving, collinear, k-points or Gamma, one band group, serial unpadded EXX grid), one pool, and
     !! the analytic Coulomb kernels (the vcut kernels are host tables).
     USE uspp,           ONLY : okvan
     USE paw_variables,  ONLY : okpaw
@@ -7156,7 +7192,7 @@ end associate
        ENDIF
        checked = .TRUE.
     ENDIF
-    exx_stress_fast_path = use_gpu .AND. (.NOT. env_off) .AND. (.NOT. gamma_only) .AND. (.NOT. noncolin) &
+    exx_stress_fast_path = use_gpu .AND. (.NOT. env_off) .AND. (.NOT. noncolin) &
          .AND. (.NOT. okvan) .AND. (.NOT. okpaw) .AND. (negrp == 1) .AND. (npool == 1) &
          .AND. (.NOT. use_coulomb_vcut_ws) .AND. (.NOT. use_coulomb_vcut_spheric) &
          .AND. (dfftt%nproc == 1) .AND. (x_nbnd_occ > 0) &
@@ -7166,7 +7202,6 @@ end associate
        why = ''
        IF ( .NOT. use_gpu ) why = TRIM(why) // ' no-gpu'
        IF ( env_off ) why = TRIM(why) // ' QE_EXX_STRESS=0'
-       IF ( gamma_only ) why = TRIM(why) // ' gamma_only'
        IF ( noncolin ) why = TRIM(why) // ' noncolin'
        IF ( okvan ) why = TRIM(why) // ' ultrasoft'
        IF ( okpaw ) why = TRIM(why) // ' PAW'
@@ -7192,6 +7227,9 @@ end associate
     !! independent components of Q(a,b;G) = q_a q_b fac_stress(G)/2 - delta_ab fac(G), the same kernel
     !! branches as the host loop. Sums are double precision. ok = .FALSE. means nothing was done (no
     !! device memory): the caller then runs the host routine.
+    !! At Gamma the buffer holds two real orbitals per entry, phi_1 + i phi_2: one transform gives the
+    !! two real pair densities, separated on the G half sphere as (rho(G) +- conj(rho(-G)))/2, and
+    !! the kernels count G and -G (the Gamma tricks of the host loop).
     USE cufft
     USE cublas
     USE cudafor,        ONLY : cudaMemGetInfo
@@ -7214,8 +7252,11 @@ end associate
     REAL(DP), INTENT(OUT) :: sigma(3,3)
     LOGICAL, INTENT(OUT) :: ok
     !
-    INTEGER, POINTER :: nl_d(:)
-    attributes(DEVICE) :: nl_d
+    INTEGER, POINTER :: nl_d(:), nlm_d(:)
+    attributes(DEVICE) :: nl_d, nlm_d
+    COMPLEX(DP) :: c1, c2
+    INTEGER :: ncol
+    REAL(DP) :: gam
     COMPLEX(DP), ALLOCATABLE, DEVICE :: evc_d(:), psic_d(:), rhoc_d(:,:)
     REAL(DP), ALLOCATABLE, DEVICE :: gtl_d(:,:), qmat_d(:,:), a_d(:,:), s_d(:,:), xw_d(:), sig_d(:)
     INTEGER, ALLOCATABLE, DEVICE :: il_d(:)
@@ -7248,7 +7289,7 @@ end associate
        pblk = MIN( x_nbnd_occ, MAX( 8, MIN( 128, pblk ) ) )
     ENDIF
     ! ... P15-style pre-check of the device work arrays
-    need = 16_8*INT(nrxxs,8)*INT(pblk,8) + 8_8*INT(ngmt,8)*INT(pblk,8) + 16_8*INT(nrxxs,8) &
+    need = 16_8*INT(nrxxs,8)*INT(pblk,8) + 16_8*INT(ngmt,8)*INT(pblk,8) + 16_8*INT(nrxxs,8) &
          + 72_8*INT(ngmt,8) + 16_8*INT(npwx,8) + 64_8*INT(pblk,8) + 12_8*INT(nbuf,8) + 64_8
     istat = cudaMemGetInfo( free_, total_ )
     IF ( istat == 0 .AND. need + 268435456_8 > free_ ) THEN
@@ -7257,8 +7298,8 @@ end associate
        RETURN
     ENDIF
     istat = 0
-    ALLOCATE( rhoc_d(nrxxs,pblk), a_d(ngmt,pblk), psic_d(nrxxs), evc_d(npwx), gtl_d(3,ngmt), qmat_d(6,ngmt), &
-              s_d(6,pblk), il_d(nbuf), xw_d(nbuf), sig_d(6), STAT=istat )
+    ALLOCATE( rhoc_d(nrxxs,pblk), a_d(ngmt,2*pblk), psic_d(nrxxs), evc_d(npwx), gtl_d(3,ngmt), qmat_d(6,ngmt), &
+              s_d(6,2*pblk), il_d(nbuf), xw_d(2*nbuf), sig_d(6), STAT=istat )
     IF ( istat /= 0 ) THEN
        IF ( ALLOCATED(rhoc_d) ) DEALLOCATE( rhoc_d )
        IF ( ALLOCATED(a_d) ) DEALLOCATE( a_d )
@@ -7273,11 +7314,14 @@ end associate
        WRITE( stdout, '(5X,"EXX-GPU: exchange stress on the host routine (P17); device-memory (allocation failed)")' )
        RETURN
     ENDIF
-    ALLOCATE( il_h(nbuf), xw_h(nbuf) )
+    ALLOCATE( il_h(nbuf), xw_h(2*nbuf) )
     !
     CALL transform_evc_to_exx( 0 )
     !
     nl_d => dfftt%nl_d
+    IF ( gamma_only ) nlm_d => dfftt%nlm_d
+    gam = 1.0_DP
+    IF ( gamma_only ) gam = 2.0_DP        ! G and -G of the half sphere
     gtl_d = gt(1:3,1:ngmt)
     ! ... plans (the P6 cache; pinned for this call)
     p6_plan_pinned = 0
@@ -7316,15 +7360,31 @@ end associate
           xq1 = xkq_collect(1,ikq); xq2 = xkq_collect(2,ikq); xq3 = xkq_collect(3,ikq)
           ! ... the occupied k+q orbitals of this q (the host loop's threshold)
           ni = 0
+          IF ( gamma_only ) THEN
+             ! buffer entries (band pairs) with an occupied band, and the occupations of the two
+             DO ibnd = 1, nbuf
+                IF ( 2*ibnd - 1 > nbnd ) EXIT
+                w = 0.0_DP
+                IF ( 2*ibnd <= nbnd ) w = x_occupation(2*ibnd,ik)
+                IF ( ABS( x_occupation(2*ibnd-1,ik) ) < eps_occ .AND. ABS( w ) < eps_occ ) CYCLE
+                ni = ni + 1
+                il_h(ni) = ibnd
+                xw_h(2*ni-1) = x_occupation(2*ibnd-1,ik)
+                xw_h(2*ni)   = w
+             ENDDO
+             ncol = 2
+          ELSE
           DO ibnd = 1, MIN( nbuf, nbnd )
              IF ( ABS( x_occupation(ibnd,ik) ) < 1.d-6 ) CYCLE
              ni = ni + 1
              il_h(ni) = ibnd
              xw_h(ni) = x_occupation(ibnd,ik)
           ENDDO
+             ncol = 1
+          ENDIF
           IF ( ni == 0 ) CYCLE
           il_d(1:ni) = il_h(1:ni)
-          xw_d(1:ni) = xw_h(1:ni)
+          xw_d(1:ncol*ni) = xw_h(1:ncol*ni)
           !
           ! ... Q(1:6,G): xx, yy, zz, xy, xz, yz of q_a q_b fac_stress/2 - delta_ab fac, the host branches
           !$cuf kernel do (1)
@@ -7346,8 +7406,8 @@ end associate
              qq = q1*q1 + q2*q2 + q3*q3
              gf = gfac_
              IF ( gau_ > 0.0_DP ) THEN
-                f  = e2_ * ( (pi_/gau_)**1.5_DP ) * EXP( -qq/4.0_DP/gau_ ) * gf
-                fs = e2_ * 2.0_DP/4.0_DP/gau_ * EXP( -qq/4.0_DP/gau_ ) * ( (pi_/gau_)**1.5_DP ) * gf
+                f  = e2_ * ( (pi_/gau_)**1.5_DP ) * EXP( -qq/4.0_DP/gau_ ) * gf * gam
+                fs = e2_ * 2.0_DP/4.0_DP/gau_ * EXP( -qq/4.0_DP/gau_ ) * ( (pi_/gau_)**1.5_DP ) * gf * gam
                 IF ( odg1 .AND. odg2 .AND. odg3 ) THEN
                    f = 0.0_DP; fs = 0.0_DP
                 ENDIF
@@ -7359,6 +7419,8 @@ end associate
                    f  = e2_*fpi_/( qq + yuk_ ) * gf
                    fs = 2.0_DP * e2_*fpi_/( qq + yuk_ )**2 * gf
                 ENDIF
+                f = f * gam
+                fs = fs * gam
                 IF ( odg1 .AND. odg2 .AND. odg3 ) THEN
                    f = 0.0_DP; fs = 0.0_DP
                 ENDIF
@@ -7393,6 +7455,12 @@ end associate
              DO ig = 1, npw
                 psic_d( nl_d( igk_exx_d(ig,ikk) ) ) = evc_d(ig)
              ENDDO
+             IF ( gamma_only ) THEN
+                !$cuf kernel do (1)
+                DO ig = 1, npw
+                   psic_d( nlm_d( igk_exx_d(ig,ikk) ) ) = CONJG( evc_d(ig) )
+                ENDDO
+             ENDIF
              istat = cufftExecZ2Z( plan_one, psic_d, psic_d, CUFFT_INVERSE )
              IF ( istat /= 0 ) CALL errore( 'exx_stress_gpu', 'cuFFT exec failed', ABS(istat) )
              !
@@ -7410,17 +7478,30 @@ end associate
                 ENDDO
                 istat = cufftExecZ2Z( plan, rhoc_d(1,1), rhoc_d(1,1), CUFFT_FORWARD )
                 IF ( istat /= 0 ) CALL errore( 'exx_stress_gpu', 'cuFFT exec failed', ABS(istat) )
+                IF ( gamma_only ) THEN
+                   ! the two real pair densities of each entry, |rho_1(G)|^2 and |rho_2(G)|^2
+                   !$cuf kernel do (2)
+                   DO ip = 1, np_
+                      DO ig = 1, ngmt
+                         c1 = rhoc_d(nl_d(ig),ip)
+                         c2 = CONJG( rhoc_d(nlm_d(ig),ip) )
+                         a_d(ig,2*ip-1) = 0.25_DP * ( DBLE( c1 + c2 )**2 + AIMAG( c1 + c2 )**2 )
+                         a_d(ig,2*ip)   = 0.25_DP * ( DBLE( c1 - c2 )**2 + AIMAG( c1 - c2 )**2 )
+                      ENDDO
+                   ENDDO
+                ELSE
                 !$cuf kernel do (2)
                 DO ip = 1, np_
                    DO ig = 1, ngmt
                       a_d(ig,ip) = DBLE( rhoc_d(nl_d(ig),ip) )**2 + AIMAG( rhoc_d(nl_d(ig),ip) )**2
                    ENDDO
                 ENDDO
-                CALL DGEMM( 'N', 'N', 6, np_, ngmt, 1.0_DP, qmat_d, 6, a_d, ngmt, 0.0_DP, s_d, 6 )
+                ENDIF
+                CALL DGEMM( 'N', 'N', 6, ncol*np_, ngmt, 1.0_DP, qmat_d, 6, a_d, ngmt, 0.0_DP, s_d, 6 )
                 !$cuf kernel do (1)
                 DO ic = 1, 6
-                   DO ip = 1, np_
-                      sig_d(ic) = sig_d(ic) + w * s_d(ic,ip) * xw_d(p0+ip-1)
+                   DO ip = 1, ncol*np_
+                      sig_d(ic) = sig_d(ic) + w * s_d(ic,ip) * xw_d(ncol*(p0-1)+ip)
                    ENDDO
                 ENDDO
              ENDDO

@@ -850,11 +850,17 @@ MODULE exx
       ! |xi> = Vx[phi]|phi>
       CALL vexx( nnpw, nnpw, nbndproj, phi, xitmp, becpsi )
       ! mexx = <phi|Vx[phi]|phi>
+      IF ( .NOT. use_gpu ) &
       CALL matcalc( 'exact', .TRUE., 0, nnpw, nbndproj, nbndproj, phi, xitmp, mexx, exxe )
       ! |xi> = -One * Vx[phi]|phi> * rmexx^T
     ENDIF  
     !
-    CALL aceupdate( nbndproj, nnpw, xitmp, mexx )
+    IF ( use_gpu .AND. .NOT. DoLoc ) THEN
+       ! the two steps above and below with the device BLAS
+       CALL aceupdate_gpu( nnpw, nnpw, phi, xitmp, exxe, .TRUE. )
+    ELSE
+       CALL aceupdate( nbndproj, nnpw, xitmp, mexx )
+    ENDIF
     !
     DEALLOCATE( mexx )  
     !
@@ -1044,6 +1050,85 @@ MODULE exx
     !
   END SUBROUTINE vexxace_gamma_gpu
   !
+  !-----------------------------------------------------------------------------------------
+  SUBROUTINE aceupdate_gpu( ld, nnpw, phi, xitmp, exxe, update )
+    !---------------------------------------------------------------------------------------
+    !! The matrix <phi|Vx[phi]|phi> with its energy (matcalc, matcalc_k) and the ACE projectors
+    !! |xi> = Vx[phi]|phi> L^-H, with -<phi|Vx|phi> = L L^H (aceupdate, aceupdate_k), by the device
+    !! BLAS: the two products over plane waves are the cost of an ACE build after V_x itself,
+    !! and the host BLAS of a GPU build need not be an optimised one. The factorisation and
+    !! inversion of the nbndproj x nbndproj matrix stay on the host.
+    !
+    USE wvfct,    ONLY : current_k
+#if defined(__CUDA)
+    USE cublas
+#endif
+    !
+    IMPLICIT NONE
+    !
+    INTEGER, INTENT(IN) :: ld
+    !! leading dimension of phi and xitmp (npwx*npol; the number of PW at Gamma)
+    INTEGER, INTENT(IN) :: nnpw
+    !! number of PW
+    COMPLEX(DP), INTENT(IN) :: phi(ld,nbndproj)
+    !! wave functions
+    COMPLEX(DP), INTENT(INOUT) :: xitmp(ld,nbndproj)
+    !! Vx[phi]|phi> on input, xi on output
+    REAL(DP), INTENT(OUT) :: exxe
+    !! exx energy
+    LOGICAL, INTENT(IN) :: update
+    !! if FALSE only the energy is computed (k-points of zero weight)
+    !
+    ! ... local variables
+    !
+    COMPLEX(DP), ALLOCATABLE :: phi_d(:,:), x_d(:,:), c_d(:,:), cmexx(:,:)
+    REAL(DP), ALLOCATABLE :: r_d(:,:), rmexx(:,:)
+#if defined(__CUDA)
+    ATTRIBUTES(DEVICE) :: phi_d, x_d, c_d, r_d
+#endif
+    REAL(DP), PARAMETER :: Zero=0._DP, One=1._DP
+    !
+#if defined(__CUDA)
+    ALLOCATE( phi_d(ld,nbndproj), x_d(ld,nbndproj), c_d(nbndproj,nbndproj), cmexx(nbndproj,nbndproj) )
+    phi_d = phi(:,1:nbndproj)
+    x_d = xitmp
+    IF ( gamma_only ) THEN
+       ALLOCATE( r_d(nbndproj,nbndproj), rmexx(nbndproj,nbndproj) )
+       CALL matcalc_gpu( 'exact', .TRUE., 0, ld, nbndproj, nbndproj, phi_d, x_d, r_d, exxe )
+       rmexx = r_d
+       IF ( update ) THEN
+          CALL start_clock( 'aceupdate' )
+          ! rmexx = -(Cholesky(rmexx))^-1
+          rmexx = -rmexx
+          CALL MatChol( nbndproj, rmexx )
+          CALL MatInv( 'L', nbndproj, rmexx )
+          cmexx = (One,Zero)*rmexx
+       ENDIF
+       DEALLOCATE( r_d, rmexx )
+    ELSE
+       CALL matcalc_k_gpu( 'exact', .TRUE., 0, current_k, ld, nbndproj, nbndproj, phi_d, x_d, c_d, exxe )
+       cmexx = c_d
+       IF ( update ) THEN
+          CALL start_clock( 'aceupdate' )
+          ! mexx = -(Cholesky(mexx))^-1
+          cmexx = -cmexx
+          CALL invchol_k( nbndproj, cmexx )
+       ENDIF
+    ENDIF
+    IF ( update ) THEN
+       ! |xi> = -One * Vx[phi]|phi> * mexx^T
+       c_d = cmexx
+       CALL ZTRMM( 'R', 'L', 'C', 'N', ld, nbndproj, (One,Zero), c_d, nbndproj, x_d, ld )
+       xitmp = x_d
+       CALL stop_clock( 'aceupdate' )
+    ENDIF
+    DEALLOCATE( phi_d, x_d, c_d, cmexx )
+#else
+    CALL errore( 'aceupdate_gpu', 'called in a build without CUDA', 1 )
+#endif
+    !
+  END SUBROUTINE aceupdate_gpu
+  !
   !
   !-------------------------------------------------------------------------------------------
   SUBROUTINE aceupdate( nbndproj, nnpw, xitmp, rmexx )
@@ -1140,6 +1225,7 @@ MODULE exx
       ! |xi> = Vx[phi]|phi>
       IF ( .NOT. have_vx ) CALL vexx( npwx, nnpw, nbndproj, phi, xitmp, becpsi )
       ! mexx = <phi|Vx[phi]|phi>
+      IF ( .NOT. use_gpu ) &
       CALL matcalc_k( 'exact', .TRUE., 0, current_k, npwx*npol, nbndproj, nbndproj, &
                       phi, xitmp, mexx, exxe )
     ENDIF
@@ -1147,8 +1233,11 @@ MODULE exx
       WRITE( stdout,'(3(A,I3),A,I9,A,f12.6)') 'aceinit_k: nbnd=', nbnd, ' nbndproj=',nbndproj, &
                                               ' k=',current_k,' npw=',nnpw,' Ex(k)=',exxe
 #endif
+    IF ( use_gpu .AND. .NOT. DoLoc ) THEN
+      ! the matrix and the update with the device BLAS (the update skipped at zero weight, as below)
+      CALL aceupdate_gpu( npwx*npol, nnpw, phi, xitmp, exxe, wk(current_k)/=0._dp )
+    ELSE IF(wk(current_k)/=0._dp)THEN
     ! Skip k-points that have exactly zero weight
-    IF(wk(current_k)/=0._dp)THEN
       ! |xi> = -One * Vx[phi]|phi> * rmexx^T
       CALL aceupdate_k( nbndproj, nnpw, xitmp, mexx )
     ENDIF
