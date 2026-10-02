@@ -99,7 +99,9 @@ MODULE exx_bp
   LOGICAL :: p6_env_off = .FALSE.
   !! QE_EXX_FAST=0: every batched operator is switched off
   INTEGER :: gf_sym_mode = 1
-  !! QE_EXX_SYM: 1 (default) each unordered orbital pair is transformed once when psi is the buffered set, 0 never
+  !! QE_EXX_SYM: 1 (default) each unordered orbital pair is transformed once when psi is the buffered set, 0 never;
+  !! 2: as 1, and the Gamma operator always takes the orbital buffer as the real-space psi of such a call (what
+  !! it does by itself when the device is short of memory)
   INTEGER :: gf_fft1_mode = -1
   !! QE_EXX_FFT1: 1 single-grid cuFFT plans, 0 batched plans, -1 (default) chosen by the grid size
   INTEGER :: ku_env_mode = -1
@@ -3722,6 +3724,7 @@ end associate
        CALL GET_ENVIRONMENT_VARIABLE( 'QE_EXX_SYM', val, lenv, stat )
        IF (stat == 0 .AND. lenv > 0) THEN
           IF ( val(1:1) == '0' .OR. p14_is_off( val ) ) gf_sym_mode = 0
+          IF ( val(1:1) == '2' ) gf_sym_mode = 2
        ENDIF
        CALL GET_ENVIRONMENT_VARIABLE( 'QE_EXX_FFT1', val, lenv, stat )
        IF (stat == 0 .AND. lenv > 0) THEN
@@ -5501,6 +5504,47 @@ end associate
   END SUBROUTINE vexx_gfast_fft
   !
   !-----------------------------------------------------------------------
+  SUBROUTINE vexx_gfast_psi2r( nrxxs, ld, n, m, mp, bw, ik, psi, nl, nlm, psic, plan_full, plan_tail, single )
+  !-----------------------------------------------------------------------
+    !! The m bands psi in real space on the EXX grid, two bands per transform: psic(:,ip) holds
+    !! band 2 ip - 1 in its real part and band 2 ip in its imaginary part.
+    USE cufft
+    USE exx_bp_utils, ONLY : igk_exx_d
+    IMPLICIT NONE
+    INTEGER, INTENT(IN) :: nrxxs, ld, n, m, mp, bw, ik, plan_full, plan_tail
+    LOGICAL, INTENT(IN) :: single
+    COMPLEX(DP), DEVICE, INTENT(IN) :: psi(ld,m)
+    INTEGER, DEVICE, INTENT(IN) :: nl(*), nlm(*)
+    COMPLEX(DP), DEVICE, INTENT(INOUT) :: psic(nrxxs,mp)
+    INTEGER :: i, ip, ig, ir, p0, np_, plan
+    !$cuf kernel do (2)
+    DO ip = 1, mp
+       DO ir = 1, nrxxs
+          psic(ir,ip) = ( 0._DP, 0._DP )
+       ENDDO
+    ENDDO
+    !$cuf kernel do (2)
+    DO ip = 1, mp
+       DO ig = 1, n
+          i = 2*ip - 1
+          IF ( i + 1 <= m ) THEN
+             psic( nl(igk_exx_d(ig,ik)),  ip ) = psi(ig,i) + ( 0._DP, 1._DP ) * psi(ig,i+1)
+             psic( nlm(igk_exx_d(ig,ik)), ip ) = CONJG( psi(ig,i) ) + ( 0._DP, 1._DP ) * CONJG( psi(ig,i+1) )
+          ELSE
+             psic( nl(igk_exx_d(ig,ik)),  ip ) = psi(ig,i)
+             psic( nlm(igk_exx_d(ig,ik)), ip ) = CONJG( psi(ig,i) )
+          ENDIF
+       ENDDO
+    ENDDO
+    DO p0 = 1, mp, bw
+       np_ = MIN( bw, mp - p0 + 1 )
+       plan = plan_full
+       IF ( np_ /= bw ) plan = plan_tail
+       CALL vexx_gfast_fft( nrxxs, np_, psic(1,p0), plan, single, CUFFT_INVERSE )
+    ENDDO
+  END SUBROUTINE vexx_gfast_psi2r
+  !
+  !-----------------------------------------------------------------------
   SUBROUTINE vexx_gfast_same( nrxxs, nbuf, ebuf, mp, psic, m, dmax, bmax )
   !-----------------------------------------------------------------------
     !! The largest difference between the psi of this call and the buffered orbitals of the same
@@ -6284,7 +6328,9 @@ end associate
     INTEGER :: plan_full, plan_tail, plan_wfull, plan_wtail, istat, i, ig, ir, ip, p0, np_, plan
     INTEGER :: jp, j1, j2, jlast, pass, key
     INTEGER(KIND=8) :: need, free_, total_
-    LOGICAL :: sym, single
+    LOGICAL :: sym, single, lean
+    LOGICAL, SAVE :: lean_said = .FALSE.
+    REAL(DP) :: dblk, bblk
     REAL(DP) :: xkp(3), xkq(3), omega_inv, scale, dmax, bmax, fs, w(4)
     COMPLEX(DP) :: c1, c2
     CHARACTER(LEN=48) :: why, plans
@@ -6329,12 +6375,23 @@ end associate
     ! ... the device work arrays: ask first whether they fit (the runtime aborts on a failed device
     !     ALLOCATE even with STAT=); if not, this and every later call go to vexx_bp_gamma_gpu
     need = 0_8
+    lean = .FALSE.
     IF ( .NOT. ALLOCATED(gf_psic_d) ) need = need + 16_8*INT(nrxxs,8)*INT(mp,8) + 8_8*INT(nrxxs,8)*INT(m,8) + &
                                              32_8*INT(nrxxs,8)*INT(pblk,8) + 8_8*INT(nrxxs,8)
     IF ( .NOT. ALLOCATED(p6_psi_d) )  need = need + 32_8*INT(lda*npol,8)*INT(m,8)
     IF ( need > 0_8 ) THEN
        istat = exx_device_room( need, free_, total_ )
-       IF ( istat == 0 .AND. need + 268435456_8 > free_ ) THEN
+       ! no room for all of it: when the psi of this call are the buffered orbitals (every ACE build;
+       ! checked below, block by block) their real-space copy is the orbital buffer itself and need
+       ! not be held a second time
+       IF ( istat == 0 .AND. ( need + 268435456_8 > free_ .OR. gf_sym_mode == 2 ) .AND. .NOT. ALLOCATED(gf_psic_d) &
+            .AND. gf_sym_mode /= 0 .AND. m <= nbb .AND. .NOT. gf_force_mode ) THEN
+          lean = ( need - 16_8*INT(nrxxs,8)*INT(mp,8) + 268435456_8 <= free_ )
+          IF ( lean .AND. .NOT. lean_said ) WRITE( stdout, '(5X,"EXX-GPU: ",I0," MB of device memory are free, the batched Gamma operator takes the orbital buffer as the real-space psi of the ACE builds (",I0," MB less)")' ) &
+               free_/1000000_8, 16_8*INT(nrxxs,8)*INT(mp,8)/1000000_8
+          lean_said = lean_said .OR. lean
+       ENDIF
+       IF ( istat == 0 .AND. need + 268435456_8 > free_ .AND. .NOT. lean ) THEN
           CALL p15_release_work_arrays()
           p15_fast_disabled = .TRUE.
           WRITE( stdout, '(5X,"EXX-GPU: the batched Gamma operator would need ",I0," MB of device memory for ",I0," bands on ",I0," grid points, ",I0," MB are free: this run continues on the original vexx_gamma_gpu path")' ) &
@@ -6349,7 +6406,12 @@ end associate
             SIZE(gf_rho_d,2) /= pblk ) DEALLOCATE( gf_psic_d, gf_res_d, gf_rho_d )
     ENDIF
     istat = 0
-    IF ( .NOT. ALLOCATED(gf_psic_d) ) ALLOCATE( gf_psic_d(nrxxs,mp), gf_res_d(nrxxs,m), gf_rho_d(nrxxs,pblk), STAT=istat )
+    IF ( lean ) THEN
+       IF ( ALLOCATED(gf_res_d) ) DEALLOCATE( gf_res_d, gf_rho_d )
+       ALLOCATE( gf_res_d(nrxxs,m), gf_rho_d(nrxxs,pblk), STAT=istat )
+    ELSE IF ( .NOT. ALLOCATED(gf_psic_d) ) THEN
+       ALLOCATE( gf_psic_d(nrxxs,mp), gf_res_d(nrxxs,m), gf_rho_d(nrxxs,pblk), STAT=istat )
+    ENDIF
     ! (the single-precision block is an argument of the pair loop: it exists, if only as one element)
     IF ( ALLOCATED(p6_rhoc_s) .AND. sp ) THEN
        IF ( SIZE(p6_rhoc_s,1) /= nrxxs .OR. SIZE(p6_rhoc_s,2) /= pblk ) DEALLOCATE( p6_rhoc_s )
@@ -6373,7 +6435,7 @@ end associate
        RETURN
     ENDIF
     ! the work arrays of a small system stay for the next call, those of a large one are returned
-    gf_keep = ( 16_8*INT(nrxxs,8)*INT(mp,8) + 8_8*INT(nrxxs,8)*INT(m,8) + 16_8*INT(nrxxs,8)*INT(pblk,8) <= 536870912_8 )
+    gf_keep = .NOT. lean .AND. ( 16_8*INT(nrxxs,8)*INT(mp,8) + 8_8*INT(nrxxs,8)*INT(m,8) + 16_8*INT(nrxxs,8)*INT(pblk,8) <= 536870912_8 )
     !
     ! ... the Coulomb kernel on the full grid, both halves of the G sphere, times the FFT normalisation
     CALL g2_convolution_all( ngmt, gt, xkp, xkq, 1, current_k )
@@ -6400,34 +6462,46 @@ end associate
     ENDIF
     p6_psi_d  = psi(:,1:m)
     p6_hpsi_d = hpsi(:,1:m)
-    gf_psic_d = ( 0._DP, 0._DP )
-    !$cuf kernel do (2)
-    DO ip = 1, mp
-       DO ig = 1, n
-          i = 2*ip - 1
-          IF ( i + 1 <= m ) THEN
-             gf_psic_d( nl_d(igk_exx_d(ig,current_k)),  ip ) = p6_psi_d(ig,i) + ( 0._DP, 1._DP ) * p6_psi_d(ig,i+1)
-             gf_psic_d( nlm_d(igk_exx_d(ig,current_k)), ip ) = CONJG( p6_psi_d(ig,i) ) + ( 0._DP, 1._DP ) * CONJG( p6_psi_d(ig,i+1) )
-          ELSE
-             gf_psic_d( nl_d(igk_exx_d(ig,current_k)),  ip ) = p6_psi_d(ig,i)
-             gf_psic_d( nlm_d(igk_exx_d(ig,current_k)), ip ) = CONJG( p6_psi_d(ig,i) )
-          ENDIF
+    IF ( lean ) THEN
+       ! a block at a time, only to be compared with the orbital buffer
+       dmax = 0.0_DP
+       bmax = 0.0_DP
+       DO p0 = 1, mp, bw
+          np_ = MIN( bw, mp - p0 + 1 )
+          plan = plan_wfull
+          IF ( np_ /= bw ) plan = plan_wtail
+          gf_rho_d(:,1:np_) = ( 0._DP, 0._DP )
+          !$cuf kernel do (2)
+          DO ip = 1, np_
+             DO ig = 1, n
+                i = 2*(p0+ip-1) - 1
+                IF ( i + 1 <= m ) THEN
+                   gf_rho_d( nl_d(igk_exx_d(ig,current_k)),  ip ) = p6_psi_d(ig,i) + ( 0._DP, 1._DP ) * p6_psi_d(ig,i+1)
+                   gf_rho_d( nlm_d(igk_exx_d(ig,current_k)), ip ) = CONJG( p6_psi_d(ig,i) ) + ( 0._DP, 1._DP ) * CONJG( p6_psi_d(ig,i+1) )
+                ELSE
+                   gf_rho_d( nl_d(igk_exx_d(ig,current_k)),  ip ) = p6_psi_d(ig,i)
+                   gf_rho_d( nlm_d(igk_exx_d(ig,current_k)), ip ) = CONJG( p6_psi_d(ig,i) )
+                ENDIF
+             ENDDO
+          ENDDO
+          CALL vexx_gfast_fft( nrxxs, np_, gf_rho_d, plan, single, CUFFT_INVERSE )
+          CALL vexx_gfast_same( nrxxs, np_, exxbuff_d(1,LBOUND(exxbuff_d,2)+p0-1,ikq), np_, gf_rho_d, &
+                                MIN( 2*np_, m - 2*(p0-1) ), dblk, bblk )
+          dmax = MAX( dmax, dblk )
+          bmax = MAX( bmax, bblk )
        ENDDO
-    ENDDO
-    DO p0 = 1, mp, bw
-       np_ = MIN( bw, mp - p0 + 1 )
-       plan = plan_wfull
-       IF ( np_ /= bw ) plan = plan_wtail
-       CALL vexx_gfast_fft( nrxxs, np_, gf_psic_d(1,p0), plan, single, CUFFT_INVERSE )
-    ENDDO
-    gf_res_d = 0.0_DP
-    !
-    ! ... are these psi the buffered orbitals? Then every pair potential serves two bands
-    sym = ( gf_sym_mode /= 0 ) .AND. ( m <= nbb ) .AND. ( .NOT. gf_force_mode )
-    IF ( sym ) THEN
-       CALL vexx_gfast_same( nrxxs, nbuf, exxbuff_d(1,LBOUND(exxbuff_d,2),ikq), mp, gf_psic_d, m, dmax, bmax )
        sym = ( dmax <= 1.0E-11_DP * bmax )
+    ELSE
+       CALL vexx_gfast_psi2r( nrxxs, lda*npol, n, m, mp, bw, current_k, p6_psi_d, nl_d, nlm_d, gf_psic_d, plan_wfull, plan_wtail, single )
+       !
+       ! ... are these psi the buffered orbitals? Then every pair potential serves two bands
+       sym = ( gf_sym_mode /= 0 ) .AND. ( m <= nbb ) .AND. ( .NOT. gf_force_mode )
+       IF ( sym ) THEN
+          CALL vexx_gfast_same( nrxxs, nbuf, exxbuff_d(1,LBOUND(exxbuff_d,2),ikq), mp, gf_psic_d, m, dmax, bmax )
+          sym = ( dmax <= 1.0E-11_DP * bmax )
+       ENDIF
     ENDIF
+    gf_res_d = 0.0_DP
     IF ( okvan ) THEN
        CALL start_clock( 'vexx_k_us' )
        CALL vexx_gfast_us_setup( current_k, ikq, ik, lda, n, m, ngmt, pblk, xkp, nbe, us_ok )
@@ -6451,6 +6525,21 @@ end associate
           ENDDO
           sym = ( dmax <= 1.0E-9_DP * bmax )
        ENDIF
+    ENDIF
+    IF ( lean .AND. .NOT. sym ) THEN
+       ! not an ACE build after all: the psi of this call are needed in real space
+       IF ( need + 268435456_8 > free_ ) THEN
+          CALL p15_release_work_arrays()
+          p15_fast_disabled = .TRUE.
+          WRITE( stdout, '(5X,"EXX-GPU: the batched Gamma operator would need ",I0," MB of device memory for ",I0," bands on ",I0," grid points, ",I0," MB are free: this run continues on the original vexx_gamma_gpu path")' ) &
+               need/1000000_8, m, nrxxs, free_/1000000_8
+          CALL stop_clock( 'vexx_g_setup' )
+          ok = .FALSE.
+          RETURN
+       ENDIF
+       lean = .FALSE.
+       ALLOCATE( gf_psic_d(nrxxs,mp) )
+       CALL vexx_gfast_psi2r( nrxxs, lda*npol, n, m, mp, bw, current_k, p6_psi_d, nl_d, nlm_d, gf_psic_d, plan_wfull, plan_wtail, single )
     ENDIF
     !
     ! ... the slot list. General: band i with every occupied buffer pair. Symmetric: band i with the
@@ -6524,18 +6613,10 @@ end associate
              plan_tail = vexx_fast_plan( nr1, nr2, nr3, MOD(ns,bp), .FALSE. );  p6_plan_pinned(4) = plan_tail
           ENDIF
        ENDIF
-       IF ( okvan ) THEN
-          !$acc host_data use_device( p18_qgm_acc )
-          CALL vexx_gfast_main_us( nrxxs, nbuf, exxbuff_d(1,LBOUND(exxbuff_d,2),ikq), mp, gf_psic_d, m, gf_res_d, gf_fac_d, ns, &
-                                   gf_si_d, gf_sj_d, gf_sx_d, bp, gf_rho_d, nr1, nr2, nr3, single, cmax, sym, omega_inv, omega, scale, &
-                                   ngmt, nl_d, nlm_d, gstart, nkb, nbe, nat, nhm, p18_na, p18_nij, gf_bec_d, gf_becpsi_d, &
-                                   gf_deexx_d, gf_f_d, gf_u_d, gf_aug_d, gf_vcg_d, gf_wb_d, gf_t_d, gf_cb_d, p18_qgm_acc, &
-                                   p18_sf_d, p18_acol_d, p18_aof_d, p18_ofs_d, p18_kbat_d, p18_kbih_d, p18_nhat_d, &
-                                   gf_ntu, gf_tkb0, gf_tnkb, gf_tq0, gf_tnq )
-          !$acc end host_data
+       IF ( lean ) THEN
+          CALL pair_loop( exxbuff_d(1,LBOUND(exxbuff_d,2),ikq) )
        ELSE
-          CALL vexx_gfast_main( nrxxs, nbuf, exxbuff_d(1,LBOUND(exxbuff_d,2),ikq), mp, gf_psic_d, m, gf_res_d, gf_fac_d, ns, gf_si_d, gf_sj_d, &
-                                gf_sx_d, bp, gf_rho_d, plan_full, plan_tail, single, sym, omega_inv, sp, p6_rhoc_s, nr1, nr2, nr3, cmax )
+          CALL pair_loop( gf_psic_d )
        ENDIF
     ENDIF
     !
@@ -6590,11 +6671,32 @@ end associate
     CALL start_clock( 'vexx_g_fin' )
     hpsi(:,1:m) = p6_hpsi_d
     IF ( .NOT. gf_keep ) THEN
-       DEALLOCATE( gf_psic_d, gf_res_d, gf_rho_d )
+       IF ( ALLOCATED(gf_psic_d) ) DEALLOCATE( gf_psic_d )
+       DEALLOCATE( gf_res_d, gf_rho_d )
        IF ( ALLOCATED(p6_rhoc_s) ) DEALLOCATE( p6_rhoc_s )
        IF ( ALLOCATED(gf_f_d) ) DEALLOCATE( gf_f_d, gf_u_d, gf_aug_d, gf_vcg_d, gf_wb_d, gf_t_d, gf_cb_d )
     ENDIF
     CALL stop_clock( 'vexx_g_fin' )
+    !
+  CONTAINS
+    !
+    SUBROUTINE pair_loop( psic )
+      !! The pair loop with psic as the real-space psi of this call
+      COMPLEX(DP), DEVICE, INTENT(IN) :: psic(nrxxs,mp)
+      IF ( okvan ) THEN
+         !$acc host_data use_device( p18_qgm_acc )
+         CALL vexx_gfast_main_us( nrxxs, nbuf, exxbuff_d(1,LBOUND(exxbuff_d,2),ikq), mp, psic, m, gf_res_d, gf_fac_d, ns, &
+                                  gf_si_d, gf_sj_d, gf_sx_d, bp, gf_rho_d, nr1, nr2, nr3, single, cmax, sym, omega_inv, omega, scale, &
+                                  ngmt, nl_d, nlm_d, gstart, nkb, nbe, nat, nhm, p18_na, p18_nij, gf_bec_d, gf_becpsi_d, &
+                                  gf_deexx_d, gf_f_d, gf_u_d, gf_aug_d, gf_vcg_d, gf_wb_d, gf_t_d, gf_cb_d, p18_qgm_acc, &
+                                  p18_sf_d, p18_acol_d, p18_aof_d, p18_ofs_d, p18_kbat_d, p18_kbih_d, p18_nhat_d, &
+                                  gf_ntu, gf_tkb0, gf_tnkb, gf_tq0, gf_tnq )
+         !$acc end host_data
+      ELSE
+         CALL vexx_gfast_main( nrxxs, nbuf, exxbuff_d(1,LBOUND(exxbuff_d,2),ikq), mp, psic, m, gf_res_d, gf_fac_d, ns, gf_si_d, gf_sj_d, &
+                               gf_sx_d, bp, gf_rho_d, plan_full, plan_tail, single, sym, omega_inv, sp, p6_rhoc_s, nr1, nr2, nr3, cmax )
+      ENDIF
+    END SUBROUTINE pair_loop
     !
   END SUBROUTINE vexx_bp_gamma_gpu_fast
   !
@@ -7491,7 +7593,8 @@ end associate
     IF ( ALLOCATED(p6_ikq_d) ) DEALLOCATE( p6_ikq_d )
     IF ( ALLOCATED(p6_xocc_d) ) DEALLOCATE( p6_xocc_d )
     IF ( ALLOCATED(cfac_all_d) ) DEALLOCATE( cfac_all_d )
-    IF ( ALLOCATED(gf_psic_d) ) DEALLOCATE( gf_psic_d, gf_res_d, gf_rho_d )
+    IF ( ALLOCATED(gf_psic_d) ) DEALLOCATE( gf_psic_d )
+    IF ( ALLOCATED(gf_res_d) ) DEALLOCATE( gf_res_d, gf_rho_d )
     IF ( ALLOCATED(gf_fac_d) ) DEALLOCATE( gf_fac_d, gf_facg_d )
     IF ( ALLOCATED(gf_si_h) ) DEALLOCATE( gf_si_h, gf_sj_h, gf_sx_h, gf_si_d, gf_sj_d, gf_sx_d )
     IF ( ALLOCATED(ka_acc_d) ) DEALLOCATE( ka_acc_d, ka_h_d, ka_rir_d )
