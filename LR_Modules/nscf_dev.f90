@@ -67,6 +67,441 @@ MODULE nscf_dev
 CONTAINS
   !
 #if defined(__CUDA)
+  !-----------------------------------------------------------------------
+  SUBROUTINE init_batched( ok )
+    !-----------------------------------------------------------------------
+    !! Beta functions, kinetic energies, preconditioner and starting
+    !! wavefunctions of all k-points: what g2_kin, init_us_2, usnldiag,
+    !! atomic_wfc, init_wfc (startingwfc = 'atomic', the setting of ph.x) and
+    !! rotate_wfc_k compute for one k-point, with the same expressions and the
+    !! same random numbers, for blocks of k-points. ok = .FALSE.: not served,
+    !! nothing was done.
+    !
+    USE constants,            ONLY : tpi
+    USE cell_base,            ONLY : tpiba, tpiba2, omega
+    USE ions_base,            ONLY : nat, ityp, tau, nsp
+    USE klist,                ONLY : xk, ngk, igk_k
+    USE gvect,                ONLY : g, mill, eigts1, eigts2, eigts3
+    USE gvecw,                ONLY : qcutz
+    USE uspp,                 ONLY : vkb, nkb, nhtol, nhtolm, indv, ofsbeta
+    USE uspp_param,           ONLY : upf, nh, nhm, lmaxkb, nbetam, nwfcm
+    USE uspp_init,            ONLY : init_us_2
+    USE beta_mod,             ONLY : interp_beta
+    USE atwfc_mod,            ONLY : interp_atwfc
+    USE basis,                ONLY : natomwfc
+    USE scf,                  ONLY : v_of_0
+    USE lsda_mod,             ONLY : lsda, isk, current_spin
+    USE wvfct,                ONLY : current_k
+    USE fft_base,             ONLY : dffts
+    USE starting_scf,         ONLY : starting_wfc
+    USE random_numbers_gpum,  ONLY : randy_vect_gpu
+    !
+    LOGICAL, INTENT(OUT) :: ok
+    !
+    INTEGER :: nstart, nr, lmax_wfc, lmm, kbmax, kb, k1, k2, npb, ik, ig, ip, iv, nt, na, nb, ih, jh, &
+               lm, nhnt, nat_t, ia, jkb, n, l, m, is, nsl, il, nl, nlmax, istat, n1, nwa, nrr, ioff, &
+               cnt, npair, nrnd, kk, r1(1), r2(1)
+    INTEGER(8) :: ro, idx
+    REAL(DP) :: arg, rr1, rr2, hh, ss, ar, tmpneed, vof0, tpiba_l, tpiba2_l
+    COMPLEX(DP) :: sk, pref
+    INTEGER(KIND=cuda_count_kind) :: mfree, mtot
+    INTEGER, ALLOCATABLE :: nl_h(:,:), iv_h(:), na_t(:), w_na(:), w_nb(:), w_nt(:), w_lm(:), &
+                            ikbl_h(:,:,:), nls_h(:), pk_h(:), pn_h(:), info_k(:)
+    INTEGER(8), ALLOCATABLE :: roff_h(:)
+    REAL(DP), ALLOCATABLE :: gk(:,:), qg(:), ylm(:,:), vq(:,:), vkb1(:,:), chiq(:,:,:), arg_h(:,:), &
+                             prl_h(:,:,:), deeq_h(:,:,:,:), qq_h(:,:,:), ewk(:)
+    COMPLEX(DP), ALLOCATABLE :: w_ph(:), kph_h(:,:), hr_h(:,:,:), sr_h(:,:,:), vr_h(:,:,:), hk(:,:), &
+                                sk2(:,:), vk(:,:)
+    INTEGER, ALLOCATABLE, DEVICE :: ikbl_d(:,:,:), nls_d(:)
+    INTEGER(8), ALLOCATABLE, DEVICE :: roff_d(:)
+    REAL(DP), ALLOCATABLE, DEVICE :: xk_d(:,:), prl_d(:,:,:), rnd_d(:)
+    COMPLEX(DP), ALLOCATABLE, DEVICE :: hr_d(:,:,:), sr_d(:,:,:), vr_d(:,:,:)
+    !
+    ok = .FALSE.
+    IF ( TRIM(starting_wfc) /= 'atomic' .OR. qcutz > 0.0_DP ) RETURN
+    nstart = MAX( natomwfc, nvec )
+    nr = nstart - natomwfc
+    IF ( natomwfc < 1 .OR. nwfcm < 1 .OR. nstart > nvecx ) RETURN
+    lmax_wfc = 0
+    DO nt = 1, nsp
+       IF ( upf(nt)%nwfc > 0 ) lmax_wfc = MAX( lmax_wfc, MAXVAL( upf(nt)%lchi(1:upf(nt)%nwfc) ) )
+    ENDDO
+    lmm = (lmax_wfc+1)**2
+    IF ( nkbl > 0 ) lmm = MAX( lmm, (lmaxkb+1)**2 )
+    !
+    ! ... k-points per block: bounded work space
+    !
+    kbmax = MAX( 1, MIN( nk, 1048576 / npwxl ) )
+    IF ( nr > 0 ) kbmax = MAX( 1, MIN( kbmax, INT( 67108864_8 / ( INT(nr,8) * npwxl ) ) ) )
+    tmpneed = 8.0_DP * REAL(npwxl,DP) * kbmax * ( 4 + lmm + nbetam + nhm + nwfcm*nsp + 2*nr ) + &
+              16.0_DP * REAL(nstart,DP) * ( 2*nstart + nvec ) * nk
+    istat = cudaMemGetInfo( mfree, mtot )
+    IF ( tmpneed > 0.5_DP * REAL(mfree,DP) ) RETURN
+    !
+    n1 = npwxl
+    tpiba_l = tpiba ; tpiba2_l = tpiba2 ; vof0 = v_of_0
+    !
+    ! ... FFT indices, spin and number of plane waves of each k-point
+    !
+    ALLOCATE( nl_h(npwxl,nk), iv_h(nk) )
+    nl_h = 1
+    DO ik = 1, nk
+       DO ig = 1, ngk(ik)
+          nl_h(ig,ik) = dffts%nl(igk_k(ig,ik))
+       ENDDO
+    ENDDO
+    nl_d = nl_h
+    iv_h = 1
+    IF ( lsda ) iv_h(:) = isk(1:nk)
+    spin_d = iv_h
+    iv_h(:) = ngk(1:nk)
+    npw_d = iv_h
+    DEALLOCATE( nl_h, iv_h )
+    ALLOCATE( xk_d(3,nk) )
+    xk_d = xk(:,1:nk)
+    !
+    ! ... kinetic energies (g2_kin)
+    !
+    !$acc parallel loop collapse(2) present(g, igk_k)
+    DO ik = 1, nk
+       DO ig = 1, n1
+          IF ( ig <= npw_d(ik) ) THEN
+             iv = igk_k(ig,ik)
+             g2_d(ig,ik) = ( ( xk_d(1,ik) + g(1,iv) )*( xk_d(1,ik) + g(1,iv) ) + &
+                             ( xk_d(2,ik) + g(2,iv) )*( xk_d(2,ik) + g(2,iv) ) + &
+                             ( xk_d(3,ik) + g(3,iv) )*( xk_d(3,ik) + g(3,iv) ) ) * tpiba2_l
+          ELSE
+             g2_d(ig,ik) = 0.0_DP
+          ENDIF
+       ENDDO
+    ENDDO
+    !
+    ! ... the atomic wavefunctions in the order of atomic_wfc: atom, radial
+    ! ... function, angular momentum and phase (0,1)^l of each
+    !
+    ALLOCATE( w_na(natomwfc), w_nb(natomwfc), w_nt(natomwfc), w_lm(natomwfc), w_ph(natomwfc) )
+    n = 0
+    DO na = 1, nat
+       nt = ityp(na)
+       DO nb = 1, upf(nt)%nwfc
+          IF ( upf(nt)%oc(nb) >= 0.0_DP ) THEN
+             l = upf(nt)%lchi(nb)
+             DO m = 1, 2*l + 1
+                n = n + 1
+                IF ( n > natomwfc ) CALL errore( 'nscf_dev', 'internal error: too many wfcs', 1 )
+                w_na(n) = na ; w_nb(n) = nb ; w_nt(n) = nt ; w_lm(n) = l*l + m
+                w_ph(n) = (0.0_DP,1.0_DP)**l
+             ENDDO
+          ENDIF
+       ENDDO
+    ENDDO
+    IF ( n /= natomwfc ) CALL errore( 'nscf_dev', 'internal error: some wfcs were lost', 1 )
+    nwa = natomwfc ; nrr = nr
+    !
+    ALLOCATE( na_t(nat), arg_h(nat,kbmax), kph_h(nat,kbmax) )
+    IF ( nr > 0 ) ALLOCATE( rnd_d(2_8*nr*npwxl*kbmax), roff_h(kbmax), roff_d(kbmax) )
+    !
+    DO k1 = 1, nk, kbmax
+       k2 = MIN( nk, k1+kbmax-1 )
+       kb = k2 - k1 + 1
+       npb = npwxl * kb
+       ALLOCATE( gk(3,npb), qg(npb), ylm(npb,lmm), vq(npb,MAX(nbetam,1)), vkb1(npb,MAX(nhm,1)), &
+                 chiq(npb,nwfcm,nsp) )
+       !$acc data create(gk, qg, ylm, vq, vkb1, chiq) copyin(w_na, w_nb, w_nt, w_lm, w_ph) &
+       !$acc      present(g, igk_k, mill, eigts1, eigts2, eigts3)
+       !
+       !$acc parallel loop collapse(2)
+       DO ik = k1, k2
+          DO ig = 1, n1
+             ip = (ik-k1)*n1 + ig
+             IF ( ig <= npw_d(ik) ) THEN
+                iv = igk_k(ig,ik)
+                gk(1,ip) = xk_d(1,ik) + g(1,iv)
+                gk(2,ip) = xk_d(2,ik) + g(2,iv)
+                gk(3,ip) = xk_d(3,ik) + g(3,iv)
+                qg(ip) = gk(1,ip)*gk(1,ip) + gk(2,ip)*gk(2,ip) + gk(3,ip)*gk(3,ip)
+             ELSE
+                gk(1,ip) = 0.0_DP ; gk(2,ip) = 0.0_DP ; gk(3,ip) = 0.0_DP
+                qg(ip) = 0.0_DP
+             ENDIF
+          ENDDO
+       ENDDO
+       CALL ylmr2( lmm, npb, gk, qg, ylm )
+       !$acc parallel loop
+       DO ip = 1, npb
+          qg(ip) = SQRT( qg(ip) ) * tpiba_l
+       ENDDO
+       !
+       ! ... beta functions (init_us_2)
+       !
+       IF ( nkbl > 0 ) THEN
+          jkb = 0
+          DO nt = 1, nsp
+             CALL interp_beta( nt, npb, qg, omega, vq )
+             nhnt = nh(nt)
+             !$acc parallel loop collapse(2) copyin(indv, nhtolm)
+             DO ih = 1, nhnt
+                DO ip = 1, npb
+                   nb = indv(ih,nt)
+                   lm = nhtolm(ih,nt)
+                   vkb1(ip,ih) = ylm(ip,lm) * vq(ip,nb)
+                ENDDO
+             ENDDO
+             nat_t = 0
+             arg_h = 0.0_DP
+             DO na = 1, nat
+                IF ( ityp(na) == nt ) THEN
+                   nat_t = nat_t + 1
+                   na_t(nat_t) = na
+                   DO ik = k1, k2
+                      arg_h(nat_t,ik-k1+1) = ( xk(1,ik)*tau(1,na) + xk(2,ik)*tau(2,na) + &
+                                               xk(3,ik)*tau(3,na) ) * tpi
+                   ENDDO
+                ENDIF
+             ENDDO
+             IF ( nat_t == 0 ) CYCLE
+             !$acc parallel loop collapse(3) copyin(na_t, arg_h, nhtol) private(ip, na, iv, sk, pref, kk)
+             DO ia = 1, nat_t
+                DO ik = k1, k2
+                   DO ig = 1, n1
+                      IF ( ig <= npw_d(ik) ) THEN
+                         ip = (ik-k1)*n1 + ig
+                         kk = ik - k1 + 1
+                         na = na_t(ia)
+                         iv = igk_k(ig,ik)
+                         sk = eigts1(mill(1,iv),na) * eigts2(mill(2,iv),na) * eigts3(mill(3,iv),na) * &
+                              CMPLX( COS(arg_h(ia,kk)), -SIN(arg_h(ia,kk)), KIND=DP )
+                         !$acc loop seq
+                         DO ih = 1, nhnt
+                            pref = (0.0_DP,-1.0_DP)**nhtol(ih,nt)
+                            vkb_d(ig,jkb+(ia-1)*nhnt+ih,ik) = vkb1(ip,ih) * sk * pref
+                         ENDDO
+                      ENDIF
+                   ENDDO
+                ENDDO
+             ENDDO
+             jkb = jkb + nat_t*nhnt
+          ENDDO
+       ENDIF
+       !
+       ! ... atomic wavefunctions (atomic_wfc)
+       !
+       CALL interp_atwfc( npb, qg, nwfcm, omega, chiq )
+       DO ik = k1, k2
+          DO na = 1, nat
+             arg = ( xk(1,ik)*tau(1,na) + xk(2,ik)*tau(2,na) + xk(3,ik)*tau(3,na) ) * tpi
+             kph_h(na,ik-k1+1) = CMPLX( COS(arg), -SIN(arg), KIND=DP )
+          ENDDO
+       ENDDO
+       !$acc parallel loop collapse(3) copyin(kph_h) private(ip, na, iv, sk)
+       DO ik = k1, k2
+          DO n = 1, nwa
+             DO ig = 1, n1
+                IF ( ig <= npw_d(ik) ) THEN
+                   ip = (ik-k1)*n1 + ig
+                   na = w_na(n)
+                   iv = igk_k(ig,ik)
+                   sk = kph_h(na,ik-k1+1) * eigts1(mill(1,iv),na) * eigts2(mill(2,iv),na) * &
+                        eigts3(mill(3,iv),na)
+                   psi_d(ig,n,ik) = w_ph(n) * sk * CMPLX( ylm(ip,w_lm(n)) * chiq(ip,w_nb(n),w_nt(n)), KIND=DP )
+                ENDIF
+             ENDDO
+          ENDDO
+       ENDDO
+       !
+       ! ... random wavefunctions where the atomic ones are too few (init_wfc):
+       ! ... the generator is called k-point by k-point as in the stock routine
+       !
+       IF ( nr > 0 ) THEN
+          ro = 0
+          DO ik = k1, k2
+             roff_h(ik-k1+1) = ro
+             nrnd = 2 * nr * ngk(ik)
+             CALL randy_vect_gpu( rnd_d(ro+1:ro+nrnd), nrnd )
+             ro = ro + nrnd
+          ENDDO
+          roff_d = roff_h
+          !$acc parallel loop collapse(3) private(idx, rr1, rr2, iv, arg)
+          DO ik = k1, k2
+             DO n = 1, nrr
+                DO ig = 1, n1
+                   IF ( ig <= npw_d(ik) ) THEN
+                      idx = roff_d(ik-k1+1) + 2_8*( INT(ig-1,8) + INT(n-1,8)*npw_d(ik) ) + 1
+                      rr1 = rnd_d(idx)
+                      rr2 = rnd_d(idx+1)
+                      iv = igk_k(ig,ik)
+                      rr1 = rr1 / ( ( xk_d(1,ik) + g(1,iv) )**2 + ( xk_d(2,ik) + g(2,iv) )**2 + &
+                                    ( xk_d(3,ik) + g(3,iv) )**2 + 1.0_DP )
+                      arg = tpi * rr2
+                      psi_d(ig,nwa+n,ik) = CMPLX( rr1*COS(arg), rr1*SIN(arg), KIND=DP )
+                   ENDIF
+                ENDDO
+             ENDDO
+          ENDDO
+       ENDIF
+       !
+       !$acc end data
+       DEALLOCATE( gk, qg, ylm, vq, vkb1, chiq )
+    ENDDO
+    DEALLOCATE( na_t, arg_h, kph_h, w_na, w_nb, w_nt, w_lm, w_ph )
+    IF ( nr > 0 ) DEALLOCATE( rnd_d, roff_h, roff_d )
+    !
+    ! ... diagonal of H and S for the preconditioner (usnldiag): the nonzero
+    ! ... coefficients of each spin, in the order in which they are added
+    !
+    nsl = 1
+    IF ( lsda ) nsl = 2
+    nlmax = MAX( 1, natl*nhml*nhml )
+    ALLOCATE( prl_h(2,nlmax,nsl), ikbl_h(2,nlmax,nsl), nls_h(nsl) )
+    prl_h = 0.0_DP ; ikbl_h = 1 ; nls_h = 0
+    IF ( nhml > 0 .AND. nkbl > 0 ) THEN
+       ALLOCATE( deeq_h(nhml,nhml,natl,nspl), qq_h(nhml,nhml,natl) )
+       deeq_h = deeq_d ; qq_h = qq_d
+       DO is = 1, nsl
+          nl = 0
+          DO nt = 1, nsp
+             nhnt = nh(nt)
+             DO na = 1, nat
+                IF ( ityp(na) == nt ) THEN
+                   DO ih = 1, nhnt
+                      DO jh = 1, nhnt
+                         IF ( deeq_h(ih,jh,na,is) == 0.0_DP .AND. qq_h(ih,jh,na) == 0.0_DP ) CYCLE
+                         nl = nl + 1
+                         ikbl_h(1,nl,is) = ofsbeta(na) + ih
+                         ikbl_h(2,nl,is) = ofsbeta(na) + jh
+                         prl_h(1,nl,is) = deeq_h(ih,jh,na,is)
+                         prl_h(2,nl,is) = qq_h(ih,jh,na)
+                      ENDDO
+                   ENDDO
+                ENDIF
+             ENDDO
+          ENDDO
+          nls_h(is) = nl
+       ENDDO
+       DEALLOCATE( deeq_h, qq_h )
+    ENDIF
+    ALLOCATE( prl_d(2,nlmax,nsl), ikbl_d(2,nlmax,nsl), nls_d(nsl) )
+    prl_d = prl_h ; ikbl_d = ikbl_h ; nls_d = nls_h
+    !$acc parallel loop collapse(2) private(is, hh, ss, ar)
+    DO ik = 1, nk
+       DO ig = 1, n1
+          IF ( ig <= npw_d(ik) ) THEN
+             is = spin_d(ik)
+             hh = g2_d(ig,ik) + vof0
+             ss = 1.0_DP
+             !$acc loop seq
+             DO il = 1, nls_d(is)
+                ar = DBLE( vkb_d(ig,ikbl_d(1,il,is),ik) * CONJG( vkb_d(ig,ikbl_d(2,il,is),ik) ) )
+                hh = hh + prl_d(1,il,is) * ar
+                ss = ss + prl_d(2,il,is) * ar
+             ENDDO
+             hd_d(ig,ik) = hh
+             sd_d(ig,ik) = ss
+          ELSE
+             hd_d(ig,ik) = 1.0_DP
+             sd_d(ig,ik) = 1.0_DP
+          ENDIF
+       ENDDO
+    ENDDO
+    DEALLOCATE( prl_h, ikbl_h, nls_h, prl_d, ikbl_d, nls_d, xk_d )
+    !
+    ! ... diagonalization in the space of the starting wavefunctions
+    ! ... (rotate_wfc_k): H and S on the nstart vectors, nvec at a time
+    !
+    CALL start_clock( 'nscfd_irot' )
+    ALLOCATE( pk_h(nvec*nk), pn_h(nvec*nk) )
+    r1(1) = 1 ; r2(1) = nk
+    DO ioff = 0, nstart-1, nvec
+       cnt = MIN( nvec, nstart-ioff )
+       npair = 0
+       DO ik = 1, nk
+          DO n = 1, cnt
+             npair = npair + 1
+             pk_h(npair) = ik ; pn_h(npair) = n
+          ENDDO
+       ENDDO
+       pk_d(1:npair) = pk_h(1:npair) ; pn_d(1:npair) = pn_h(1:npair)
+       CALL copy_block( psi_d, wrk_d, ioff, cnt )
+       CALL hs_apply( npair, 1, r1, r2 )
+       CALL put_block( hwrk_d, hpsi_d, ioff, cnt )
+       IF ( lus ) CALL put_block( swrk_d, spsi_d, ioff, cnt )
+    ENDDO
+    DEALLOCATE( pk_h, pn_h )
+    !
+    ALLOCATE( hr_d(nstart,nstart,nk), sr_d(nstart,nstart,nk), vr_d(nstart,nvec,nk) )
+    ALLOCATE( hr_h(nstart,nstart,nk), sr_h(nstart,nstart,nk), vr_h(nstart,nvec,nk), info_k(nk) )
+    CALL gemm_b( CUBLAS_OP_C, nstart, nstart, npwxl, psi_d, npwxl, INT(npwxl,8)*nvecx, &
+                 hpsi_d, npwxl, INT(npwxl,8)*nvecx, c_zero, hr_d, nstart, INT(nstart,8)*nstart, nk )
+    IF ( lus ) THEN
+       CALL gemm_b( CUBLAS_OP_C, nstart, nstart, npwxl, psi_d, npwxl, INT(npwxl,8)*nvecx, &
+                    spsi_d, npwxl, INT(npwxl,8)*nvecx, c_zero, sr_d, nstart, INT(nstart,8)*nstart, nk )
+    ELSE
+       CALL gemm_b( CUBLAS_OP_C, nstart, nstart, npwxl, psi_d, npwxl, INT(npwxl,8)*nvecx, &
+                    psi_d, npwxl, INT(npwxl,8)*nvecx, c_zero, sr_d, nstart, INT(nstart,8)*nstart, nk )
+    ENDIF
+    hr_h = hr_d ; sr_h = sr_d
+    info_k = 0
+    !$omp parallel do schedule(dynamic,8) private(ik, hk, sk2, vk, ewk)
+    DO ik = 1, nk
+       ALLOCATE( hk(nstart,nstart), sk2(nstart,nstart), vk(nstart,nvec), ewk(nstart) )
+       hk(:,:) = hr_h(:,:,ik)
+       sk2(:,:) = sr_h(:,:,ik)
+       CALL diag_small( nstart, nvec, hk, sk2, ewk, vk, info_k(ik) )
+       vr_h(:,:,ik) = vk(:,:)
+       DEALLOCATE( hk, sk2, vk, ewk )
+    ENDDO
+    !$omp end parallel do
+    IF ( ANY( info_k /= 0 ) ) CALL errore( 'c_bands_nscf_dev', &
+         'starting wavefunctions: reduced eigenproblem failed (S matrix not positive definite?)', 1 )
+    vr_d = vr_h
+    CALL gemm_b( CUBLAS_OP_N, npwxl, nvec, nstart, psi_d, npwxl, INT(npwxl,8)*nvecx, &
+                 vr_d, nstart, INT(nstart,8)*nvec, c_zero, wrk_d, npwxl, INT(npwxl,8)*nvec, nk )
+    CALL put_block( wrk_d, psi_d, 0, nvec )
+    CALL zero_cols( nvec, nstart )
+    DEALLOCATE( hr_d, sr_d, vr_d, hr_h, sr_h, vr_h, info_k )
+    CALL stop_clock( 'nscfd_irot' )
+    !
+    ! ... module variables as the loop over k-points of the stock routine leaves them
+    !
+    current_k = nk
+    IF ( lsda ) current_spin = isk(nk)
+    CALL g2_kin( nk )
+    IF ( nkb > 0 ) THEN
+       CALL init_us_2( ngk(nk), igk_k(1,nk), xk(1,nk), vkb, .TRUE. )
+       !$acc update host(vkb)
+    ENDIF
+    ok = .TRUE.
+    !
+  END SUBROUTINE init_batched
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE zero_cols( n0, n9 )
+    !-----------------------------------------------------------------------
+    !! columns n0+1 ... n9 of psi, H psi and S psi set to zero for all k
+    INTEGER, INTENT(IN) :: n0, n9
+    INTEGER :: ik, n, ig, n1, n3
+    n1 = npwxl ; n3 = nk
+    IF ( n9 <= n0 ) RETURN
+    !$cuf kernel do(3)
+    DO ik = 1, n3
+       DO n = n0+1, n9
+          DO ig = 1, n1
+             psi_d(ig,n,ik) = (0.0_DP, 0.0_DP)
+             hpsi_d(ig,n,ik) = (0.0_DP, 0.0_DP)
+          ENDDO
+       ENDDO
+    ENDDO
+    IF ( lus ) THEN
+       !$cuf kernel do(3)
+       DO ik = 1, n3
+          DO n = n0+1, n9
+             DO ig = 1, n1
+                spsi_d(ig,n,ik) = (0.0_DP, 0.0_DP)
+             ENDDO
+          ENDDO
+       ENDDO
+    ENDIF
+  END SUBROUTINE zero_cols
   !
   !-----------------------------------------------------------------------
   SUBROUTINE diag_small( n, m, h, s, e, v, info )
