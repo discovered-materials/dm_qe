@@ -44,7 +44,7 @@ MODULE dyn_dev
   LOGICAL :: check_read = .FALSE., check_on = .FALSE.
   !
 #if defined(__CUDA)
-  PUBLIC :: dyn_dform, dyn_d2form, &
+  PUBLIC :: dyn_dform, dyn_d2form, drhodv_nl_dev, drhodv_nl_k, drhodv_nl_int2, &
             dynmat_us_nl_dev, d2ionq_g_dev, dyn_fwfft
   !
   COMPLEX(DP), PARAMETER :: c_one = (1.0_DP, 0.0_DP), c_zero = (0.0_DP, 0.0_DP)
@@ -440,6 +440,272 @@ CONTAINS
     DEALLOCATE( g_d, fac_d, facq_d, tau_d, zv_d, ityp_d, atl_d, r_d, r_h, atl_h )
     !
   END SUBROUTINE d2ionq_g_dev
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE drhodv_nl_dev( nu_i0, nper, dynwrk )
+    !-----------------------------------------------------------------------
+    !! Nonlocal part of drhodv (the loop over k-points of drhodv with
+    !! drhodvnl), collinear case: the projections of \(\Delta\psi\) and of
+    !! \((k+q+G)_\alpha\Delta\psi\) on the beta functions are one ZGEMM per
+    !! block of bands on the device, the sums over bands and projectors
+    !! run on the host (drhodv_nl_k, drhodv_nl_int2). The result (rows
+    !! nu_i0+1..nu_i0+nper, Cartesian columns) is added to dynwrk.
+    !
+    USE ions_base,     ONLY : nat
+    USE klist,         ONLY : xk, ngk, igk_k
+    USE gvect,         ONLY : g
+    USE lsda_mod,      ONLY : current_spin, lsda, isk
+    USE wvfct,         ONLY : npwx, nbnd
+    USE uspp,          ONLY : nkb, vkb, okvan
+    USE uspp_param,    ONLY : nhm
+    USE uspp_init,     ONLY : init_us_2
+    USE buffers,       ONLY : get_buffer
+    USE units_lr,      ONLY : lrdwf, iudwf
+    USE eqv,           ONLY : dpsi
+    USE qpoint,        ONLY : nksq, ikks, ikqs
+    USE dvbare_dev,    ONLY : dvbare_blas
+    USE dfpt_dev,      ONLY : dfpt_dev_get_bq, dfpt_dev_kept
+    !
+    INTEGER, INTENT(IN) :: nu_i0, nper
+    COMPLEX(DP), INTENT(INOUT) :: dynwrk(3*nat,3*nat)
+    !
+    COMPLEX(DP), ALLOCATABLE, DEVICE :: dps_d(:,:), aux_d(:,:), bec_d(:,:)
+    REAL(DP), ALLOCATABLE, DEVICE :: kqg_d(:,:)
+    COMPLEX(DP), ALLOCATABLE :: bq(:,:,:), cus(:,:,:,:), bqa(:,:,:,:)
+    REAL(DP), ALLOCATABLE :: kqg_h(:,:)
+    LOGICAL :: from_engine
+    TYPE(cublasHandle) :: h
+    INTEGER :: ik, ikk, ikq, npwq, mu, nrec, j0, nbl, nbc, j, ig, istat
+    !
+    IF ( nkb == 0 ) RETURN
+    !
+    ! ... the response wavefunctions are still on the device (engine dfpt_dev):
+    ! ... projections of all k-points from there, no buffer and no beta functions
+    !
+    from_engine = dfpt_dev_kept( nper )
+    IF ( from_engine ) THEN
+       ALLOCATE( bqa(nkb,4*nbnd,nper,nksq) )
+       CALL dfpt_dev_get_bq( nper, nbnd, bqa, from_engine )
+       IF ( .NOT. from_engine ) DEALLOCATE( bqa )
+    ENDIF
+    IF ( from_engine ) THEN
+       ALLOCATE( cus(nhm,nhm,nat,nper) )
+       cus(:,:,:,:) = (0.0_DP, 0.0_DP)
+       DO ik = 1, nksq
+          IF ( lsda ) current_spin = isk(ikks(ik))
+          CALL drhodv_nl_k( ik, nu_i0, nper, bqa(:,:,:,ik), dynwrk, cus )
+       ENDDO
+       IF ( okvan ) CALL drhodv_nl_int2( nu_i0, nper, cus, dynwrk )
+       DEALLOCATE( bqa, cus )
+       RETURN
+    ENDIF
+    !
+    CALL dvbare_blas( h )
+    nbc = MAX( 1, MIN( nbnd, max_tmp_elems / (4*npwx) ) )
+    ALLOCATE( dps_d(npwx,nbnd), aux_d(npwx,4*nbc), bec_d(nkb,4*nbnd), kqg_d(3,npwx), STAT=istat )
+    IF ( istat /= 0 ) CALL errore( 'drhodv_nl_dev', 'device allocation failed', 1 )
+    ALLOCATE( bq(nkb,4*nbnd,nper), kqg_h(3,npwx) )
+    ALLOCATE( cus(nhm,nhm,nat,nper) )
+    cus(:,:,:,:) = (0.0_DP, 0.0_DP)
+    !
+    DO ik = 1, nksq
+       ikk = ikks(ik) ; ikq = ikqs(ik)
+       npwq = ngk(ikq)
+       IF ( lsda ) current_spin = isk(ikk)
+       CALL init_us_2( npwq, igk_k(1,ikq), xk(1,ikq), vkb, .TRUE. )
+       DO ig = 1, npwq
+          kqg_h(:,ig) = xk(:,ikq) + g(:,igk_k(ig,ikq))
+       ENDDO
+       kqg_h(:,npwq+1:npwx) = 0.0_DP
+       kqg_d = kqg_h
+       !
+       ! ... <beta|dpsi> and <beta|(k+q+G)_alpha dpsi> of all perturbations
+       !
+       DO mu = 1, nper
+          nrec = (mu - 1) * nksq + ik
+          IF ( nksq > 1 .OR. nper > 1 ) CALL get_buffer( dpsi, lrdwf, iudwf, nrec )
+          dps_d = dpsi
+          DO j0 = 0, nbnd-1, nbc
+             nbl = MIN( nbc, nbnd-j0 )
+             !$cuf kernel do(2)
+             DO j = 1, nbl
+                DO ig = 1, npwq
+                   aux_d(ig,4*(j-1)+1) = dps_d(ig,j0+j)
+                   aux_d(ig,4*(j-1)+2) = dps_d(ig,j0+j) * kqg_d(1,ig)
+                   aux_d(ig,4*(j-1)+3) = dps_d(ig,j0+j) * kqg_d(2,ig)
+                   aux_d(ig,4*(j-1)+4) = dps_d(ig,j0+j) * kqg_d(3,ig)
+                ENDDO
+             ENDDO
+             !$acc host_data use_device(vkb)
+             istat = cublasZgemm( h, CUBLAS_OP_C, CUBLAS_OP_N, nkb, 4*nbl, npwq, c_one, vkb, npwx, &
+                                  aux_d, npwx, c_zero, bec_d(1,4*j0+1), nkb )
+             !$acc end host_data
+             IF ( istat /= 0 ) CALL errore( 'drhodv_nl_dev', 'cublasZgemm failed', ABS(istat) )
+          ENDDO
+          bq(:,:,mu) = bec_d
+       ENDDO
+       !
+       CALL drhodv_nl_k( ik, nu_i0, nper, bq, dynwrk, cus )
+       !
+    ENDDO
+    !
+    IF ( okvan ) CALL drhodv_nl_int2( nu_i0, nper, cus, dynwrk )
+    DEALLOCATE( dps_d, aux_d, bec_d, kqg_d, bq, kqg_h, cus )
+    !
+  END SUBROUTINE drhodv_nl_dev
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE drhodv_nl_k( ik, nu_i0, nper, bq, dynwrk, cus )
+    !-----------------------------------------------------------------------
+    !! Contribution of k-point ik to the nonlocal part of drhodv (the sums
+    !! of drhodvnl, collinear case), from the projections of the nper
+    !! responses on the beta functions of k+q:
+    !!
+    !! bq(:,4*(ibnd-1)+1,iper) = <beta|dpsi_ibnd>,
+    !! bq(:,4*(ibnd-1)+1+alpha,iper) = <beta|(k+q+G)_alpha dpsi_ibnd>
+    !! (units 2pi/a, without the factor i tpiba).
+    !!
+    !! The terms with D - eS and int1 are added to dynwrk; for ultrasoft
+    !! PPs the sums over the bands needed by the term with int2 are
+    !! accumulated in cus (see drhodv_nl_int2). The current spin must be
+    !! set. Host routine: it can be fed by any code that has the projections.
+    !
+    USE ions_base,  ONLY : nat, ityp
+    USE klist,      ONLY : wk
+    USE cell_base,  ONLY : tpiba
+    USE lsda_mod,   ONLY : current_spin
+    USE wvfct,      ONLY : nbnd, et
+    USE uspp,       ONLY : nkb, okvan, ofsbeta, deeq, qq_at
+    USE uspp_param, ONLY : nh, nhm
+    USE qpoint,     ONLY : ikks
+    USE lrus,       ONLY : becp1
+    USE phus,       ONLY : alphap, int1
+    !
+    INTEGER, INTENT(IN) :: ik, nu_i0, nper
+    COMPLEX(DP), INTENT(IN) :: bq(nkb,4*nbnd,nper)
+    COMPLEX(DP), INTENT(INOUT) :: dynwrk(3*nat,3*nat)
+    COMPLEX(DP), INTENT(INOUT) :: cus(nhm,nhm,nat,nper)
+    !
+    COMPLEX(DP), ALLOCATABLE :: pp1(:), pp2(:,:), acc(:,:)
+    INTEGER :: ikk, na, nb, nt, ijkb0, nhn, ibnd, ih, jh, ikb, jkb, ipol, iper, is, ib
+    REAL(DP) :: wgt, d, e
+    COMPLEX(DP) :: fact, p1, p2(3), bj, s
+    !
+    ikk = ikks(ik)
+    is = current_spin
+    fact = CMPLX( 0.d0, tpiba, KIND=DP )
+    wgt = 2.d0 * wk(ikk)
+    !
+    !$omp parallel private(pp1, pp2, acc, na, nt, ijkb0, nhn, ibnd, e, ih, jh, ikb, jkb, ipol, &
+    !$omp                  iper, d, bj, p1, p2, ib) if(nkb*nbnd > 5000)
+    ALLOCATE( pp1(nhm), pp2(nhm,3), acc(3,nper) )
+    !$omp do
+    DO na = 1, nat
+       nt = ityp(na)
+       ijkb0 = ofsbeta(na)
+       nhn = nh(nt)
+       acc(:,:) = (0.0_DP, 0.0_DP)
+       DO ibnd = 1, nbnd
+          e = et(ibnd,ikk)
+          ib = 4 * (ibnd - 1)
+          DO ih = 1, nhn
+             p1 = (0.0_DP, 0.0_DP)
+             p2(:) = (0.0_DP, 0.0_DP)
+             DO jh = 1, nhn
+                jkb = ijkb0 + jh
+                d = deeq(ih,jh,na,is)
+                IF ( okvan ) d = d - e * qq_at(ih,jh,na)
+                bj = becp1(ik)%k(jkb,ibnd)
+                p1 = p1 + d * bj
+                DO ipol = 1, 3
+                   p2(ipol) = p2(ipol) + d * alphap(ipol,ik)%k(jkb,ibnd)
+                   IF ( okvan ) p2(ipol) = p2(ipol) + int1(ih,jh,ipol,na,is) * bj
+                ENDDO
+             ENDDO
+             pp1(ih) = p1
+             pp2(ih,:) = p2(:)
+          ENDDO
+          DO ipol = 1, 3
+             DO ih = 1, nhn
+                ikb = ijkb0 + ih
+                DO iper = 1, nper
+                   acc(ipol,iper) = acc(ipol,iper) + wgt * ( pp2(ih,ipol) * &
+                        CONJG( bq(ikb,ib+1,iper) ) + pp1(ih) * CONJG( fact * bq(ikb,ib+1+ipol,iper) ) )
+                ENDDO
+             ENDDO
+          ENDDO
+       ENDDO
+       DO iper = 1, nper
+          DO ipol = 1, 3
+             dynwrk(nu_i0+iper,3*(na-1)+ipol) = dynwrk(nu_i0+iper,3*(na-1)+ipol) + acc(ipol,iper)
+          ENDDO
+       ENDDO
+    ENDDO
+    !$omp end do
+    DEALLOCATE( pp1, pp2, acc )
+    !$omp end parallel
+    !
+    ! ... ultrasoft: 2 wk sum_v conj(<beta_i|dpsi_v>) <beta_j|psi_v> for the term with int2
+    !
+    IF ( okvan ) THEN
+       !$omp parallel do private(iper, nb, nt, ijkb0, ih, jh, ibnd, s) if(nkb*nbnd > 5000)
+       DO nb = 1, nat
+          nt = ityp(nb)
+          ijkb0 = ofsbeta(nb)
+          DO iper = 1, nper
+             DO jh = 1, nh(nt)
+                DO ih = 1, nh(nt)
+                   s = (0.0_DP, 0.0_DP)
+                   DO ibnd = 1, nbnd
+                      s = s + CONJG( bq(ijkb0+ih,4*(ibnd-1)+1,iper) ) * becp1(ik)%k(ijkb0+jh,ibnd)
+                   ENDDO
+                   cus(ih,jh,nb,iper) = cus(ih,jh,nb,iper) + wgt * s
+                ENDDO
+             ENDDO
+          ENDDO
+       ENDDO
+       !$omp end parallel do
+    ENDIF
+    !
+  END SUBROUTINE drhodv_nl_k
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE drhodv_nl_int2( nu_i0, nper, cus, dynwrk )
+    !-----------------------------------------------------------------------
+    !! Ultrasoft term of drhodvnl with int2, from the sums over k-points
+    !! and bands accumulated by drhodv_nl_k:
+    !! dynwrk(nu,(na,alpha)) += sum_{nb,ih,jh} int2(ih,jh,alpha,na,nb) cus(ih,jh,nb,iper)
+    !
+    USE ions_base,  ONLY : nat, ityp
+    USE uspp_param, ONLY : nh, nhm
+    USE phus,       ONLY : int2
+    !
+    INTEGER, INTENT(IN) :: nu_i0, nper
+    COMPLEX(DP), INTENT(IN) :: cus(nhm,nhm,nat,nper)
+    COMPLEX(DP), INTENT(INOUT) :: dynwrk(3*nat,3*nat)
+    INTEGER :: na, nb, nt, ih, jh, ipol, iper
+    COMPLEX(DP) :: s
+    !
+    !$omp parallel do private(na, nb, nt, ih, jh, ipol, iper, s) if(nat > 8)
+    DO na = 1, nat
+       DO iper = 1, nper
+          DO ipol = 1, 3
+             s = (0.0_DP, 0.0_DP)
+             DO nb = 1, nat
+                nt = ityp(nb)
+                DO jh = 1, nh(nt)
+                   DO ih = 1, nh(nt)
+                      s = s + int2(ih,jh,ipol,na,nb) * cus(ih,jh,nb,iper)
+                   ENDDO
+                ENDDO
+             ENDDO
+             dynwrk(nu_i0+iper,3*(na-1)+ipol) = dynwrk(nu_i0+iper,3*(na-1)+ipol) + s
+          ENDDO
+       ENDDO
+    ENDDO
+    !$omp end parallel do
+    !
+  END SUBROUTINE drhodv_nl_int2
   !
   !-----------------------------------------------------------------------
   SUBROUTINE dynmat_us_nl_dev( dynwrk )

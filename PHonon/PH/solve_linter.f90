@@ -74,7 +74,10 @@ SUBROUTINE solve_linter (irr, imode0, dfpt_data)
   USE recover_mod,          ONLY : write_rec
 #if defined(__CUDA)
   USE dfpt_dev,             ONLY : dfpt_dev_prefill_begin, dfpt_dev_prefill_end, &
-                                   dfpt_dev_agree, dvb_d, psik_d, w_d, nbo, npwxl
+                                   dfpt_dev_keep_dpsi, dfpt_dev_agree, dvb_d, psik_d, w_d, &
+                                   nbo, npwxl
+  USE dyn_dev,              ONLY : dyn_dev_ok
+  USE control_ph,           ONLY : zue
   USE dvbare_dev,           ONLY : dvbare_dev_ok, dvqpsi_us_dev
 #endif
   !
@@ -189,6 +192,11 @@ SUBROUTINE solve_linter (irr, imode0, dfpt_data)
      ENDDO
      CALL dfpt_dev_prefill_end()
      CALL stop_clock ('dvqpsi_us')
+     !
+     ! the response wavefunctions are needed again only by drhodv, which takes their
+     ! projections from the device: no copy to the buffer (zue: add_zstar_ue reads it)
+     !
+     IF (.NOT. zue .AND. dyn_dev_ok()) CALL dfpt_dev_keep_dpsi()
   ENDIF
 #endif
   !
