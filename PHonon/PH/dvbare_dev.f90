@@ -48,7 +48,7 @@ MODULE dvbare_dev
   !
 #if defined(__CUDA)
   !
-  PUBLIC :: dvloc_dev_slot, dvl_d, &
+  PUBLIC :: dvqpsi_us_dev, dvqpsi_us_host, dvqpsi_nl_coef, dvloc_dev_slot, dvl_d, &
             dvbare_blas, dev_fft3
   !
   COMPLEX(DP), PARAMETER :: c_one = (1.0_DP, 0.0_DP), c_zero = (0.0_DP, 0.0_DP)
@@ -478,6 +478,326 @@ CONTAINS
     CALL stop_clock( 'dvq_dvloc' )
     !
   END FUNCTION dvloc_dev_slot
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE dvqpsi_nl_coef( ik, uact, becp1, alphap, ps )
+    !-----------------------------------------------------------------------
+    !! Coefficients of the nonlocal part of \(dV_\text{bare}/du\,\psi\)
+    !! (dvqpsi_us_only, collinear case): the term proportional to
+    !! \(\beta(k+q+G)\) in ps(:,ibnd) and the three terms proportional to
+    !! \((k+q+G)_\alpha\beta(k+q+G)\) in ps(:,nbnd+3*(ibnd-1)+alpha).
+    !! The current spin must be set by the caller.
+    !
+    USE cell_base,  ONLY : tpiba
+    USE ions_base,  ONLY : nat, ityp
+    USE lsda_mod,   ONLY : current_spin
+    USE wvfct,      ONLY : nbnd, et
+    USE uspp,       ONLY : okvan, nkb, ofsbeta, deeq, qq_at
+    USE uspp_param, ONLY : nh, nhm
+    USE phus,       ONLY : int1, int2
+    USE qpoint,     ONLY : nksq, ikks
+    USE becmod,     ONLY : bec_type
+    !
+    INTEGER, INTENT(IN) :: ik
+    COMPLEX(DP), INTENT(IN) :: uact(3*nat)
+    TYPE(bec_type), INTENT(IN) :: becp1(nksq), alphap(3,nksq)
+    COMPLEX(DP), INTENT(OUT) :: ps(nkb,4*nbnd)
+    !
+    REAL(DP), PARAMETER :: eps = 1.d-12
+    INTEGER :: ikk, is, na, nb, nt, mu, nu, ih, jh, ikb, jkb, ijkb0, ipol, ibnd, im, nmov, i2
+    INTEGER, ALLOCATABLE :: mov(:)
+    COMPLEX(DP), ALLOCATABLE :: aus(:,:,:)
+    COMPLEX(DP) :: s1, s2(3), bj
+    REAL(DP) :: d, e
+    LOGICAL :: ok
+    !
+    ikk = ikks(ik)
+    is = current_spin
+    ALLOCATE( mov(nat) )
+    nmov = 0
+    DO na = 1, nat
+       mu = 3 * (na - 1)
+       IF ( ABS(uact(mu+1)) + ABS(uact(mu+2)) + ABS(uact(mu+3)) > eps ) THEN
+          nmov = nmov + 1
+          mov(nmov) = na
+       ENDIF
+    ENDDO
+    !
+    ! ... ultrasoft: the term with int2 does not depend on the band
+    !
+    IF ( okvan ) THEN
+       ALLOCATE( aus(nhm,nhm,nat) )
+       aus(:,:,:) = (0.0_DP, 0.0_DP)
+       !$omp parallel do private(na, nt, im, nb, nu, ih, jh, ipol) if(nmov*nat > 64)
+       DO na = 1, nat
+          nt = ityp(na)
+          DO im = 1, nmov
+             nb = mov(im)
+             nu = 3 * (nb - 1)
+             DO ih = 1, nh(nt)
+                DO jh = 1, nh(nt)
+                   DO ipol = 1, 3
+                      aus(ih,jh,na) = aus(ih,jh,na) + int2(ih,jh,ipol,nb,na) * uact(nu+ipol)
+                   ENDDO
+                ENDDO
+             ENDDO
+          ENDDO
+       ENDDO
+       !$omp end parallel do
+    ENDIF
+    !
+    !$omp parallel do private(ibnd, e, i2, im, na, nt, mu, ijkb0, ih, jh, ikb, jkb, ipol, &
+    !$omp                     s1, s2, d, bj) if(nbnd*nkb > 20000)
+    DO ibnd = 1, nbnd
+       e = et(ibnd,ikk)
+       i2 = nbnd + 3*(ibnd-1)
+       ps(:,ibnd) = (0.0_DP, 0.0_DP)
+       ps(:,i2+1:i2+3) = (0.0_DP, 0.0_DP)
+       DO im = 1, nmov
+          na = mov(im)
+          nt = ityp(na)
+          mu = 3 * (na - 1)
+          ijkb0 = ofsbeta(na)
+          DO ih = 1, nh(nt)
+             ikb = ijkb0 + ih
+             s1 = (0.0_DP, 0.0_DP)
+             s2(:) = (0.0_DP, 0.0_DP)
+             DO jh = 1, nh(nt)
+                jkb = ijkb0 + jh
+                d = deeq(ih,jh,na,is)
+                IF ( okvan ) d = d - e * qq_at(ih,jh,na)
+                bj = becp1(ik)%k(jkb,ibnd)
+                DO ipol = 1, 3
+                   s1 = s1 + d * alphap(ipol,ik)%k(jkb,ibnd) * uact(mu+ipol)
+                   s2(ipol) = s2(ipol) + d * bj * (0.0_DP,-1.0_DP) * uact(mu+ipol) * tpiba
+                   IF ( okvan ) s1 = s1 + ( int1(ih,jh,ipol,na,is) * bj ) * uact(mu+ipol)
+                ENDDO
+             ENDDO
+             ps(ikb,ibnd) = s1
+             ps(ikb,i2+1:i2+3) = s2(:)
+          ENDDO
+       ENDDO
+       IF ( okvan .AND. nmov > 0 ) THEN
+          DO na = 1, nat
+             nt = ityp(na)
+             ijkb0 = ofsbeta(na)
+             DO ih = 1, nh(nt)
+                s1 = (0.0_DP, 0.0_DP)
+                DO jh = 1, nh(nt)
+                   s1 = s1 + aus(ih,jh,na) * becp1(ik)%k(ijkb0+jh,ibnd)
+                ENDDO
+                ps(ijkb0+ih,ibnd) = ps(ijkb0+ih,ibnd) + s1
+             ENDDO
+          ENDDO
+       ENDIF
+    ENDDO
+    !$omp end parallel do
+    !
+    ! ... as in the stock routine, a term (k+q+G)_alpha beta that is below
+    ! ... eps for all bands is dropped
+    !
+    DO im = 1, nmov
+       na = mov(im)
+       DO ih = 1, nh(ityp(na))
+          ikb = ofsbeta(na) + ih
+          DO ipol = 1, 3
+             ok = .FALSE.
+             DO ibnd = 1, nbnd
+                IF ( ABS( ps(ikb,nbnd+3*(ibnd-1)+ipol) ) > eps ) THEN
+                   ok = .TRUE.
+                   EXIT
+                ENDIF
+             ENDDO
+             IF ( .NOT. ok ) THEN
+                DO ibnd = 1, nbnd
+                   ps(ikb,nbnd+3*(ibnd-1)+ipol) = (0.0_DP, 0.0_DP)
+                ENDDO
+             ENDIF
+          ENDDO
+       ENDDO
+    ENDDO
+    !
+    DEALLOCATE( mov )
+    IF ( okvan ) DEALLOCATE( aus )
+    !
+  END SUBROUTINE dvqpsi_nl_coef
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE dvqpsi_us_dev( ik, uact, addnlcc, becp1, alphap, nb, out_d, ldo, &
+                            psi_d, ldp, beta_d, ldb )
+    !-----------------------------------------------------------------------
+    !! \(dV_\text{bare}/du\,\psi_k\) for the first nb bands of k-point ik,
+    !! written to the device array out_d(1:npwx,1:nb) (zero above npwq).
+    !! Same input as dvqpsi_us: the wavefunctions in evc, the beta
+    !! functions of k+q in vkb (device copy), the current spin set.
+    !! A caller that already has \(\psi_k\) and/or \(\beta_{k+q}\) on the
+    !! device passes them in psi_d (leading dimension ldp, at least nb
+    !! columns) and beta_d (leading dimension ldb, nkb columns): evc and
+    !! vkb are then not used.
+    !
+    USE ions_base,     ONLY : nat
+    USE fft_base,      ONLY : dffts
+    USE wvfct,         ONLY : npwx, nbnd
+    USE wavefunctions, ONLY : evc
+    USE klist,         ONLY : xk, ngk, igk_k
+    USE gvect,         ONLY : g
+    USE qpoint,        ONLY : nksq, ikks, ikqs
+    USE uspp,          ONLY : nkb, vkb
+    USE becmod,        ONLY : bec_type
+    !
+    INTEGER, INTENT(IN) :: ik, nb, ldo
+    COMPLEX(DP), INTENT(IN) :: uact(3*nat)
+    LOGICAL, INTENT(IN) :: addnlcc
+    TYPE(bec_type), INTENT(IN) :: becp1(nksq), alphap(3,nksq)
+    COMPLEX(DP), DEVICE, INTENT(INOUT) :: out_d(ldo,nb)
+    INTEGER, OPTIONAL, INTENT(IN) :: ldp, ldb
+    COMPLEX(DP), DEVICE, OPTIONAL, INTENT(IN) :: psi_d(*), beta_d(*)
+    !
+    INTEGER :: ikk, ikq, npw, npwq, islot, ig, j, j0, nbl, ip, ir, nnr, istat, npwxl, ipol, ldpl
+    REAL(DP) :: scale
+    LOGICAL :: own_psi, own_beta
+    !
+    IF ( nb > nbnd .OR. ldo < npwx ) CALL errore( 'dvqpsi_us_dev', 'wrong dimensions', 1 )
+    own_psi = PRESENT(psi_d) .AND. PRESENT(ldp)
+    own_beta = PRESENT(beta_d) .AND. PRESENT(ldb)
+    ldpl = npwx
+    IF ( own_psi ) ldpl = ldp
+    CALL work_setup( )
+    ikk = ikks(ik) ; ikq = ikqs(ik)
+    npw = ngk(ikk) ; npwq = ngk(ikq)
+    nnr = w_nnr ; npwxl = npwx
+    scale = 1.0_DP / DBLE(nnr)
+    !
+    islot = dvloc_dev_slot( uact, addnlcc )
+    !
+    ! ... FFT maps of k+G and k+q+G; k+q+G
+    !
+    DO ig = 1, npw
+       nl_h(ig,1) = dffts%nl(igk_k(ig,ikk))
+    ENDDO
+    nl_h(npw+1:npwx,1) = 1
+    DO ig = 1, npwq
+       nl_h(ig,2) = dffts%nl(igk_k(ig,ikq))
+       kqg_h(:,ig) = xk(:,ikq) + g(:,igk_k(ig,ikq))
+    ENDDO
+    nl_h(npwq+1:npwx,2) = 1
+    kqg_h(:,npwq+1:npwx) = 0.0_DP
+    nlk_d = nl_h
+    kqg_d = kqg_h
+    !
+    ! ... local potential: psi(r) * dV_loc(r), back on the k+q sphere
+    !
+    IF ( .NOT. own_psi ) THEN
+       !$acc update device(evc)
+    ENDIF
+    DO j0 = 0, nb-1, nfb
+       nbl = MIN( nfb, nb-j0 )
+       ip = get_plan( nbl )
+       IF ( own_psi ) THEN
+          !$cuf kernel do(2)
+          DO j = 1, nbl
+             DO ig = 1, npw
+                psig_d(nlk_d(ig,1) + (j-1)*nnr) = psi_d(ig + (j0+j-1)*ldpl)
+             ENDDO
+          ENDDO
+       ELSE
+          !$acc parallel loop collapse(2) present(evc)
+          DO j = 1, nbl
+             DO ig = 1, npw
+                psig_d(nlk_d(ig,1) + (j-1)*nnr) = evc(ig,j0+j)
+             ENDDO
+          ENDDO
+       ENDIF
+       istat = cufftExecZ2Z( plan(ip), psig_d, psic_d, CUFFT_INVERSE )
+       !$cuf kernel do(2)
+       DO j = 1, nbl
+          DO ig = 1, npw
+             psig_d(nlk_d(ig,1) + (j-1)*nnr) = (0.0_DP, 0.0_DP)
+          ENDDO
+       ENDDO
+       !$cuf kernel do(2)
+       DO j = 1, nbl
+          DO ir = 1, nnr
+             psic_d(ir + (j-1)*nnr) = psic_d(ir + (j-1)*nnr) * dvl_d(ir,islot)
+          ENDDO
+       ENDDO
+       istat = cufftExecZ2Z( plan(ip), psic_d, psic_d, CUFFT_FORWARD )
+       !$cuf kernel do(2)
+       DO j = 1, nbl
+          DO ig = 1, npwxl
+             IF ( ig <= npwq ) THEN
+                out_d(ig,j0+j) = psic_d(nlk_d(ig,2) + (j-1)*nnr) * scale
+             ELSE
+                out_d(ig,j0+j) = (0.0_DP, 0.0_DP)
+             ENDIF
+          ENDDO
+       ENDDO
+    ENDDO
+    !
+    ! ... nonlocal potential: beta(k+q+G) ps1 + (k+q+G)_alpha beta(k+q+G) ps2_alpha
+    !
+    IF ( nkb > 0 ) THEN
+       CALL start_clock( 'dvq_coef' )
+       CALL dvqpsi_nl_coef( ik, uact, becp1, alphap, ps_h )
+       ps_d = ps_h
+       CALL stop_clock( 'dvq_coef' )
+       IF ( own_beta ) THEN
+          istat = cublasZgemm( hblas, CUBLAS_OP_N, CUBLAS_OP_N, npwq, nb, nkb, c_one, beta_d, ldb, &
+                               ps_d, nkb, c_one, out_d, ldo )
+       ELSE
+          !$acc host_data use_device(vkb)
+          istat = cublasZgemm( hblas, CUBLAS_OP_N, CUBLAS_OP_N, npwq, nb, nkb, c_one, vkb, npwx, &
+                               ps_d, nkb, c_one, out_d, ldo )
+          !$acc end host_data
+       ENDIF
+       IF ( istat /= 0 ) CALL errore( 'dvqpsi_us_dev', 'cublasZgemm failed', ABS(istat) )
+       DO j0 = 0, nb-1, nbc
+          nbl = MIN( nbc, nb-j0 )
+          IF ( own_beta ) THEN
+             istat = cublasZgemm( hblas, CUBLAS_OP_N, CUBLAS_OP_N, npwq, 3*nbl, nkb, c_one, beta_d, &
+                                  ldb, ps_d(1,nbnd+3*j0+1), nkb, c_zero, tmp_d, npwx )
+          ELSE
+             !$acc host_data use_device(vkb)
+             istat = cublasZgemm( hblas, CUBLAS_OP_N, CUBLAS_OP_N, npwq, 3*nbl, nkb, c_one, vkb, &
+                                  npwx, ps_d(1,nbnd+3*j0+1), nkb, c_zero, tmp_d, npwx )
+             !$acc end host_data
+          ENDIF
+          IF ( istat /= 0 ) CALL errore( 'dvqpsi_us_dev', 'cublasZgemm failed', ABS(istat) )
+          !$cuf kernel do(2)
+          DO j = 1, nbl
+             DO ig = 1, npwq
+                out_d(ig,j0+j) = out_d(ig,j0+j) + kqg_d(1,ig) * tmp_d(ig,3*(j-1)+1) + &
+                                 kqg_d(2,ig) * tmp_d(ig,3*(j-1)+2) + kqg_d(3,ig) * tmp_d(ig,3*(j-1)+3)
+             ENDDO
+          ENDDO
+       ENDDO
+    ENDIF
+    !
+  END SUBROUTINE dvqpsi_us_dev
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE dvqpsi_us_host( ik, uact, addnlcc, becp1, alphap, dvpsi_h )
+    !-----------------------------------------------------------------------
+    !! dvqpsi_us_dev for all bands, result copied to the host.
+    !
+    USE ions_base, ONLY : nat
+    USE wvfct,     ONLY : npwx, nbnd
+    USE qpoint,    ONLY : nksq
+    USE becmod,    ONLY : bec_type
+    !
+    INTEGER, INTENT(IN) :: ik
+    COMPLEX(DP), INTENT(IN) :: uact(3*nat)
+    LOGICAL, INTENT(IN) :: addnlcc
+    TYPE(bec_type), INTENT(IN) :: becp1(nksq), alphap(3,nksq)
+    COMPLEX(DP), INTENT(OUT) :: dvpsi_h(npwx,nbnd)
+    !
+    CALL work_setup( )
+    CALL dvqpsi_us_dev( ik, uact, addnlcc, becp1, alphap, nbnd, dvq_d, npwx )
+    CALL start_clock( 'dvq_d2h' )
+    dvpsi_h = dvq_d
+    CALL stop_clock( 'dvq_d2h' )
+    !
+  END SUBROUTINE dvqpsi_us_host
   !
 #else
   !

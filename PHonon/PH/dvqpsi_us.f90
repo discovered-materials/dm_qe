@@ -38,6 +38,9 @@ subroutine dvqpsi_us (ik, uact, addnlcc, becp1, alphap)
   USE becmod,           ONLY : bec_type
   USE gvect,            ONLY : gg
   USE control_ph,       ONLY : lmultipole
+#if defined(__CUDA)
+  USE dvbare_dev,       ONLY : dvbare_dev_ok, dvqpsi_us_host
+#endif
   !
   IMPLICIT NONE
   !
@@ -79,6 +82,20 @@ subroutine dvqpsi_us (ik, uact, addnlcc, becp1, alphap)
   !
   ALLOCATE( nl_d(dffts%ngm) )
   nl_d  = dffts%nl
+#endif
+  !
+#if defined(__CUDA)
+  !
+  ! Device path: batched FFTs for the local term, ZGEMM for the nonlocal
+  ! term, dV_loc computed once per pattern (module dvbare_dev)
+  !
+  IF ( dvbare_dev_ok( ) ) THEN
+     call start_clock ('dvqpsi_us')
+     IF (lsda) current_spin = isk(ikks(ik))
+     CALL dvqpsi_us_host (ik, uact, addnlcc, becp1, alphap, dvpsi)
+     call stop_clock ('dvqpsi_us')
+     RETURN
+  ENDIF
 #endif
   !
   call start_clock ('dvqpsi_us')

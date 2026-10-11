@@ -159,6 +159,9 @@ subroutine print_clock_ph
   call print_clock ('dvqpsi_us')
 
   call print_clock ('dvqpsi_us_on')
+  call print_clock ('dvq_dvloc')
+  call print_clock ('dvq_coef')
+  call print_clock ('dvq_d2h')
 
   WRITE( stdout, * )
   call print_clock ('firstfft')

@@ -29,6 +29,7 @@ subroutine dynmat0_new
   USE dynmat,        ONLY : dyn, dyn00, dyn_rec
   USE lr_symm_base,  ONLY : minus_q, irotmq, nsymq, rtau
   USE ldaU,          ONLY : lda_plus_u
+  USE dvbare_dev,    ONLY : dvbare_dev_reset
 
   implicit none
 
@@ -38,6 +39,12 @@ subroutine dynmat0_new
   complex(DP) :: wrk, dynwrk (3 * nat, 3 * nat)
   ! auxiliary space
 
+  !
+  ! This routine is called once for every q-point: the data of the previous
+  ! q kept on the device by dvbare_dev and dyn_dev are dropped here.
+  !
+  CALL dvbare_dev_reset()
+  !
   IF ( .NOT. comp_irr(0) .or. done_irr(0) ) RETURN
   IF (rec_code_read > -30 ) RETURN
 
