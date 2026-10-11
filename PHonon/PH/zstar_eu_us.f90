@@ -43,7 +43,9 @@ subroutine zstar_eu_us
   USE ldaU,             ONLY : lda_plus_u
   USE dv_of_drho_lr
   USE uspp_init,        ONLY : init_us_2
+  USE dfpt_dev_grid,    ONLY : dfpt_dev_dv_of_drho
   USE incdrhoscf_mod,   ONLY : incdrhoscf, incdrhoscf_nc
+  USE usaug_dev,        ONLY : usaug_on, usaug_check
   !
   implicit none
   !
@@ -64,6 +66,11 @@ subroutine zstar_eu_us
   complex(DP), allocatable :: drhoscfh (:,:)
   complex(DP), allocatable :: dvkb (:,:,:)
   integer :: npe, irr1, imode1, na, nt
+  complex(DP), allocatable :: zs_new(:,:), zs_ref(:,:)
+  ! the term with the position operator computed for all modes together
+  logical :: lnew, lcheck
+  logical :: dv_done
+  complex(DP), allocatable :: dvtmp(:,:,:)
 
 #ifdef TIMINIG_ZSTAR_US
   call start_clock('zstar_eu_us')
@@ -143,6 +150,12 @@ subroutine zstar_eu_us
 
   if (nlcc_any) call addnlcc_zstar_eu_us (dvscf)
 
+  ! the three directions at once on the device, when the case is served
+  allocate (dvtmp(dfftp%nnr, nspin_mag, 3))
+  call dfpt_dev_dv_of_drho (3, dvscf, dvtmp, dv_done)
+  if (dv_done) call zcopy (dfftp%nnr*nspin_mag*3, dvtmp, 1, dvscf, 1)
+  deallocate (dvtmp)
+  if (.not. dv_done) then
   do ipol = 1, 3
      !
      ! Instead of recalculating the perturbed charge density,
@@ -153,6 +166,7 @@ subroutine zstar_eu_us
      !
      call dv_of_drho (dvscf (:, :, ipol))
   enddo
+  endif
   call psymdvscf(dvscf, dfftp)
 
 #ifdef TIMINIG_ZSTAR_US
@@ -188,6 +202,22 @@ subroutine zstar_eu_us
   !
   !  Calculate the part with the position operator
   !
+  ! In the collinear case the scalar products with the wavefunctions that
+  ! this term needs are written with <beta|psi>, <beta|(k+G) psi> and the
+  ! like, which do not depend on the mode: see zstar_eu_us_pos below
+  !
+  call start_clock ('zeu_us_pos')
+  lnew = usaug_on()
+  if (lnew) then
+     allocate (zs_new(3,3*nat))
+     call zstar_eu_us_pos (zs_new)
+     if (usaug_check()) then
+        allocate (zs_ref, source = zstareu0)
+     else
+        zstareu0(:,:) = zstareu0(:,:) + zs_new(:,:)
+     endif
+  endif
+  if (.not. lnew .or. usaug_check()) then
   allocate (dvkb(npwx,nkb,3))
   do ik = 1, nksq
      ikk = ikks(ik)
@@ -262,6 +292,14 @@ subroutine zstar_eu_us
      enddo
   enddo
   deallocate (dvkb)
+  endif
+  if (allocated(zs_ref)) then
+     zs_ref(:,:) = zstareu0(:,:) - zs_ref(:,:)
+     lcheck = usaug_check ('zstar_eu_us pos', size(zs_new), zs_new, zs_ref)
+     deallocate (zs_ref)
+  endif
+  if (allocated(zs_new)) deallocate (zs_new)
+  call stop_clock ('zeu_us_pos')
 
   deallocate (pdsp)
   deallocate (dbecsum)
@@ -311,3 +349,172 @@ subroutine zstar_eu_us
 
   return
 end subroutine zstar_eu_us
+!
+!-----------------------------------------------------------------------
+subroutine zstar_eu_us_pos (zs)
+  !-----------------------------------------------------------------------
+  !! The part of the ultrasoft term of the effective charges that contains
+  !! the position operator, for all the modes (collinear case, no DFT+U):
+  !!
+  !! zs(jpol,mode) =   w sum_ij <psi_i|dvpsi_j> <psi_j|dS/du|psi_i>
+  !!                 - w sum_i <psi_i| dS/du |dpsi_i> + (dK/du - dS/du) r |psi_i> >
+  !!
+  !! with dvpsi the commutator [H-eS, r]|psi> plus additional terms (buffer
+  !! iuebar), dpsi = P_c [H-eS, r]|psi> (buffer iucom), as in the loop over
+  !! k-points and modes of zstar_eu_us (psidspsi, add_for_charges, add_dkmds).
+  !! dS/du and dK/du are sums of projectors on the beta functions and on
+  !! (k+G) times the beta functions, so every scalar product with psi_i is
+  !! a sum over the beta functions of products of
+  !!   becp1 = <beta|psi>,   alphap = <beta|i(k+G)psi>,
+  !!   bedp  = <beta|dpsi>,  alphapp = <beta|i(k+G)dpsi>,
+  !!   becp2 = <dbeta/dk|psi>, alphadk = <dbeta/dk|i(k+G)psi>
+  !! that do not depend on the mode, times the displacement of the atom:
+  !! they are computed once per k-point and direction of the field instead
+  !! of once per mode, and nothing is applied to the wavefunctions.
+  !
+  USE kinds,            ONLY : DP
+  USE cell_base,        ONLY : tpiba
+  USE ions_base,        ONLY : nat, ityp
+  USE buffers,          ONLY : get_buffer
+  USE klist,            ONLY : xk, wk, ngk, igk_k
+  USE gvect,            ONLY : g
+  USE uspp,             ONLY : nkb, vkb, qq_nt, ofsbeta
+  USE uspp_param,       ONLY : nh
+  USE wvfct,            ONLY : nbnd, npwx
+  USE wavefunctions,    ONLY : evc
+  USE modes,            ONLY : u
+  USE units_ph,         ONLY : iucom, lrcom, lrebar, iuebar
+  USE units_lr,         ONLY : iuwfc, lrwfc
+  USE control_lr,       ONLY : nbnd_occ
+  USE lrus,             ONLY : becp1, dpqq
+  USE phus,             ONLY : alphap
+  USE eqv,              ONLY : dvpsi, dpsi
+  USE qpoint,           ONLY : nksq, ikks
+  USE uspp_init,        ONLY : init_us_2
+  !
+  implicit none
+  !
+  complex(DP), intent(out) :: zs(3,3*nat)
+  !! the contribution to zstareu0 (field direction, mode) of the k-points of this pool
+  !
+  real(DP), parameter :: eps = 1.d-12
+  complex(DP), parameter :: one = (1.d0,0.d0), zero = (0.d0,0.d0), ci = (0.d0,1.d0)
+  integer :: ik, ikk, npw, nocc, jpol, ipol, nrec, ibnd, ig, na, nt, ih, jh, ikb, jkb, &
+             ijkb0, mu, mode
+  real(DP) :: weight, q, dq
+  complex(DP) :: sa, sb1, sb2, t, fac
+  complex(DP), allocatable :: dvkb(:,:,:), aux1(:,:), mm(:,:), bedp(:,:), alphapp(:,:,:), &
+                              becp2(:,:), alphadk(:,:,:), bm(:,:), am(:,:,:), cb(:,:), tc(:,:)
+  !
+  zs(:,:) = zero
+  if (nkb <= 0) return
+  allocate (dvkb(npwx,nkb,3), aux1(npwx,nbnd), mm(nbnd,nbnd), bedp(nkb,nbnd), &
+            alphapp(nkb,nbnd,3), becp2(nkb,nbnd), alphadk(nkb,nbnd,3), bm(nkb,nbnd), &
+            am(nkb,nbnd,3), cb(nkb,nbnd), tc(3,3*nat))
+  !
+  ! tc(jpol,mu): the term for the displacement of one atom in one cartesian
+  ! direction, mu = (atom, direction)
+  !
+  tc(:,:) = zero
+  do ik = 1, nksq
+     ikk = ikks(ik)
+     npw = ngk(ikk)
+     nocc = nbnd_occ(ikk)
+     weight = wk(ikk)
+     if (nksq > 1) call get_buffer (evc, lrwfc, iuwfc, ikk)
+     call init_us_2 (npw, igk_k(1,ikk), xk(1,ikk), vkb)
+     call dvkb3 (ik, dvkb)
+     do jpol = 1, 3
+        nrec = (jpol - 1) * nksq + ik
+        !
+        ! mm(i,j) = <psi_i|dvpsi_j>
+        !
+        call get_buffer (dvpsi, lrebar, iuebar, nrec)
+        call zgemm ('C', 'N', nocc, nocc, npwx, one, evc, npwx, dvpsi, npwx, zero, mm, nbnd)
+        !
+        ! projections of dpsi = P_c [H-eS, r]|psi> and of psi
+        !
+        call get_buffer (dpsi, lrcom, iucom, nrec)
+        call zgemm ('C', 'N', nkb, nocc, npw, one, vkb, npwx, dpsi, npwx, zero, bedp, nkb)
+        call zgemm ('C', 'N', nkb, nocc, npw, one, dvkb(1,1,jpol), npwx, evc, npwx, zero, becp2, nkb)
+        do ipol = 1, 3
+           do ibnd = 1, nocc
+              do ig = 1, npw
+                 aux1(ig,ibnd) = dpsi(ig,ibnd) * tpiba * (0.d0,1.d0) * &
+                                 ( xk(ipol,ikk) + g(ipol,igk_k(ig,ikk)) )
+              enddo
+           enddo
+           call zgemm ('C', 'N', nkb, nocc, npw, one, vkb, npwx, aux1, npwx, zero, &
+                       alphapp(1,1,ipol), nkb)
+           do ibnd = 1, nocc
+              do ig = 1, npw
+                 aux1(ig,ibnd) = evc(ig,ibnd) * tpiba * (0.d0,1.d0) * &
+                                 ( xk(ipol,ikk) + g(ipol,igk_k(ig,ikk)) )
+              enddo
+           enddo
+           call zgemm ('C', 'N', nkb, nocc, npw, one, dvkb(1,1,jpol), npwx, aux1, npwx, zero, &
+                       alphadk(1,1,ipol), nkb)
+        enddo
+        !
+        ! bm(ikb,i) = sum_j conj(becp1(ikb,j)) mm(i,j), am likewise with alphap
+        !
+        cb(:,1:nocc) = conjg(becp1(ik)%k(:,1:nocc))
+        call zgemm ('N', 'T', nkb, nocc, nocc, one, cb, nkb, mm, nbnd, zero, bm, nkb)
+        do ipol = 1, 3
+           cb(:,1:nocc) = conjg(alphap(ipol,ik)%k(:,1:nocc))
+           call zgemm ('N', 'T', nkb, nocc, nocc, one, cb, nkb, mm, nbnd, zero, am(1,1,ipol), nkb)
+        enddo
+        !
+        do na = 1, nat
+           nt = ityp(na)
+           ijkb0 = ofsbeta(na)
+           mu = 3 * (na - 1)
+           do ipol = 1, 3
+              t = zero
+              do ih = 1, nh(nt)
+                 ikb = ijkb0 + ih
+                 do jh = 1, nh(nt)
+                    jkb = ijkb0 + jh
+                    q = qq_nt(ih,jh,nt)
+                    dq = dpqq(ih,jh,jpol,nt)
+                    sa = zero ; sb1 = zero ; sb2 = zero
+                    do ibnd = 1, nocc
+                       sa = sa + bm(ikb,ibnd) * alphap(ipol,ik)%k(jkb,ibnd) + &
+                                 am(ikb,ibnd,ipol) * becp1(ik)%k(jkb,ibnd)
+                       sb1 = sb1 + conjg(becp1(ik)%k(ikb,ibnd)) * alphapp(jkb,ibnd,ipol) + &
+                                   conjg(alphap(ipol,ik)%k(ikb,ibnd)) * bedp(jkb,ibnd)
+                       sb2 = sb2 + conjg(becp1(ik)%k(ikb,ibnd)) * &
+                                   ( ci * q * alphadk(jkb,ibnd,ipol) + dq * alphap(ipol,ik)%k(jkb,ibnd) ) + &
+                                   conjg(alphap(ipol,ik)%k(ikb,ibnd)) * &
+                                   ( ci * q * becp2(jkb,ibnd) + dq * becp1(ik)%k(jkb,ibnd) )
+                    enddo
+                    t = t + weight * q * sa - weight * ( q * sb1 + sb2 )
+                 enddo
+              enddo
+              tc(jpol,mu+ipol) = tc(jpol,mu+ipol) + t
+           enddo
+        enddo
+     enddo
+  enddo
+  !
+  ! from the displacements of the atoms to the modes; the atoms that a mode
+  ! does not move are skipped as in psidspsi, add_for_charges and add_dkmds
+  !
+  do mode = 1, 3 * nat
+     do na = 1, nat
+        mu = 3 * (na - 1)
+        if ( abs(u(mu+1,mode)) + abs(u(mu+2,mode)) + abs(u(mu+3,mode)) > eps ) then
+           do ipol = 1, 3
+              fac = u(mu+ipol,mode)
+              do jpol = 1, 3
+                 zs(jpol,mode) = zs(jpol,mode) + tc(jpol,mu+ipol) * fac
+              enddo
+           enddo
+        endif
+     enddo
+  enddo
+  !
+  deallocate (dvkb, aux1, mm, bedp, alphapp, becp2, alphadk, bm, am, cb, tc)
+  !
+  return
+end subroutine zstar_eu_us_pos

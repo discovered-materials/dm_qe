@@ -47,6 +47,8 @@ subroutine print_clock_ph
      call print_clock ('solve_e')
      call print_clock ('dielec')
      call print_clock ('zstar_eu')
+     call print_clock ('zeu_bare')
+     call print_clock ('zeu_us_pos')
 #ifdef TIMING_ZSTAR_US
      WRITE( stdout, * )
      call print_clock ('zstar_eu_us')
