@@ -2473,6 +2473,357 @@ CONTAINS
   END SUBROUTINE vloc_g
   !
   !-----------------------------------------------------------------------
+  SUBROUTINE setup_lowg_real( )
+    !-----------------------------------------------------------------------
+    !! The preconditioner of setup_lowg for the real mode: the block of
+    !! B = H + alpha_pv P_v (and of S) on the pairs (G, G') of lowest kinetic
+    !! energy, in the real storage of the K-symmetric vectors (two numbers per
+    !! pair, the matrix B~ with (B x)~ = B~ x~), diagonalized on the device.
+    !! For a vector x = sum_j x_j |G_j> + conj(x_j) |G'_j>:
+    !!   (B x)(G_i) = sum_j a_ij x_j + b_ij conj(x_j),
+    !!   a_ij = B(G_i,G_j), b_ij = B(G_i,G'_j),
+    !! local part from V(G_i - G_j) and V(G_i - G'_j), nonlocal and projector
+    !! part 2 W~ D W~^T from the real rows of W. Size: as in setup_lowg, with
+    !! the number of modes that the run computes at this q-point.
+    !
+    USE io_global,   ONLY : stdout
+    USE klist,       ONLY : igk_k
+    USE gvect,       ONLY : mill
+    USE qpoint,      ONLY : ikks
+    !
+    INTEGER, PARAMETER :: nbmax = 16384
+    REAL(DP), PARAMETER :: elow_def = 24.0_DP, cap_fac = 2.0_DP, rt2 = 1.4142135623730951_DP
+    INTEGER :: ik, ikk, i, j, n, nlp, nb, is, nm, ncap, npc, lenv, ierr, istat, lwork, info, nbad, &
+               pi, pj, mi(3), mj(3), mpj(3), mm(3), nbl, nwl, nkl, ikl, iw, na, iof, ih, jh, nhl
+    CHARACTER(LEN=16) :: envval
+    REAL(DP) :: elow, capf, emax, apv, v0, hh, ss
+    COMPLEX(DP) :: a, b
+    LOGICAL :: selfi, selfj
+    INTEGER, ALLOCATABLE :: nlp_h(:), lp_h(:,:), ind(:)
+    REAL(DP), ALLOCATABLE :: ek_h(:), gs(:), bm(:,:), w_h(:), le_h(:,:)
+    COMPLEX(DP), ALLOCATABLE :: vg_h(:,:)
+    INTEGER, DEVICE :: devinfo
+    REAL(DP), ALLOCATABLE, DEVICE :: bm_d(:,:), sm_d(:,:), wl_d(:,:), y_d(:,:), yq_d(:,:), ww_d(:), work_d(:)
+    !
+    use_lgr = .FALSE.
+    elow = elow_def
+    CALL get_environment_variable( 'QE_PH_LOWG', envval, lenv, ierr )
+    IF ( ierr == 0 .AND. lenv > 0 ) THEN
+       READ( envval, *, IOSTAT=ierr ) elow
+       IF ( ierr /= 0 ) elow = elow_def
+    ENDIF
+    IF ( elow <= 0.0_DP .OR. .NOT. use_real ) RETURN
+    IF ( .NOT. lowg_cell_ok( ) ) RETURN
+    capf = cap_fac
+    CALL get_environment_variable( 'QE_PH_LOWG_CAP', envval, lenv, ierr )
+    IF ( ierr == 0 .AND. lenv > 0 ) THEN
+       READ( envval, *, IOSTAT=ierr ) capf
+       IF ( ierr /= 0 .OR. capf <= 0.0_DP ) capf = cap_fac
+    ENDIF
+    CALL start_clock( 'dfptd_lowg' )
+    nm = nmodes_hint
+    IF ( nm <= 0 ) nm = 3 * natl
+    ncap = NINT( ( capf * nm * nbo * REAL(nnr,DP) )**(1.0_DP/3.0_DP) )
+    ! device: eigenvectors 4 nb^2 nks bytes; work matrices of one k-point 8 nb^2 * 3
+    ncap = MIN( ncap, INT( SQRT( 0.05_DP * free_bytes( ) / ( 4.0_DP * nks ) ) ), &
+                INT( SQRT( 0.2_DP * free_bytes( ) / 32.0_DP ) ) )
+    ncap = MAX( 32, MIN( nbmax, ncap ) )
+    npc = ncap / 2
+    apv = alpha_pv_l ; nwl = nw ; nkl = nkbl ; nhl = nhx
+    !
+    ! ... pairs of the block
+    !
+    ALLOCATE( nlp_h(nks), ek_h(nks), gs(nhx), ind(nhx) )
+    DO ik = 1, nks
+       n = rnh_h(ik)
+       ek_h(ik) = elow
+       IF ( COUNT( rg2_h(1:n,ik) <= elow ) > npc ) THEN
+          gs(1:n) = rg2_h(1:n,ik)
+          ind(1) = 0
+          CALL hpsort( n, gs, ind )
+          ek_h(ik) = gs(npc)
+       ENDIF
+       nlp_h(ik) = COUNT( rg2_h(1:n,ik) <= ek_h(ik) )
+    ENDDO
+    DEALLOCATE( gs, ind )
+    nlb = 2 * MAXVAL( nlp_h )
+    IF ( nlb < 4 .OR. nlb > 2*nbmax ) THEN
+       CALL stop_clock( 'dfptd_lowg' )
+       RETURN
+    ENDIF
+    ALLOCATE( lp_h(nlb/2,nks) )
+    lp_h = 1
+    DO ik = 1, nks
+       n = 0
+       DO j = 1, rnh_h(ik)
+          IF ( rg2_h(j,ik) <= ek_h(ik) ) THEN
+             n = n + 1
+             lp_h(n,ik) = j
+          ENDIF
+       ENDDO
+    ENDDO
+    ALLOCATE( vg_h(nnr,nspl) )
+    CALL vloc_g( vg_h )
+    !
+    ALLOCATE( lgnr_d(nks), lgpr_d(nlb/2,nks), lgvr_d(nlb,nlb,nks), lger_d(nlb,nks), le_h(nlb,nks) )
+    lgpr_d = lp_h
+    lgvr_d = 0.0_SP
+    le_h = 1.0E30_DP
+    nbad = 0
+    IF ( .NOT. blas_ready ) CALL init_blas( )
+    IF ( .NOT. solv_ready ) THEN
+       istat = cusolverDnCreate( hsolv )
+       solv_ready = .TRUE.
+    ENDIF
+    DO ik = 1, nks
+       ikk = ikks(ik)
+       nlp = nlp_h(ik)
+       nb = 2 * nlp
+       is = spin_h(ik)
+       IF ( nlp < 2 ) THEN
+          nlp_h(ik) = 0
+          CYCLE
+       ENDIF
+       !
+       ! ... kinetic energy and local potential (host)
+       !
+       ALLOCATE( bm(nb,nb) )
+       !$omp parallel do default(shared) private(j, i, pj, pi, mj, mpj, mi, mm, selfj, selfi, a, b)
+       DO j = 1, nlp
+          pj = lp_h(j,ik)
+          mj(:) = mill(:,igk_k(rhl_h(pj,ik),ikk))
+          mpj(:) = mill(:,igk_k(rhm_h(pj,ik),ikk))
+          selfj = pj <= rns_h(ik)
+          DO i = 1, nlp
+             pi = lp_h(i,ik)
+             mi(:) = mill(:,igk_k(rhl_h(pi,ik),ikk))
+             selfi = pi <= rns_h(ik)
+             mm(:) = mi(:) - mj(:)
+             a = vg_h( 1 + MODULO(mm(1),nr1) + nr1*( MODULO(mm(2),nr2) + nr2*MODULO(mm(3),nr3) ), is )
+             mm(:) = mi(:) - mpj(:)
+             b = vg_h( 1 + MODULO(mm(1),nr1) + nr1*( MODULO(mm(2),nr2) + nr2*MODULO(mm(3),nr3) ), is )
+             IF ( selfi .AND. selfj ) THEN
+                bm(2*i-1,2*j-1) = DBLE(a) ; bm(2*i-1,2*j) = 0.0_DP
+                bm(2*i,2*j-1) = 0.0_DP ; bm(2*i,2*j) = 0.0_DP
+             ELSEIF ( selfj ) THEN
+                bm(2*i-1,2*j-1) = rt2 * DBLE(a) ; bm(2*i-1,2*j) = 0.0_DP
+                bm(2*i,2*j-1) = rt2 * AIMAG(a) ; bm(2*i,2*j) = 0.0_DP
+             ELSEIF ( selfi ) THEN
+                bm(2*i-1,2*j-1) = rt2 * DBLE(a) ; bm(2*i-1,2*j) = - rt2 * AIMAG(a)
+                bm(2*i,2*j-1) = 0.0_DP ; bm(2*i,2*j) = 0.0_DP
+             ELSE
+                bm(2*i-1,2*j-1) = DBLE(a) + DBLE(b) ; bm(2*i-1,2*j) = - AIMAG(a) + AIMAG(b)
+                bm(2*i,2*j-1) = AIMAG(a) + AIMAG(b) ; bm(2*i,2*j) = DBLE(a) - DBLE(b)
+             ENDIF
+          ENDDO
+          bm(2*j-1,2*j-1) = bm(2*j-1,2*j-1) + rg2_h(pj,ik)
+          IF ( selfj ) THEN
+             bm(2*j,2*j) = 1.0E8_DP          ! the imaginary part of a self-conjugate component does not exist
+          ELSE
+             bm(2*j,2*j) = bm(2*j,2*j) + rg2_h(pj,ik)
+          ENDIF
+       ENDDO
+       !$omp end parallel do
+       !
+       ! ... nonlocal potential and projector: 2 W~ D W~^T (device)
+       !
+       ALLOCATE( bm_d(nb,nb), wl_d(nb,nw), y_d(nb,nw), ww_d(nb) )
+       bm_d = bm
+       DEALLOCATE( bm )
+       ikl = ik ; nbl = nb
+       !$cuf kernel do(2)
+       DO iw = 1, nwl
+          DO i = 1, nbl
+             wl_d(i,iw) = DBLE( wr_d(2*lgpr_d((i+1)/2,ikl)-MOD(i,2),iw,ikl) )
+          ENDDO
+       ENDDO
+       !$cuf kernel do(2)
+       DO iw = 1, nwl
+          DO i = 1, nbl
+             IF ( iw <= nkl ) THEN
+                na = kbna_d(iw) ; iof = kbof_d(iw) ; ih = iw - iof
+                hh = 0.0_DP
+                DO jh = 1, kbnh_d(iw)
+                   hh = hh + deeq_d(jh,ih,na,is) * wl_d(i,iof+jh)
+                ENDDO
+                y_d(i,iw) = hh
+             ELSEIF ( iw - nkl <= noccq_d(ikl) ) THEN
+                y_d(i,iw) = apv * wl_d(i,iw)
+             ELSE
+                y_d(i,iw) = 0.0_DP
+             ENDIF
+          ENDDO
+       ENDDO
+       istat = cublasDgemm( hblas, CUBLAS_OP_N, CUBLAS_OP_T, nb, nb, nw, 2.0_DP, y_d, nb, wl_d, nb, &
+                            1.0_DP, bm_d, nb )
+       IF ( lus ) THEN
+          ALLOCATE( sm_d(nb,nb), yq_d(nb,MAX(nkbl,1)) )
+          !$cuf kernel do(2)
+          DO j = 1, nbl
+             DO i = 1, nbl
+                IF ( i == j ) THEN
+                   sm_d(i,j) = 1.0_DP
+                ELSE
+                   sm_d(i,j) = 0.0_DP
+                ENDIF
+             ENDDO
+          ENDDO
+          !$cuf kernel do(2)
+          DO iw = 1, nkl
+             DO i = 1, nbl
+                na = kbna_d(iw) ; iof = kbof_d(iw) ; ih = iw - iof
+                hh = 0.0_DP
+                DO jh = 1, kbnh_d(iw)
+                   hh = hh + qq_d(jh,ih,na) * wl_d(i,iof+jh)
+                ENDDO
+                yq_d(i,iw) = hh
+             ENDDO
+          ENDDO
+          istat = cublasDgemm( hblas, CUBLAS_OP_N, CUBLAS_OP_T, nb, nb, nkbl, 2.0_DP, yq_d, nb, wl_d, nb, &
+                               1.0_DP, sm_d, nb )
+          istat = cusolverDnDsygvd_bufferSize( hsolv, CUSOLVER_EIG_TYPE_1, CUSOLVER_EIG_MODE_VECTOR, &
+                                               CUBLAS_FILL_MODE_UPPER, nb, bm_d, nb, sm_d, nb, ww_d, lwork )
+          ALLOCATE( work_d(lwork) )
+          istat = cusolverDnDsygvd( hsolv, CUSOLVER_EIG_TYPE_1, CUSOLVER_EIG_MODE_VECTOR, &
+                                    CUBLAS_FILL_MODE_UPPER, nb, bm_d, nb, sm_d, nb, ww_d, work_d, lwork, devinfo )
+          DEALLOCATE( sm_d, yq_d )
+       ELSE
+          istat = cusolverDnDsyevd_bufferSize( hsolv, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER, &
+                                               nb, bm_d, nb, ww_d, lwork )
+          ALLOCATE( work_d(lwork) )
+          istat = cusolverDnDsyevd( hsolv, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER, nb, bm_d, nb, &
+                                    ww_d, work_d, lwork, devinfo )
+       ENDIF
+       info = devinfo
+       ALLOCATE( w_h(nb) )
+       w_h = ww_d
+       emax = MAXVAL( erot_h(1:nocc_h(ik),ik) )
+       IF ( istat /= 0 .OR. info /= 0 .OR. w_h(1) - emax < 1.0E-3_DP ) THEN
+          nbad = nbad + 1
+          nlp_h(ik) = 0
+       ELSE
+          !$cuf kernel do(2)
+          DO j = 1, nbl
+             DO i = 1, nbl
+                lgvr_d(i,j,ikl) = REAL( bm_d(i,j), SP )
+             ENDDO
+          ENDDO
+          le_h(1:nb,ik) = w_h(1:nb)
+       ENDIF
+       DEALLOCATE( bm_d, wl_d, y_d, ww_d, work_d, w_h )
+    ENDDO
+    nlp_h(:) = 2 * nlp_h(:)
+    lgnr_d = nlp_h
+    lger_d = le_h
+    !
+    ! ... diagonal of B and of S for the other pairs
+    !
+    ALLOCATE( hdr_d(nhx,nks), sdr_d(nhx,nks) )
+    DO is = 1, nspl
+       v0 = DBLE( vg_h(1,is) )
+       ikl = is
+       !$acc parallel loop gang collapse(2) private(hh, ss, na, iof, ih)
+       DO ik = 1, nks
+          DO j = 1, nhl
+             IF ( spin_d(ik) == ikl ) THEN
+                hh = g2h_d(j,ik) + v0
+                ss = 1.0_DP
+                IF ( j <= nh_d(ik) ) THEN
+                   !$acc loop seq
+                   DO iw = 1, nkl
+                      na = kbna_d(iw) ; iof = kbof_d(iw) ; ih = iw - iof
+                      !$acc loop seq
+                      DO jh = 1, kbnh_d(iw)
+                         hh = hh + deeq_d(ih,jh,na,ikl) * ( DBLE(wr_d(2*j-1,iw,ik)) * wr_d(2*j-1,iof+jh,ik) + &
+                                                           DBLE(wr_d(2*j,iw,ik)) * wr_d(2*j,iof+jh,ik) )
+                         ss = ss + qq_d(ih,jh,na) * ( DBLE(wr_d(2*j-1,iw,ik)) * wr_d(2*j-1,iof+jh,ik) + &
+                                                      DBLE(wr_d(2*j,iw,ik)) * wr_d(2*j,iof+jh,ik) )
+                      ENDDO
+                   ENDDO
+                   !$acc loop seq
+                   DO iw = nkl+1, nkl+noccq_d(ik)
+                      hh = hh + apv * ( DBLE(wr_d(2*j-1,iw,ik))**2 + DBLE(wr_d(2*j,iw,ik))**2 )
+                   ENDDO
+                ENDIF
+                hdr_d(j,ik) = hh
+                sdr_d(j,ik) = ss
+             ENDIF
+          ENDDO
+       ENDDO
+    ENDDO
+    use_lgr = .TRUE.
+    WRITE( stdout, '(5x,"DFPT device engine: preconditioner with an exact block of ",i5, &
+         &" plane waves (below ",f6.2," Ry)")' ) nlb, MINVAL( ek_h )
+    IF ( nbad > 0 ) WRITE( stdout, '(5x,"DFPT device engine: ",i6," k-points without the block")' ) nbad
+    CALL stop_clock( 'dfptd_lowg' )
+    !
+  END SUBROUTINE setup_lowg_real
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE lowg_apply_real( nar )
+    !-----------------------------------------------------------------------
+    !! low-G block of the preconditioned gradient of the real mode,
+    !! tr_L = v (lambda - e)^-1 v^T gr_L, for the active columns of each
+    !! k-point; then rho = <tr|gr>.
+    INTEGER, INTENT(IN) :: nar
+    INTEGER :: j, j1, j2, ik, nak, jj, i, ir, rc, c, n2, nbl, nrr, istat, nbk
+    REAL(DP) :: s
+    !
+    n2 = ncol ; nbl = nlb ; nrr = 2*nhx
+    j1 = 1
+    DO WHILE ( j1 <= nar )
+       ik = kof( actr_h(j1) )
+       j2 = j1
+       DO WHILE ( j2 < nar )
+          IF ( kof( actr_h(j2+1) ) /= ik ) EXIT
+          j2 = j2 + 1
+       ENDDO
+       nak = j2 - j1 + 1
+       !$cuf kernel do(2)
+       DO jj = 1, nak
+          DO i = 1, nbl
+             IF ( i <= lgnr_d(ik) ) THEN
+                glr_d(i,jj) = gr_d(2*lgpr_d((i+1)/2,ik)-MOD(i,2),actr_d(j1-1+jj))
+             ELSE
+                glr_d(i,jj) = 0.0_SP
+             ENDIF
+          ENDDO
+       ENDDO
+       istat = cublasSgemm( hblas, CUBLAS_OP_T, CUBLAS_OP_N, nlb, nak, nlb, 1.0_SP, lgvr_d(1,1,ik), nlb, &
+                            glr_d, nlb, 0.0_SP, clr_d, nlb )
+       !$cuf kernel do(2)
+       DO jj = 1, nak
+          DO i = 1, nbl
+             rc = actr_d(j1-1+jj)
+             c = rc
+             IF ( rc > n2 ) c = rc - n2
+             clr_d(i,jj) = clr_d(i,jj) / REAL( MAX( 1.0E-3_DP, lger_d(i,ik) - er_d(c) ), SP )
+          ENDDO
+       ENDDO
+       istat = cublasSgemm( hblas, CUBLAS_OP_N, CUBLAS_OP_N, nlb, nak, nlb, 1.0_SP, lgvr_d(1,1,ik), nlb, &
+                            clr_d, nlb, 0.0_SP, glr_d, nlb )
+       !$cuf kernel do(2)
+       DO jj = 1, nak
+          DO i = 1, nbl
+             IF ( i <= lgnr_d(ik) ) tr_d(2*lgpr_d((i+1)/2,ik)-MOD(i,2),actr_d(j1-1+jj)) = glr_d(i,jj)
+          ENDDO
+       ENDDO
+       j1 = j2 + 1
+    ENDDO
+    !$acc parallel loop gang private(rc, s)
+    DO j = 1, nar
+       rc = actr_d(j)
+       s = 0.0_DP
+       !$acc loop vector reduction(+:s)
+       DO ir = 1, nrr
+          s = s + DBLE(tr_d(ir,rc)) * DBLE(gr_d(ir,rc))
+       ENDDO
+       rhor_d(rc) = 2.0_DP * s
+    ENDDO
+    !
+  END SUBROUTINE lowg_apply_real
+  !
+  !-----------------------------------------------------------------------
   LOGICAL FUNCTION lowg_cell_ok( )
     !-----------------------------------------------------------------------
     !! The block preconditioner leaves the residual that the convergence test
