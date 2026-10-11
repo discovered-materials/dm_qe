@@ -22,6 +22,7 @@ SUBROUTINE clean_pw_ph(iq)
 
   USE lr_symm_base,    ONLY : nsymq
   USE dfpt_dev,        ONLY : dfpt_dev_invalidate
+  USE usaug_dev,       ONLY : usaug_invalidate
   !
   USE beta_cache,       ONLY : beta_cache_free
   IMPLICIT NONE
@@ -33,6 +34,7 @@ SUBROUTINE clean_pw_ph(iq)
   ! ... device data of this q-point (engine, augmentation tables, work arrays)
   !
   CALL dfpt_dev_invalidate()
+  CALL usaug_invalidate()
   CALL beta_cache_free()
   !
   done_iq(iq)=.TRUE.

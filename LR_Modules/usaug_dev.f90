@@ -53,7 +53,7 @@ MODULE usaug_dev
   PRIVATE
   SAVE
   !
-  PUBLIC :: usaug_on, usaug_check, usaug_invalidate, &
+  PUBLIC :: usaug_on, usaug_check, usaug_invalidate, usaug_newdq, usaug_addusddens, &
             usaug_interp_on
   !
   LOGICAL :: env_read = .FALSE.
@@ -628,12 +628,199 @@ CONTAINS
     !
   END SUBROUTINE add_from_g
   !
+  !-----------------------------------------------------------------------
+  SUBROUTINE usaug_newdq( dvscf, npe )
+    !-----------------------------------------------------------------------
+    !! Ultrasoft part of int3 (the integral of the response potential and of
+    !! the augmentation functions), see newdq:
+    !! int3(ih,jh,na,is,ipert) = omega sum_G conj(Q_ij(q+G) S_na(q+G)) dV(G,is,ipert)
+    !
+    USE cell_base,        ONLY : omega
+    USE fft_base,         ONLY : dfftp
+    USE ions_base,        ONLY : ntyp => nsp
+    USE noncollin_module, ONLY : nspin_mag
+    USE uspp_param,       ONLY : upf, nh
+    USE lrus,             ONLY : int3
+    !
+    INTEGER, INTENT(IN) :: npe
+    COMPLEX(DP), INTENT(IN) :: dvscf(dfftp%nnr,nspin_mag,npe)
+    !
+    COMPLEX(DP), ALLOCATABLE, DEVICE :: aux_d(:,:), b_d(:,:), r_d(:,:)
+    COMPLEX(DP), ALLOCATABLE :: r_h(:,:)
+    INTEGER :: nisp, nt, natc, a0, nac, ncols, ia0, c, ig, na, isp, ij0, nc, col, istat, &
+               ia, is, ipert, ih, jh, ij, n1, nqb, nijt
+    COMPLEX(DP) :: zomega
+    !
+    CALL prepare_q( )
+    nisp = nspin_mag * npe
+    n1 = ngml
+    zomega = CMPLX( omega, 0.0_DP, KIND=DP )
+    ALLOCATE( aux_d(ngml,nisp) )
+    CALL fft_to_g( dvscf, nisp, aux_d )
+    !
+    int3(:,:,:,:,:) = (0.0_DP, 0.0_DP)
+    DO nt = 1, ntyp
+       IF ( .NOT. upf(nt)%tvanp .OR. tnat(nt) == 0 ) CYCLE
+       nijt = nij(nt)
+       nqb = qblock( nt )
+       natc = ncol_fit( 16.0_DP * REAL(ngml,DP) * nisp, tnat(nt) )
+       ALLOCATE( b_d(ngml,natc*nisp), r_d(nijt,natc*nisp), r_h(nijt,natc*nisp) )
+       DO a0 = 0, tnat(nt)-1, natc
+          nac = MIN( natc, tnat(nt)-a0 )
+          ncols = nac * nisp
+          ia0 = tat0(nt) + a0
+          !
+          ! ... conj(S_na(q+G)) dV(G,is,ipert): column (ia-1)*nisp + isp
+          !
+          !$cuf kernel do(2)
+          DO c = 1, ncols
+             DO ig = 1, n1
+                na = atl_d(ia0 + (c-1)/nisp + 1)
+                isp = MOD(c-1,nisp) + 1
+                b_d(ig,c) = CONJG( eig1_d(mill_d(1,ig),na) * eig2_d(mill_d(2,ig),na) * &
+                                   eig3_d(mill_d(3,ig),na) * eigq_d(na) ) * aux_d(ig,isp)
+             ENDDO
+          ENDDO
+          DO ij0 = 0, nijt-1, nqb
+             nc = MIN( nqb, nijt-ij0 )
+             col = qcol( nt, ij0, nc )
+             istat = cublasZgemm( hblas, CUBLAS_OP_C, CUBLAS_OP_N, nc, ncols, ngml, zomega, &
+                                  qg_d(1,col), ngml, b_d, ngml, c_zero, r_d(ij0+1,1), nijt )
+             IF ( istat /= 0 ) CALL errore( 'usaug_newdq', 'cublasZgemm failed', ABS(istat) )
+          ENDDO
+          r_h(:,1:ncols) = r_d(:,1:ncols)
+          !
+          DO ia = 1, nac
+             na = atl(ia0+ia)
+             DO isp = 1, nisp
+                c = (ia-1)*nisp + isp
+                is = MOD(isp-1,nspin_mag) + 1
+                ipert = (isp-1)/nspin_mag + 1
+                ij = 0
+                DO ih = 1, nh(nt)
+                   DO jh = ih, nh(nt)
+                      ij = ij + 1
+                      int3(ih,jh,na,is,ipert) = r_h(ij,c)
+                      int3(jh,ih,na,is,ipert) = r_h(ij,c)
+                   ENDDO
+                ENDDO
+             ENDDO
+          ENDDO
+       ENDDO
+       DEALLOCATE( b_d, r_d, r_h )
+    ENDDO
+    DEALLOCATE( aux_d )
+    !
+  END SUBROUTINE usaug_newdq
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE usaug_addusddens( npert, dbecsum, drhop )
+    !-----------------------------------------------------------------------
+    !! Augmentation part of the response density, see lr_addusddens:
+    !! drho(G,is,ipert) += 2 sum_na S_na(q+G) sum_ij Q_ij(q+G) dbecsum(ij,na,is,ipert)
+    !
+    USE fft_base,         ONLY : dfftp
+    USE ions_base,        ONLY : nat, ntyp => nsp
+    USE noncollin_module, ONLY : nspin_mag
+    USE uspp_param,       ONLY : upf, nhm
+    !
+    INTEGER, INTENT(IN) :: npert
+    COMPLEX(DP), INTENT(IN) :: dbecsum(nhm*(nhm+1)/2,nat,nspin_mag,npert)
+    COMPLEX(DP), INTENT(INOUT) :: drhop(dfftp%nnr,nspin_mag,npert)
+    !
+    COMPLEX(DP), ALLOCATABLE, DEVICE :: aux_d(:,:), t_d(:,:), d_d(:,:)
+    COMPLEX(DP), ALLOCATABLE :: d_h(:,:)
+    INTEGER :: nisp, nt, natc, a0, nac, ncols, ia0, c, ig, na, isp, ij0, nc, col, istat, &
+               ia, is, ipert, n1, nqb, nijt
+    COMPLEX(DP) :: sk, beta
+    !
+    CALL prepare_q( )
+    nisp = nspin_mag * npert
+    n1 = ngml
+    ALLOCATE( aux_d(ngml,nisp) )
+    !$cuf kernel do(2)
+    DO isp = 1, nisp
+       DO ig = 1, n1
+          aux_d(ig,isp) = (0.0_DP, 0.0_DP)
+       ENDDO
+    ENDDO
+    !
+    DO nt = 1, ntyp
+       IF ( .NOT. upf(nt)%tvanp .OR. tnat(nt) == 0 ) CYCLE
+       nijt = nij(nt)
+       nqb = qblock( nt )
+       natc = ncol_fit( 16.0_DP * REAL(ngml,DP) * nisp, tnat(nt) )
+       ALLOCATE( t_d(ngml,natc*nisp), d_d(nijt,natc*nisp), d_h(nijt,natc*nisp) )
+       DO a0 = 0, tnat(nt)-1, natc
+          nac = MIN( natc, tnat(nt)-a0 )
+          ncols = nac * nisp
+          ia0 = tat0(nt) + a0
+          DO ia = 1, nac
+             na = atl(ia0+ia)
+             DO isp = 1, nisp
+                is = MOD(isp-1,nspin_mag) + 1
+                ipert = (isp-1)/nspin_mag + 1
+                d_h(1:nijt,(ia-1)*nisp+isp) = dbecsum(1:nijt,na,is,ipert)
+             ENDDO
+          ENDDO
+          d_d(:,1:ncols) = d_h(:,1:ncols)
+          !
+          ! ... t(G,c) = sum_ij Q_ij(q+G) dbecsum(ij,c)
+          !
+          beta = c_zero
+          DO ij0 = 0, nijt-1, nqb
+             nc = MIN( nqb, nijt-ij0 )
+             col = qcol( nt, ij0, nc )
+             istat = cublasZgemm( hblas, CUBLAS_OP_N, CUBLAS_OP_N, ngml, ncols, nc, c_one, &
+                                  qg_d(1,col), ngml, d_d(ij0+1,1), nijt, beta, t_d, ngml )
+             IF ( istat /= 0 ) CALL errore( 'usaug_addusddens', 'cublasZgemm failed', ABS(istat) )
+             beta = c_one
+          ENDDO
+          !$cuf kernel do(1)
+          DO ig = 1, n1
+             DO ia = 1, nac
+                na = atl_d(ia0+ia)
+                sk = eig1_d(mill_d(1,ig),na) * eig2_d(mill_d(2,ig),na) * &
+                     eig3_d(mill_d(3,ig),na) * eigq_d(na)
+                DO isp = 1, nisp
+                   aux_d(ig,isp) = aux_d(ig,isp) + 2.0_DP * sk * t_d(ig,(ia-1)*nisp+isp)
+                ENDDO
+             ENDDO
+          ENDDO
+       ENDDO
+       DEALLOCATE( t_d, d_d, d_h )
+    ENDDO
+    !
+    CALL add_from_g( aux_d, nisp, drhop )
+    DEALLOCATE( aux_d )
+    !
+  END SUBROUTINE usaug_addusddens
+  !
 #else
   !
   ! ... stubs for builds without CUDA: usaug_on is false and these are never called
   !
   SUBROUTINE usaug_invalidate( )
   END SUBROUTINE usaug_invalidate
+  !
+  SUBROUTINE usaug_newdq( dvscf, npe )
+    USE fft_base,         ONLY : dfftp
+    USE noncollin_module, ONLY : nspin_mag
+    INTEGER, INTENT(IN) :: npe
+    COMPLEX(DP), INTENT(IN) :: dvscf(dfftp%nnr,nspin_mag,npe)
+    CALL errore( 'usaug_newdq', 'not available without CUDA', 1 )
+  END SUBROUTINE usaug_newdq
+  !
+  SUBROUTINE usaug_addusddens( npert, dbecsum, drhop )
+    USE fft_base,         ONLY : dfftp
+    USE ions_base,        ONLY : nat
+    USE noncollin_module, ONLY : nspin_mag
+    USE uspp_param,       ONLY : nhm
+    INTEGER, INTENT(IN) :: npert
+    COMPLEX(DP), INTENT(IN) :: dbecsum(nhm*(nhm+1)/2,nat,nspin_mag,npert)
+    COMPLEX(DP), INTENT(INOUT) :: drhop(dfftp%nnr,nspin_mag,npert)
+    CALL errore( 'usaug_addusddens', 'not available without CUDA', 1 )
+  END SUBROUTINE usaug_addusddens
   !
 #endif
   !
