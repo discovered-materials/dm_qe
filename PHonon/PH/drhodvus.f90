@@ -40,6 +40,10 @@ subroutine drhodvus (irr, imode0, dvscfin, npe)
   USE mp,        ONLY : mp_sum
 
   USE lrus,      ONLY : int3_paw
+  USE dyn_dev,   ONLY : dyn_check
+#if defined(__CUDA)
+  USE dyn_dev,   ONLY : dyn_dev_ok, drhodvus_dev
+#endif
   
   implicit none
 
@@ -64,6 +68,7 @@ subroutine drhodvus (irr, imode0, dvscfin, npe)
   ! the dynamical matrix
   complex(DP), allocatable ::  drhous (:,:)
   ! the change of the charge
+  logical :: done
 
   if (.not.okvan) then
      dyn_rec=(0.0_DP,0.0_DP)
@@ -73,6 +78,15 @@ subroutine drhodvus (irr, imode0, dvscfin, npe)
   allocate (drhous ( dfftp%nnr, nspin_mag))
   dyn1 (:,:) = (0.d0, 0.d0)
   nrtot = dfftp%nr1 * dfftp%nr2 * dfftp%nr3
+  done = .false.
+#if defined(__CUDA)
+  !
+  ! Device path: the records of drhous stay on the device for the whole
+  ! q-point, the products with dvscfin are one ZGEMM
+  !
+  IF ( dyn_dev_ok( ) ) CALL drhodvus_dev (imode0, npert (irr), dvscfin, dyn1, done)
+#endif
+  IF ( .NOT. done ) THEN
   mode0 = 0
   do irr1 = 1, nirr
      do ipert = 1, npert (irr1)
@@ -85,6 +99,8 @@ subroutine drhodvus (irr, imode0, dvscfin, npe)
      enddo
      mode0 = mode0 + npert (irr1)
   enddo
+  ENDIF
+  call dyn_check ('drhodvus', 3*nat, dyn1)
   deallocate (drhous)
   !
   ! collect contributions from all pools (sum over k-points)

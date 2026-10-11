@@ -45,7 +45,7 @@ MODULE dyn_dev
   !
 #if defined(__CUDA)
   PUBLIC :: dyn_dform, dyn_d2form, drhodv_nl_dev, drhodv_nl_k, drhodv_nl_int2, &
-            dynmat_us_nl_dev, d2ionq_g_dev, dyn_fwfft
+            dynmat_us_nl_dev, d2ionq_g_dev, dyn_fwfft, drhodvus_dev
   !
   COMPLEX(DP), PARAMETER :: c_one = (1.0_DP, 0.0_DP), c_zero = (0.0_DP, 0.0_DP)
   INTEGER, PARAMETER :: max_tmp_elems = 8388608
@@ -440,6 +440,108 @@ CONTAINS
     DEALLOCATE( g_d, fac_d, facq_d, tau_d, zv_d, ityp_d, atl_d, r_d, r_h, atl_h )
     !
   END SUBROUTINE d2ionq_g_dev
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE host_to_dev( n, x, x_d )
+    !-----------------------------------------------------------------------
+    INTEGER, INTENT(IN) :: n
+    COMPLEX(DP), INTENT(IN) :: x(n)
+    COMPLEX(DP), DEVICE, INTENT(INOUT) :: x_d(n)
+    x_d = x
+  END SUBROUTINE host_to_dev
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE drhodvus_dev( imode0, npe, dvscfin, dyn1, done )
+    !-----------------------------------------------------------------------
+    !! The scalar products of drhodvus: for the npe perturbations of a
+    !! representation and all the modes nu_j,
+    !! dyn1(imode0+mu,nu_j) += omega/nrtot sum_r conj(dvscfin(r,mu)) drhous(r,nu_j).
+    !! The stock routine reads the 3*nat records of drhous from their
+    !! buffer for every representation; here they are read once per
+    !! q-point and kept on the device (on the host, when the device memory
+    !! allowed does not hold them), and the products of a representation are
+    !! one ZGEMM. done = .false. when the records fit in neither (the caller
+    !! uses the stock loop).
+    !
+    USE ions_base,        ONLY : nat
+    USE cell_base,        ONLY : omega
+    USE fft_base,         ONLY : dfftp
+    USE noncollin_module, ONLY : nspin_mag
+    USE buffers,          ONLY : get_buffer
+    USE units_ph,         ONLY : iudrhous, lrdrhous
+    USE qpoint,           ONLY : xq
+    USE dvbare_dev,       ONLY : dvbare_blas
+    !
+    INTEGER, INTENT(IN) :: imode0, npe
+    COMPLEX(DP), INTENT(IN) :: dvscfin(dfftp%nnr*nspin_mag,npe)
+    COMPLEX(DP), INTENT(INOUT) :: dyn1(3*nat,3*nat)
+    LOGICAL, INTENT(OUT) :: done
+    !
+    COMPLEX(DP), ALLOCATABLE, DEVICE :: dvs_d(:,:), res_d(:,:)
+    COMPLEX(DP), ALLOCATABLE :: drhous(:,:), res(:,:)
+    TYPE(cublasHandle) :: h
+    INTEGER(KIND=cuda_count_kind) :: mfree, mtot
+    INTEGER :: n, nm, nu_j, mu, istat
+    REAL(DP) :: need
+    COMPLEX(DP) :: alpha
+    !
+    done = .FALSE.
+    n = dfftp%nnr * nspin_mag
+    nm = 3 * nat
+    CALL dvbare_blas( h )
+    !
+    IF ( .NOT. ( drus_ready .AND. ALL( xq(:) == drus_q(:) ) .AND. n == drus_n .AND. &
+                 nm == drus_nm ) ) THEN
+       CALL dyn_dev_reset( )
+       need = 16.0_DP * DBLE(n) * DBLE(nm)
+       istat = cudaMemGetInfo( mfree, mtot )
+       IF ( need > max_drus_bytes .OR. need > max_drus_frac * DBLE(mfree) ) THEN
+          IF ( need > max_drus_host ) RETURN
+          ALLOCATE( drus_h(n,nm), STAT=istat )
+          IF ( istat /= 0 ) RETURN
+          DO nu_j = 1, nm
+             CALL get_buffer( drus_h(1,nu_j), lrdrhous, iudrhous, nu_j )
+          ENDDO
+       ELSE
+          ALLOCATE( drus_d(n,nm), STAT=istat )
+          IF ( istat /= 0 ) RETURN
+          ALLOCATE( drhous(dfftp%nnr,nspin_mag) )
+          DO nu_j = 1, nm
+             CALL get_buffer( drhous, lrdrhous, iudrhous, nu_j )
+             CALL host_to_dev( n, drhous, drus_d(1,nu_j) )
+          ENDDO
+          DEALLOCATE( drhous )
+       ENDIF
+       drus_q(:) = xq(:) ; drus_n = n ; drus_nm = nm
+       drus_ready = .TRUE.
+    ENDIF
+    !
+    alpha = CMPLX( omega / DBLE( dfftp%nr1 * dfftp%nr2 * dfftp%nr3 ), 0.0_DP, KIND=DP )
+    ALLOCATE( res(npe,nm) )
+    IF ( ALLOCATED(drus_h) ) THEN
+       CALL ZGEMM( 'C', 'N', npe, nm, n, alpha, dvscfin, n, drus_h, n, c_zero, res, npe )
+    ELSE
+       ALLOCATE( dvs_d(n,npe), res_d(npe,nm), STAT=istat )
+       IF ( istat /= 0 ) THEN
+          DEALLOCATE( res )
+          RETURN
+       ENDIF
+       dvs_d = dvscfin
+       istat = cublasZgemm( h, CUBLAS_OP_C, CUBLAS_OP_N, npe, nm, n, alpha, dvs_d, n, drus_d, n, &
+                            c_zero, res_d, npe )
+       IF ( istat /= 0 ) CALL errore( 'drhodvus_dev', 'cublasZgemm failed', ABS(istat) )
+       res = res_d
+       DEALLOCATE( dvs_d, res_d )
+    ENDIF
+    DO nu_j = 1, nm
+       DO mu = 1, npe
+          dyn1(imode0+mu,nu_j) = dyn1(imode0+mu,nu_j) + res(mu,nu_j)
+       ENDDO
+    ENDDO
+    DEALLOCATE( res )
+    done = .TRUE.
+    !
+  END SUBROUTINE drhodvus_dev
   !
   !-----------------------------------------------------------------------
   SUBROUTINE drhodv_nl_dev( nu_i0, nper, dynwrk )
