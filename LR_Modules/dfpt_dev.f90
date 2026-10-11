@@ -1445,6 +1445,384 @@ CONTAINS
   END SUBROUTINE add_zprec_sp
   !
   !-----------------------------------------------------------------------
+  SUBROUTINE setup_real( )
+    !-----------------------------------------------------------------------
+    !! Real mode of the single-precision iterations, for q = 0 and k-points
+    !! that are equivalent to -k (Gamma, zone-boundary points with 2k = G:
+    !! the k-points of supercells). There H, S and the projector on the
+    !! valence bands are real operators: with K the complex conjugation in
+    !! real space, ( K x )(k+G) = conj( x(k+G') ), G' = -G-2k, every vector is
+    !! x = x_s + i x_a with K x_s = x_s, K x_a = x_a, and A x = A x_s + i A x_a.
+    !! A K-symmetric vector is stored by its values on one G of each pair
+    !! (G, G') as a real array of twice that length; then
+    !!   - scalar products are real dot products (SGEMM instead of CGEMM on
+    !!     arrays of half the length),
+    !!   - two vectors go through the FFTs as one complex function.
+    !! The imaginary part x_a of the right-hand sides vanishes when the bands
+    !! are real functions; the bands of the ground state are made so by a
+    !! unitary rotation U inside each group of degenerate bands (to which the
+    !! equations are covariant), computed here. What is left of x_a (the
+    !! bands are converged to a threshold) is solved for only where it
+    !! exceeds a fraction of the convergence threshold.
+    !! Only the single-precision iterations change: the residual in double
+    !! precision, on which convergence rests, is computed as before on the
+    !! original bands. QE_PH_REAL=0 switches the real mode off.
+    !
+    USE io_global,   ONLY : stdout
+    USE klist,       ONLY : xk, igk_k
+    USE cell_base,   ONLY : at
+    USE gvect,       ONLY : mill
+    USE qpoint,      ONLY : ikks, ikqs
+    !
+    INTEGER :: ik, ikk, ig, j, n, npw, nh, nself, n2k(3), mm(3), istat, lenv, ierr, nbl, npl, ikl, &
+               nkl, nocl
+    CHARACTER(LEN=16) :: envval
+    REAL(DP) :: xc(3), eps, epsr
+    LOGICAL :: okk
+    INTEGER, ALLOCATABLE :: inv(:), nl_h(:,:), mg_h(:), hl_h(:,:), hm_h(:,:), nlh_h(:,:), nlm_h(:,:), &
+                            nh_h(:), nself_h(:), cl_h(:,:)
+    REAL(DP), ALLOCATABLE :: g2_h(:,:), g2h_h(:,:), et_h(:,:), er_h(:,:)
+    COMPLEX(DP), ALLOCATABLE :: m_h(:,:), u_h(:,:,:)
+    COMPLEX(SP), ALLOCATABLE :: us_h(:,:,:)
+    INTEGER, ALLOCATABLE, DEVICE :: mg_d(:)
+    COMPLEX(DP), ALLOCATABLE, DEVICE :: kp_d(:,:), m_d(:,:), ud_d(:,:)
+    !
+    use_real = .FALSE.
+    CALL get_environment_variable( 'QE_PH_REAL', envval, lenv, ierr )
+    IF ( ierr == 0 .AND. lenv > 0 .AND. envval(1:1) == '0' ) RETURN
+    IF ( .NOT. ( use_sp .AND. lgamma_l ) .OR. nbo < 1 ) RETURN
+    DO ik = 1, nks
+       IF ( ikqs(ik) /= ikks(ik) .OR. nocc_h(ik) /= noccq_h(ik) .OR. nocc_h(ik) < 1 ) RETURN
+    ENDDO
+    nbl = nbo ; npl = npwxl ; nkl = nkbl
+    !
+    ! ... pairs (G, G') of each k-point
+    !
+    ALLOCATE( inv(nnr), nl_h(npwxl,nks), mg_h(npwxl), hl_h(npwxl,nks), hm_h(npwxl,nks), &
+              nh_h(nks), nself_h(nks) )
+    nl_h = nlq_d
+    hl_h = 1 ; hm_h = 1
+    DO ik = 1, nks
+       ikk = ikks(ik)
+       npw = npwq_h(ik)
+       xc(:) = 2.0_DP * ( xk(1,ikk)*at(1,:) + xk(2,ikk)*at(2,:) + xk(3,ikk)*at(3,:) )
+       n2k(:) = NINT( xc(:) )
+       IF ( ANY( ABS( xc(:) - n2k(:) ) > 1.0E-8_DP ) ) RETURN
+       inv = 0
+       DO ig = 1, npw
+          inv(nl_h(ig,ik)) = ig
+       ENDDO
+       DO ig = 1, npw
+          mm(:) = mill(:,igk_k(ig,ikk))
+          IF ( box_index( mm ) /= nl_h(ig,ik) ) RETURN
+          mm(:) = - mm(:) - n2k(:)
+          mg_h(ig) = inv( box_index( mm ) )
+          IF ( mg_h(ig) == 0 ) RETURN
+       ENDDO
+       nself = 0
+       DO ig = 1, npw
+          IF ( mg_h(mg_h(ig)) /= ig ) RETURN
+          IF ( mg_h(ig) == ig ) nself = nself + 1
+       ENDDO
+       IF ( nself > 1 ) RETURN
+       nh = 0
+       DO ig = 1, npw
+          IF ( mg_h(ig) == ig ) THEN
+             nh = nh + 1
+             hl_h(nh,ik) = ig ; hm_h(nh,ik) = ig
+          ENDIF
+       ENDDO
+       DO ig = 1, npw
+          IF ( mg_h(ig) > ig ) THEN
+             nh = nh + 1
+             hl_h(nh,ik) = ig ; hm_h(nh,ik) = mg_h(ig)
+          ENDIF
+       ENDDO
+       nh_h(ik) = nh ; nself_h(ik) = nself
+    ENDDO
+    nhx = MAXVAL( nh_h )
+    !
+    ! ... rotation of the bands: M = <psi| S K |psi>, see real_rotation
+    !
+    ALLOCATE( u_h(nbo,nbo,nks), m_h(nbo,nbo), cl_h(nbo,nks), er_h(nbo,nks), et_h(nbo,nks) )
+    ALLOCATE( mg_d(npwxl), kp_d(npwxl,nbo), m_d(nbo,nbo), ud_d(nbo,nbo) )
+    et_h = et_d
+    IF ( .NOT. blas_ready ) CALL init_blas( )
+    DO ik = 1, nks
+       mg_h = 1
+       DO j = 1, nh_h(ik)
+          mg_h(hl_h(j,ik)) = hm_h(j,ik)
+          mg_h(hm_h(j,ik)) = hl_h(j,ik)
+       ENDDO
+       mg_d = mg_h
+       npw = npwq_h(ik) ; ikl = ik
+       !$cuf kernel do(2)
+       DO n = 1, nbl
+          DO ig = 1, npl
+             IF ( ig <= npw ) THEN
+                kp_d(ig,n) = CONJG( psik_d(mg_d(ig),n,ikl) )
+             ELSE
+                kp_d(ig,n) = (0.0_DP, 0.0_DP)
+             ENDIF
+          ENDDO
+       ENDDO
+       istat = cublasZgemm( hblas, CUBLAS_OP_C, CUBLAS_OP_N, nbo, nbo, npwxl, c_one, &
+                            w_d(1,nkbl+1,ik), npwxl, kp_d, npwxl, c_zero, m_d, nbo )
+       m_h = m_d
+       CALL real_rotation( nbo, nocc_h(ik), et_h(1,ik), m_h, u_h(1,1,ik), er_h(1,ik), cl_h(1,ik), okk )
+       IF ( .NOT. okk ) THEN
+          WRITE( stdout, '(5x,"DFPT device engine: the bands cannot be made real, complex iterations")' )
+          RETURN
+       ENDIF
+    ENDDO
+    !
+    ! ... device data: maps, kinetic energies, rotation, real projectors
+    !
+    ALLOCATE( nlh_h(nhx,nks), nlm_h(nhx,nks), g2_h(npwxl,nks), g2h_h(nhx,nks) )
+    g2_h = g2_d
+    nlh_h = 1 ; nlm_h = 1 ; g2h_h = 0.0_DP
+    DO ik = 1, nks
+       DO j = 1, nh_h(ik)
+          nlh_h(j,ik) = nl_h(hl_h(j,ik),ik)
+          nlm_h(j,ik) = nl_h(hm_h(j,ik),ik)
+          g2h_h(j,ik) = g2_h(hl_h(j,ik),ik)
+       ENDDO
+    ENDDO
+    ALLOCATE( nh_d(nks), nself_d(nks), hl_d(nhx,nks), hm_d(nhx,nks), nlh_d(nhx,nks), nlm_d(nhx,nks), &
+              g2h_d(nhx,nks) )
+    nh_d = nh_h ; nself_d = nself_h
+    hl_d = hl_h(1:nhx,:) ; hm_d = hm_h(1:nhx,:)
+    nlh_d = nlh_h ; nlm_d = nlm_h ; g2h_d = g2h_h
+    ALLOCATE( us_h(nbo,nbo,nks), ur_d(nbo,nbo,nks) )
+    us_h = CMPLX( u_h, KIND=SP )
+    ur_d = us_h
+    ALLOCATE( wr_d(2*nhx,nw,nks) )
+    wr_d = 0.0_SP
+    epsr = 0.0_DP
+    DO ik = 1, nks
+       IF ( nkbl > 0 ) CALL compress_dp( ik, nkbl, w_d(1,1,ik), wr_d(1,1,ik), eps )
+       ud_d = u_h(:,:,ik)
+       istat = cublasZgemm( hblas, CUBLAS_OP_N, CUBLAS_OP_N, npwxl, nbo, nbo, c_one, &
+                            w_d(1,nkbl+1,ik), npwxl, ud_d, nbo, c_zero, kp_d, npwxl )
+       nocl = nocc_h(ik)
+       CALL compress_dp( ik, nocl, kp_d, wr_d(1,nkbl+1,ik), eps )
+       epsr = MAX( epsr, eps )
+    ENDDO
+    !
+    IF ( epsr > 1.0E-4_DP ) THEN
+       ! the bands are not converged well enough for the real operator to be a good
+       ! approximation of the operator of the residual
+       DEALLOCATE( nh_d, nself_d, hl_d, hm_d, nlh_d, nlm_d, g2h_d, wr_d, ur_d )
+       WRITE( stdout, '(5x,"DFPT device engine: imaginary part of the bands ",es8.1, &
+            &", complex iterations")' ) epsr
+       RETURN
+    ENDIF
+    IF ( ALLOCATED(clus_h) ) DEALLOCATE( clus_h )
+    IF ( ALLOCATED(erot_h) ) DEALLOCATE( erot_h )
+    ALLOCATE( clus_h(nbo,nks), erot_h(nbo,nks) )
+    clus_h = cl_h ; erot_h = er_h
+    eps_real = epsr
+    use_real = .TRUE.
+    IF ( ALLOCATED(rnh_h) ) DEALLOCATE( rnh_h, rns_h, rhl_h, rhm_h, rg2_h )
+    ALLOCATE( rnh_h(nks), rns_h(nks), rhl_h(nhx,nks), rhm_h(nhx,nks), rg2_h(nhx,nks) )
+    rnh_h = nh_h ; rns_h = nself_h
+    rhl_h = hl_h(1:nhx,:) ; rhm_h = hm_h(1:nhx,:) ; rg2_h = g2h_h
+    WRITE( stdout, '(5x,"DFPT device engine: k = -k, real iterations (two bands per FFT, real ", &
+         &"projections); imaginary part of the bands ",es8.1)' ) epsr
+    !
+  CONTAINS
+    !
+    INTEGER FUNCTION box_index( m )
+      !! position on the FFT grid of the G-vector with Miller indices m
+      INTEGER, INTENT(IN) :: m(3)
+      box_index = 1 + MODULO( m(1), nr1 ) + nr1 * ( MODULO( m(2), nr2 ) + nr2 * MODULO( m(3), nr3 ) )
+    END FUNCTION box_index
+    !
+  END SUBROUTINE setup_real
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE real_rotation( nb, nocc, e, mmat, u, er, clus, ok )
+    !-----------------------------------------------------------------------
+    !! Unitary u (block diagonal over the groups of degenerate bands among
+    !! the first nocc) such that the bands psi u are invariant under the
+    !! complex conjugation K, given mmat = <psi| S K |psi>: K psi = psi mmat.
+    !! In a group mmat is unitary and symmetric, mmat = o d o^T with o real
+    !! orthogonal and d a diagonal of phases (its real and imaginary parts
+    !! commute), and u = o sqrt(d). The rotated bands of a group are then
+    !! mixed by a real orthogonal matrix that diagonalizes their eigenvalue
+    !! matrix (the group may be degenerate only within a tolerance); er are
+    !! the eigenvalues. ok = .FALSE.: the bands of some group are not closed
+    !! under K to the accuracy needed.
+    !
+    INTEGER, INTENT(IN) :: nb, nocc
+    REAL(DP), INTENT(IN) :: e(nb)
+    COMPLEX(DP), INTENT(IN) :: mmat(nb,nb)
+    COMPLEX(DP), INTENT(OUT) :: u(nb,nb)
+    REAL(DP), INTENT(OUT) :: er(nb)
+    INTEGER, INTENT(OUT) :: clus(nb)
+    LOGICAL, INTENT(OUT) :: ok
+    !
+    REAL(DP), PARAMETER :: tolc = 1.0E-6_DP, tolm = 1.0E-3_DP
+    REAL(DP), PARAMETER :: tval(3) = (/ 0.6180339887_DP, 0.3141592654_DP, 1.7320508076_DP /)
+    INTEGER :: n, m, n1, n2, d, i, j, itry, info
+    REAL(DP) :: th, dev
+    LOGICAL :: found
+    REAL(DP), ALLOCATABLE :: aa(:,:), bb(:,:), cc(:,:), ww(:), work(:)
+    COMPLEX(DP), ALLOCATABLE :: mb(:,:), dm(:,:), vv(:,:), eh(:,:)
+    !
+    ok = .FALSE.
+    u = (0.0_DP, 0.0_DP)
+    DO n = 1, nb
+       u(n,n) = (1.0_DP, 0.0_DP)
+       er(n) = e(n)
+       clus(n) = n
+    ENDDO
+    n1 = 1
+    DO WHILE ( n1 <= nocc )
+       n2 = n1
+       DO WHILE ( n2 < nocc )
+          IF ( e(n2+1) - e(n2) > tolc ) EXIT
+          n2 = n2 + 1
+       ENDDO
+       d = n2 - n1 + 1
+       clus(n1:n2) = n1
+       DO m = 1, nocc
+          IF ( m >= n1 .AND. m <= n2 ) CYCLE
+          IF ( MAXVAL( ABS( mmat(m,n1:n2) ) ) > tolm ) RETURN
+       ENDDO
+       IF ( d == 1 ) THEN
+          IF ( ABS( ABS( mmat(n1,n1) ) - 1.0_DP ) > tolm ) RETURN
+          th = ATAN2( AIMAG( mmat(n1,n1) ), DBLE( mmat(n1,n1) ) )
+          u(n1,n1) = CMPLX( COS(0.5_DP*th), SIN(0.5_DP*th), KIND=DP )
+       ELSE
+          ALLOCATE( mb(d,d), dm(d,d), vv(d,d), eh(d,d), aa(d,d), bb(d,d), cc(d,d), ww(d), work(34*d) )
+          mb(:,:) = mmat(n1:n2,n1:n2)
+          aa(:,:) = 0.5_DP * ( DBLE(mb) + TRANSPOSE( DBLE(mb) ) )
+          bb(:,:) = 0.5_DP * ( AIMAG(mb) + TRANSPOSE( AIMAG(mb) ) )
+          found = .FALSE.
+          DO itry = 1, 3
+             cc(:,:) = aa(:,:) + tval(itry) * bb(:,:)
+             CALL DSYEV( 'V', 'U', d, cc, d, ww, work, SIZE(work), info )
+             IF ( info /= 0 ) CYCLE
+             dm = MATMUL( TRANSPOSE(cc), MATMUL( mb, CMPLX( cc, 0.0_DP, KIND=DP ) ) )
+             dev = 0.0_DP
+             DO j = 1, d
+                DO i = 1, d
+                   IF ( i == j ) THEN
+                      dev = MAX( dev, ABS( ABS(dm(i,i)) - 1.0_DP ) )
+                   ELSE
+                      dev = MAX( dev, ABS( dm(i,j) ) )
+                   ENDIF
+                ENDDO
+             ENDDO
+             IF ( dev < tolm ) THEN
+                found = .TRUE.
+                EXIT
+             ENDIF
+          ENDDO
+          IF ( .NOT. found ) RETURN
+          DO j = 1, d
+             th = ATAN2( AIMAG( dm(j,j) ), DBLE( dm(j,j) ) )
+             vv(:,j) = cc(:,j) * CMPLX( COS(0.5_DP*th), SIN(0.5_DP*th), KIND=DP )
+          ENDDO
+          DO j = 1, d
+             DO i = 1, d
+                eh(i,j) = SUM( CONJG( vv(:,i) ) * e(n1:n2) * vv(:,j) )
+             ENDDO
+          ENDDO
+          aa(:,:) = 0.5_DP * ( DBLE(eh) + TRANSPOSE( DBLE(eh) ) )
+          CALL DSYEV( 'V', 'U', d, aa, d, ww, work, SIZE(work), info )
+          IF ( info /= 0 ) RETURN
+          u(n1:n2,n1:n2) = MATMUL( vv, CMPLX( aa, 0.0_DP, KIND=DP ) )
+          er(n1:n2) = ww(1:d)
+          DEALLOCATE( mb, dm, vv, eh, aa, bb, cc, ww, work )
+       ENDIF
+       n1 = n2 + 1
+    ENDDO
+    ok = .TRUE.
+    !
+  END SUBROUTINE real_rotation
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE compress_dp( ik, nc, src_d, dst_d, eps )
+    !-----------------------------------------------------------------------
+    !! K-symmetric part of nc vectors of k-point ik in the real storage
+    !! (the self-conjugate component scaled by 1/sqrt(2), so that scalar
+    !! products are twice the real dot products); eps: largest norm of the
+    !! part that is dropped.
+    INTEGER, INTENT(IN) :: ik, nc
+    COMPLEX(DP), DEVICE, INTENT(IN) :: src_d(npwxl,nc)
+    REAL(SP), DEVICE, INTENT(INOUT) :: dst_d(2*nhx,nc)
+    REAL(DP), INTENT(OUT) :: eps
+    INTEGER :: n, j, nhl, ikl
+    REAL(DP) :: s, smax
+    COMPLEX(DP) :: x1, x2, xs
+    REAL(DP), PARAMETER :: rt2i = 0.70710678118654752_DP
+    !
+    nhl = nhx ; ikl = ik
+    smax = 0.0_DP
+    !$acc parallel loop gang private(s) reduction(max:smax)
+    DO n = 1, nc
+       s = 0.0_DP
+       !$acc loop vector reduction(+:s) private(x1, x2, xs)
+       DO j = 1, nhl
+          IF ( j <= nh_d(ikl) ) THEN
+             x1 = src_d(hl_d(j,ikl),n)
+             IF ( j <= nself_d(ikl) ) THEN
+                dst_d(2*j-1,n) = REAL( DBLE(x1) * rt2i, SP )
+                dst_d(2*j,n) = 0.0_SP
+                s = s + AIMAG(x1)**2
+             ELSE
+                x2 = src_d(hm_d(j,ikl),n)
+                xs = 0.5_DP * ( x1 + CONJG(x2) )
+                dst_d(2*j-1,n) = REAL( DBLE(xs), SP )
+                dst_d(2*j,n) = REAL( AIMAG(xs), SP )
+                s = s + 0.5_DP * DBLE( CONJG(x1 - CONJG(x2)) * (x1 - CONJG(x2)) )
+             ENDIF
+          ELSE
+             dst_d(2*j-1,n) = 0.0_SP
+             dst_d(2*j,n) = 0.0_SP
+          ENDIF
+       ENDDO
+       smax = MAX( smax, s )
+    ENDDO
+    eps = SQRT( smax )
+    !
+  END SUBROUTINE compress_dp
+  !
+  !-----------------------------------------------------------------------
+  INTEGER FUNCTION kof( rc )
+    !-----------------------------------------------------------------------
+    !! k-point of a column of the real mode
+    INTEGER, INTENT(IN) :: rc
+    INTEGER :: c
+    c = rc
+    IF ( rc > ncol ) c = rc - ncol
+    kof = (c-1)/ncolk + 1
+  END FUNCTION kof
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE real_list( actf, nar )
+    !-----------------------------------------------------------------------
+    !! list of the active columns of the real mode, k-point by k-point
+    LOGICAL, INTENT(IN) :: actf(2*ncol)
+    INTEGER, INTENT(OUT) :: nar
+    INTEGER :: ik, ipart, c
+    nar = 0
+    DO ik = 1, nks
+       DO ipart = 0, 1
+          DO c = (ik-1)*ncolk+1, ik*ncolk
+             IF ( actf(ipart*ncol+c) ) THEN
+                nar = nar + 1
+                actr_h(nar) = ipart*ncol + c
+             ENDIF
+          ENDDO
+       ENDDO
+    ENDDO
+    IF ( nar > 0 ) actr_d(1:nar) = actr_h(1:nar)
+  END SUBROUTINE real_list
+  !
+  !-----------------------------------------------------------------------
   SUBROUTINE isort_small( n, a )
     !-----------------------------------------------------------------------
     !! ascending sort of an integer list (the pending columns are found in
