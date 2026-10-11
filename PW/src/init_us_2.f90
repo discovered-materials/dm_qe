@@ -26,6 +26,7 @@ CONTAINS
     USE wvfct,        ONLY : npwx
     USE uspp,         ONLY : nkb
     USE fft_base ,    ONLY : dfftp
+    USE beta_cache,   ONLY : beta_cache_on, beta_cache_get
     !
     IMPLICIT NONE
     !
@@ -41,16 +42,20 @@ CONTAINS
     !! if false (default), copy output vkb back to CPU using OpenACC:
     !! allows to use this accelerated routine in non-accelerated code
     !
-    LOGICAL :: run_on_gpu
+    LOGICAL :: run_on_gpu, cached
     !
     run_on_gpu = .FALSE.
     IF (PRESENT(run_on_gpu_)) run_on_gpu = run_on_gpu_
     !
     CALL start_clock( 'init_us_2' )
+    cached = .FALSE.
     !
     !$acc data present_or_copyin ( igk_(1:npw_) ) &
     !$acc      present ( mill(:,:),g(:,:),eigts1(:,:),eigts2(:,:), eigts3(:,:) ) &
     !$acc      present_or_copyout( vkb_(1:npwx,1:nkb) )
+    ! the beta functions of this k-point may be at hand (beta_cache, used by ph.x)
+    IF ( beta_cache_on ) CALL beta_cache_get( npw_, npwx, nkb, igk_, q_, vkb_, cached )
+    IF ( .NOT. cached ) &
     CALL init_us_2_acc( npw_, npwx, igk_, q_, nat, tau, ityp, tpiba, omega, &
                         dfftp%nr1, dfftp%nr2, dfftp%nr3, eigts1, eigts2,    &
                         eigts3, mill, g, vkb_ )
