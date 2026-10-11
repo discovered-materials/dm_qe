@@ -659,6 +659,7 @@ SUBROUTINE sternheimer_postprocess(nsolv, dfpt_data, dbecsum_nc, dbecsum_nc_trev
    USE fft_base,              ONLY : dffts, dfftp
    USE fft_interfaces,        ONLY : fft_interpolate
    USE gvecs,                 ONLY : doublegrid
+   USE usaug_dev,             ONLY : usaug_interp_on, usaug_interpolate
    USE ions_base,             ONLY : nat
    USE lsda_mod,              ONLY : nspin
    USE noncollin_module,      ONLY : noncolin, nspin_mag, domag
@@ -718,7 +719,10 @@ SUBROUTINE sternheimer_postprocess(nsolv, dfpt_data, dbecsum_nc, dbecsum_nc_trev
       CALL mp_sum(dfpt_data%dbecsum, intra_bgrp_comm)
    ENDIF
    !
-   IF (doublegrid) THEN
+   IF (doublegrid .AND. usaug_interp_on()) THEN
+      ! all perturbations and spins in one batch on the device
+      CALL usaug_interpolate(nspin_mag * npert, .TRUE., dfpt_data%drhos, dfpt_data%drhop)
+   ELSEIF (doublegrid) THEN
       DO is = 1, nspin_mag
          DO ipert = 1, npert
             CALL fft_interpolate(dffts, dfpt_data%drhos(:, is, ipert), &

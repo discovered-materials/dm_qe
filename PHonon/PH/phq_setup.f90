@@ -144,7 +144,7 @@ subroutine phq_setup
         call set_vrs (vrs, vltot, v%of_r, kedtau, v%kin_r, dfftp%nnr, nspin, doublegrid)
      end if
   ELSE
-     call set_vrs (vrs, vltot, v%of_r, kedtau, v%kin_r, dfftp%nnr, nspin, doublegrid)
+     call set_vrs_ph ()
   ENDIF
 !************************END OF  ACFDT TEST ******************
   !
@@ -461,3 +461,45 @@ subroutine phq_setup
   RETURN
   !
 END SUBROUTINE phq_setup
+!
+!-----------------------------------------------------------------------
+subroutine set_vrs_ph ()
+  !-----------------------------------------------------------------------
+  !! The total local potential on the smooth grid, as set_vrs. With a double
+  !! grid and the device code of ph.x on, the interpolation from the dense
+  !! grid is done on the device: on the host it is the first FFT of the run
+  !! on that grid and costs 0.3-0.7 s (plan and transform) whatever the size.
+  !
+  USE kinds,         ONLY : DP
+  USE fft_base,      ONLY : dfftp, dffts
+  USE gvecs,         ONLY : doublegrid
+  USE lsda_mod,      ONLY : nspin
+  USE scf,           ONLY : vrs, vltot, v, kedtau
+  USE xc_lib,        ONLY : xclib_dft_is
+  USE usaug_dev,     ONLY : usaug_interp_on, usaug_interpolate
+  !
+  implicit none
+  !
+  complex(DP), allocatable :: a(:,:), b(:,:)
+  integer :: is
+  logical :: on_device
+  !
+  on_device = doublegrid .and. nspin /= 4 .and. .not. xclib_dft_is('meta')
+  if ( on_device ) on_device = usaug_interp_on()
+  if ( .not. on_device ) then
+     call set_vrs (vrs, vltot, v%of_r, kedtau, v%kin_r, dfftp%nnr, nspin, doublegrid)
+     return
+  endif
+  allocate ( a(dfftp%nnr,nspin), b(dffts%nnr,nspin) )
+  do is = 1, nspin
+     vrs(:,is) = vltot(:) + v%of_r(:,is)
+     a(:,is) = cmplx( vrs(:,is), 0.0_DP, kind=DP )
+  enddo
+  call usaug_interpolate ( nspin, .false., a, b )
+  do is = 1, nspin
+     vrs(1:dffts%nnr,is) = dble( b(:,is) )
+  enddo
+  !$acc update device(vrs)
+  deallocate ( a, b )
+  !
+end subroutine set_vrs_ph

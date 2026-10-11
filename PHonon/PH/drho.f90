@@ -49,6 +49,7 @@ subroutine drho
   USE mp,         ONLY : mp_sum
   USE becmod,     ONLY : bec_type, allocate_bec_type, deallocate_bec_type
   USE fft_interfaces, ONLY : fft_interpolate
+  USE usaug_dev,      ONLY : usaug_check, usaug_interp_on, usaug_interpolate
 
   implicit none
 
@@ -69,6 +70,9 @@ subroutine drho
 
 
   complex(DP) :: wdyn (3 * nat, 3 * nat)
+  complex(DP), allocatable :: drhoust_dev_ (:,:,:), drhoust_ref_ (:,:,:)
+  ! result of the device code (self-test only)
+  logical :: lcheck
   type (bec_type), pointer :: becq(:), alpq(:,:)
   complex(DP), allocatable :: dvlocin (:), drhous (:,:,:),&
        drhoust (:,:,:), dbecsum(:,:,:,:), dbecsum_nc(:,:,:,:,:)
@@ -227,7 +231,27 @@ subroutine drho
      npe_offset = 0
      do irr = irr_batch, irr_end
         npe = npert(irr)
-        if (doublegrid) then
+        if (doublegrid .and. usaug_interp_on()) then
+           !
+           ! all the perturbations of the irrep together on the device
+           !
+           call usaug_interpolate (nspin_mag*npe, .true., drhous(1,1,mode+1), &
+                                   drhoust(1,1,npe_offset+1))
+           if (usaug_check()) then
+              allocate (drhoust_dev_(dfftp%nnr,nspin_mag,npe))
+              drhoust_dev_(:,:,:) = drhoust(:,:,npe_offset+1:npe_offset+npe)
+              do is = 1, nspin_mag
+                 do iper = 1, npe
+                    call fft_interpolate (dffts, drhous(:,is,mode+iper), dfftp, &
+                                        drhoust(:,is,npe_offset+iper))
+                 enddo
+              enddo
+              allocate (drhoust_ref_(dfftp%nnr,nspin_mag,npe))
+              drhoust_ref_(:,:,:) = drhoust(:,:,npe_offset+1:npe_offset+npe)
+              lcheck = usaug_check ('drho interpolate', size(drhoust_ref_), drhoust_dev_, drhoust_ref_)
+              deallocate (drhoust_dev_, drhoust_ref_)
+           endif
+        elseif (doublegrid) then
            do is = 1, nspin_mag
               do iper = 1, npe
                  call fft_interpolate (dffts, drhous(:,is,mode+iper), dfftp, &

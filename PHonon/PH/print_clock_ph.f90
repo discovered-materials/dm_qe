@@ -172,6 +172,7 @@ subroutine print_clock_ph
   call print_clock ('addusddort')
   call print_clock ('lr_addusddens')
   call print_clock ('usaug_qtab')
+  call print_clock ('usaug_interp')
   call print_clock ('PAW_dsymm')
   call print_clock ('PAW_dmqsymm')
   WRITE( stdout, * )

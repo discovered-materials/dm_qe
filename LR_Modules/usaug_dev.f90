@@ -54,7 +54,7 @@ MODULE usaug_dev
   SAVE
   !
   PUBLIC :: usaug_on, usaug_check, usaug_invalidate, usaug_newdq, usaug_addusddens, &
-            usaug_dvanqq, usaug_addusddens_pulay, usaug_interp_on
+            usaug_dvanqq, usaug_addusddens_pulay, usaug_interp_on, usaug_interpolate
   !
   LOGICAL :: env_read = .FALSE.
   !! the environment has been read
@@ -1182,6 +1182,91 @@ CONTAINS
     !
   END SUBROUTINE usaug_addusddens_pulay
   !
+  !-----------------------------------------------------------------------
+  SUBROUTINE usaug_interpolate( n, to_dense, f_in, f_out )
+    !-----------------------------------------------------------------------
+    !! Fourier interpolation of n functions between the smooth and the dense
+    !! FFT grid (fft_interpolate for each of them), batched on the device:
+    !! to_dense = .TRUE.  f_in on the smooth grid, f_out on the dense grid;
+    !! to_dense = .FALSE. f_in on the dense grid, f_out on the smooth grid.
+    !! f_in and f_out must be different arrays.
+    !
+    USE fft_base,  ONLY : dfftp, dffts
+    USE gvecs,     ONLY : ngms
+    !
+    INTEGER, INTENT(IN) :: n
+    LOGICAL, INTENT(IN) :: to_dense
+    COMPLEX(DP), INTENT(IN) :: f_in(*)
+    COMPLEX(DP), INTENT(OUT) :: f_out(*)
+    !
+    COMPLEX(DP), ALLOCATABLE, DEVICE :: a_d(:,:), b_d(:,:)
+    INTEGER, ALLOCATABLE, DEVICE :: nla_d(:), nlb_d(:)
+    INTEGER :: nna, nnb, nfb, j0, nb, ipa, ipb, j, ig, ir, istat, ngl, da(3), db(3)
+    REAL(DP) :: scale
+    !
+    CALL start_clock( 'usaug_interp' )
+    ngl = MIN( ngms, dfftp%ngm )
+    ALLOCATE( nla_d(ngl), nlb_d(ngl) )
+    IF ( to_dense ) THEN
+       nna = dffts%nnr ; nnb = dfftp%nnr
+       da = (/ dffts%nr1, dffts%nr2, dffts%nr3 /)
+       db = (/ dfftp%nr1, dfftp%nr2, dfftp%nr3 /)
+       nla_d = dffts%nl(1:ngl)
+       nlb_d = dfftp%nl(1:ngl)
+    ELSE
+       nna = dfftp%nnr ; nnb = dffts%nnr
+       da = (/ dfftp%nr1, dfftp%nr2, dfftp%nr3 /)
+       db = (/ dffts%nr1, dffts%nr2, dffts%nr3 /)
+       nla_d = dfftp%nl(1:ngl)
+       nlb_d = dffts%nl(1:ngl)
+    ENDIF
+    scale = 1.0_DP / DBLE(nna)
+    nfb = ncol_fit( 32.0_DP * ( REAL(nna,DP) + REAL(nnb,DP) ), n )
+    ALLOCATE( a_d(nna,nfb), b_d(nnb,nfb) )
+    DO j0 = 0, n-1, nfb
+       nb = MIN( nfb, n-j0 )
+       CALL put( f_in, nna, j0, nb, a_d )
+       ipa = get_plan( nb, da(1), da(2), da(3) )
+       istat = cufftExecZ2Z( ipa, a_d, a_d, CUFFT_FORWARD )
+       IF ( istat /= 0 ) CALL errore( 'usaug_interpolate', 'cufftExecZ2Z failed', ABS(istat) )
+       !$cuf kernel do(2)
+       DO j = 1, nb
+          DO ir = 1, nnb
+             b_d(ir,j) = (0.0_DP, 0.0_DP)
+          ENDDO
+       ENDDO
+       !$cuf kernel do(2)
+       DO j = 1, nb
+          DO ig = 1, ngl
+             b_d(nlb_d(ig),j) = a_d(nla_d(ig),j) * scale
+          ENDDO
+       ENDDO
+       ipb = get_plan( nb, db(1), db(2), db(3) )
+       istat = cufftExecZ2Z( ipb, b_d, b_d, CUFFT_INVERSE )
+       IF ( istat /= 0 ) CALL errore( 'usaug_interpolate', 'cufftExecZ2Z failed', ABS(istat) )
+       CALL get( b_d, nnb, j0, nb, f_out )
+    ENDDO
+    DEALLOCATE( a_d, b_d, nla_d, nlb_d )
+    CALL stop_clock( 'usaug_interp' )
+    !
+  CONTAINS
+    !
+    SUBROUTINE put( f, nn, j0, nb, f_d )
+      INTEGER, INTENT(IN) :: nn, j0, nb
+      COMPLEX(DP), INTENT(IN) :: f(nn,*)
+      COMPLEX(DP), DEVICE, INTENT(INOUT) :: f_d(:,:)
+      f_d(:,1:nb) = f(:,j0+1:j0+nb)
+    END SUBROUTINE put
+    !
+    SUBROUTINE get( f_d, nn, j0, nb, f )
+      INTEGER, INTENT(IN) :: nn, j0, nb
+      COMPLEX(DP), DEVICE, INTENT(IN) :: f_d(:,:)
+      COMPLEX(DP), INTENT(INOUT) :: f(nn,*)
+      f(:,j0+1:j0+nb) = f_d(:,1:nb)
+    END SUBROUTINE get
+    !
+  END SUBROUTINE usaug_interpolate
+  !
 #else
   !
   ! ... stubs for builds without CUDA: usaug_on is false and these are never called
@@ -1213,6 +1298,14 @@ CONTAINS
     COMPLEX(DP), INTENT(INOUT) :: int1(:,:,:,:,:), int2(:,:,:,:,:), int4(:,:,:,:,:), int5(:,:,:,:,:)
     CALL errore( 'usaug_dvanqq', 'not available without CUDA', 1 )
   END SUBROUTINE usaug_dvanqq
+  !
+  SUBROUTINE usaug_interpolate( n, to_dense, f_in, f_out )
+    INTEGER, INTENT(IN) :: n
+    LOGICAL, INTENT(IN) :: to_dense
+    COMPLEX(DP), INTENT(IN) :: f_in(*)
+    COMPLEX(DP), INTENT(OUT) :: f_out(*)
+    CALL errore( 'usaug_interpolate', 'not available without CUDA', 1 )
+  END SUBROUTINE usaug_interpolate
   !
   SUBROUTINE usaug_addusddens_pulay( npe, mode0, u, dbecsum, alphasum, drhop, lpaw, becsumort )
     USE fft_base,         ONLY : dfftp

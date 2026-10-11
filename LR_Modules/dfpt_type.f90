@@ -82,6 +82,7 @@ MODULE dfpt_type
       USE fft_base,              ONLY : dffts, dfftp
       USE fft_interfaces,        ONLY : fft_interpolate
       USE gvecs,                 ONLY : doublegrid
+      USE usaug_dev,             ONLY : usaug_interp_on, usaug_interpolate
       USE noncollin_module,      ONLY : nspin_mag
       !
       IMPLICIT NONE
@@ -90,7 +91,10 @@ MODULE dfpt_type
       !
       INTEGER :: ipert, is
       !
-      IF (doublegrid) THEN
+      IF (doublegrid .AND. usaug_interp_on()) THEN
+         ! all perturbations and spins in one batch on the device
+         CALL usaug_interpolate(nspin_mag * dfpt_data%npert, .FALSE., dfpt_data%dvscfp, dfpt_data%dvscfs)
+      ELSEIF (doublegrid) THEN
          DO ipert = 1, dfpt_data%npert
             DO is = 1, nspin_mag
                CALL fft_interpolate(dfftp, dfpt_data%dvscfp(:, is, ipert), &
