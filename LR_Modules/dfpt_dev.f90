@@ -427,6 +427,133 @@ CONTAINS
   END SUBROUTINE init_blas
   !
   !-----------------------------------------------------------------------
+  SUBROUTINE apply_qq( b_d, qb_d, m )
+    !-----------------------------------------------------------------------
+    !! qb(ikb,i) = sum_jh qq(ih,jh,na) b(ofs+jh,i)
+    INTEGER, INTENT(IN) :: m
+    COMPLEX(DP), DEVICE, INTENT(IN) :: b_d(MAX(nkbl,1),m)
+    COMPLEX(DP), DEVICE, INTENT(INOUT) :: qb_d(MAX(nkbl,1),m)
+    INTEGER :: i, ikb, jh, na, ih, iof
+    COMPLEX(DP) :: s
+    !
+    !$cuf kernel do(2)
+    DO i = 1, m
+       DO ikb = 1, nkbl
+          na = kbna_d(ikb) ; iof = kbof_d(ikb) ; ih = ikb - iof
+          s = (0.0_DP, 0.0_DP)
+          DO jh = 1, kbnh_d(ikb)
+             s = s + qq_d(ih,jh,na) * b_d(iof+jh,i)
+          ENDDO
+          qb_d(ikb,i) = s
+       ENDDO
+    ENDDO
+    !
+  END SUBROUTINE apply_qq
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE set_eprec( )
+    !-----------------------------------------------------------------------
+    INTEGER :: ik, ibnd, ig, nb, nwl
+    REAL(DP) :: s
+    !
+    nb = nbo ; nwl = nkbl
+    IF ( lus ) THEN
+       !$acc parallel loop gang collapse(2) private(s)
+       DO ik = 1, nks
+          DO ibnd = 1, nb
+             s = 0.0_DP
+             !$acc loop vector reduction(+:s)
+             DO ig = 1, npwxl
+                s = s + g2_d(ig,ik) * DBLE( CONJG(evq_d(ig,ibnd,ik)) * evq_d(ig,ibnd,ik) )
+             ENDDO
+             eprec_d(ibnd,ik) = 1.35_DP * s
+          ENDDO
+       ENDDO
+    ELSE
+       !$acc parallel loop gang collapse(2) private(s)
+       DO ik = 1, nks
+          DO ibnd = 1, nb
+             s = 0.0_DP
+             !$acc loop vector reduction(+:s)
+             DO ig = 1, npwxl
+                s = s + g2_d(ig,ik) * DBLE( CONJG(w_d(ig,nwl+ibnd,ik)) * w_d(ig,nwl+ibnd,ik) )
+             ENDDO
+             eprec_d(ibnd,ik) = 1.35_DP * s
+          ENDDO
+       ENDDO
+    ENDIF
+    !
+  END SUBROUTINE set_eprec
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE make_plans( )
+    !-----------------------------------------------------------------------
+    INTEGER :: nb, istat, fdim(3)
+    !
+    fdim = (/ nr3, nr2, nr1 /)
+    nplan = 0
+    nb = nfb
+    DO
+       nplan = nplan + 1
+       plan_nb(nplan) = nb
+       istat = cufftPlanMany( plan(nplan), 3, fdim, fdim, 1, nnr, fdim, 1, nnr, CUFFT_Z2Z, nb )
+       IF ( istat /= 0 ) CALL errore( 'dfpt_dev', 'cufftPlanMany failed', ABS(istat) )
+       IF ( nb == 1 .OR. nplan == nplan_max ) EXIT
+       nb = MAX( 1, nb / 4 )
+    ENDDO
+    IF ( plan_nb(nplan) /= 1 ) CALL errore( 'dfpt_dev', 'FFT plan table too small', 1 )
+    !
+  END SUBROUTINE make_plans
+  !
+  !-----------------------------------------------------------------------
+  INTEGER FUNCTION pick_plan( nb )
+    !-----------------------------------------------------------------------
+    !! the smallest plan that holds nb transforms
+    INTEGER, INTENT(IN) :: nb
+    INTEGER :: i
+    pick_plan = 1
+    DO i = 2, nplan
+       IF ( plan_nb(i) >= nb ) pick_plan = i
+    ENDDO
+  END FUNCTION pick_plan
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE fill_psir( )
+    !-----------------------------------------------------------------------
+    !! psir_d(:,ibnd,ik) = psi_{k,ibnd}(r) for the occupied bands
+    INTEGER :: ik, ib0, nb, ip, j, ig, ir, istat, nbl, ikl
+    !
+    nbl = nbo
+    DO ik = 1, nks
+       ikl = ik
+       DO ib0 = 0, nocc_h(ik)-1, nfb
+          nb = MIN( nfb, nocc_h(ik)-ib0 )
+          ip = pick_plan( nb )
+          !$cuf kernel do(2)
+          DO j = 1, nb
+             DO ig = 1, npwxl
+                IF ( ig <= npw_d(ikl) ) psig_d(nlk_d(ig,ikl) + (j-1)*nnr) = psik_d(ig,ib0+j,ikl)
+             ENDDO
+          ENDDO
+          istat = cufftExecZ2Z( plan(ip), psig_d, psic_d, CUFFT_INVERSE )
+          !$cuf kernel do(2)
+          DO j = 1, nb
+             DO ig = 1, npwxl
+                IF ( ig <= npw_d(ikl) ) psig_d(nlk_d(ig,ikl) + (j-1)*nnr) = (0.0_DP, 0.0_DP)
+             ENDDO
+          ENDDO
+          !$cuf kernel do(2)
+          DO j = 1, nb
+             DO ir = 1, nnr
+                psir_d(ir,ib0+j,ikl) = psic_d(ir + (j-1)*nnr)
+             ENDDO
+          ENDDO
+       ENDDO
+    ENDDO
+    !
+  END SUBROUTINE fill_psir
+  !
+  !-----------------------------------------------------------------------
   SUBROUTINE alloc_session( npert, with_dvb, ok )
     !-----------------------------------------------------------------------
     !! Work arrays for npert perturbations per k-point and the per-column
@@ -611,6 +738,63 @@ CONTAINS
     IF ( ALLOCATED(dv_d) ) DEALLOCATE( dv_d, drho_d )
     IF ( ALLOCATED(int3_d) ) DEALLOCATE( int3_d )
   END SUBROUTINE dfpt_dev_end
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE gemm_k( trans, m, n, k, alpha, a_dev, lda, stra, b_dev, ldb, strb, beta, &
+                     c_dev, ldc, strc, nbatch )
+    !-----------------------------------------------------------------------
+    !! nbatch products C_i = alpha op(A_i) B_i + beta C_i of matrices stored
+    !! with constant strides.
+    !
+    INTEGER, INTENT(IN) :: trans, m, n, k, lda, ldb, ldc, nbatch
+    INTEGER(8), INTENT(IN) :: stra, strb, strc
+    COMPLEX(DP), INTENT(IN) :: alpha, beta
+    COMPLEX(DP), DEVICE :: a_dev(*), b_dev(*), c_dev(*)
+    INTEGER :: istat, i
+    !
+    IF ( nbatch <= 0 .OR. m <= 0 .OR. n <= 0 ) RETURN
+    IF ( batched_gemm .AND. nbatch > 1 ) THEN
+       istat = cublasZgemmStridedBatched( hblas, trans, CUBLAS_OP_N, m, n, k, alpha, a_dev, lda, &
+                                          stra, b_dev, ldb, strb, beta, c_dev, ldc, strc, nbatch )
+       IF ( istat /= 0 ) CALL errore( 'dfpt_dev', 'cublasZgemmStridedBatched failed', ABS(istat) )
+    ELSE
+       DO i = 0, nbatch-1
+          istat = cublasZgemm( hblas, trans, CUBLAS_OP_N, m, n, k, alpha, a_dev(1+i*stra), lda, &
+                               b_dev(1+i*strb), ldb, beta, c_dev(1+i*strc), ldc )
+          IF ( istat /= 0 ) CALL errore( 'dfpt_dev', 'cublasZgemm failed', ABS(istat) )
+       ENDDO
+    ENDIF
+    !
+  END SUBROUTINE gemm_k
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE psi_to_r( j0, nb, ip )
+    !-----------------------------------------------------------------------
+    !! psi2_d(:,j) = psi_k(r) of the band of live column j0+j (no cache)
+    INTEGER, INTENT(IN) :: j0, nb, ip
+    INTEGER :: j, ig, c, ik, ibnd, istat, nck, nbl
+    !
+    nck = ncolk ; nbl = nbo
+    !$cuf kernel do(2)
+    DO j = 1, nb
+       DO ig = 1, npwxl
+          c = live_d(j0+j)
+          ik = (c-1)/nck + 1
+          ibnd = MOD(c-1,nbl) + 1
+          IF ( ig <= npw_d(ik) ) psig_d(nlk_d(ig,ik) + (j-1)*nnr) = psik_d(ig,ibnd,ik)
+       ENDDO
+    ENDDO
+    istat = cufftExecZ2Z( plan(ip), psig_d, psi2_d, CUFFT_INVERSE )
+    !$cuf kernel do(2)
+    DO j = 1, nb
+       DO ig = 1, npwxl
+          c = live_d(j0+j)
+          ik = (c-1)/nck + 1
+          IF ( ig <= npw_d(ik) ) psig_d(nlk_d(ig,ik) + (j-1)*nnr) = (0.0_DP, 0.0_DP)
+       ENDDO
+    ENDDO
+    !
+  END SUBROUTINE psi_to_r
   !
 #else
   !
