@@ -45,7 +45,7 @@ MODULE dyn_dev
   !
 #if defined(__CUDA)
   PUBLIC :: dyn_dform, dyn_d2form, &
-            d2ionq_g_dev, dyn_fwfft
+            dynmat_us_nl_dev, d2ionq_g_dev, dyn_fwfft
   !
   COMPLEX(DP), PARAMETER :: c_one = (1.0_DP, 0.0_DP), c_zero = (0.0_DP, 0.0_DP)
   INTEGER, PARAMETER :: max_tmp_elems = 8388608
@@ -440,6 +440,136 @@ CONTAINS
     DEALLOCATE( g_d, fac_d, facq_d, tau_d, zv_d, ityp_d, atl_d, r_d, r_h, atl_h )
     !
   END SUBROUTINE d2ionq_g_dev
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE dynmat_us_nl_dev( dynwrk )
+    !-----------------------------------------------------------------------
+    !! Nonlocal part of dynmat_us (the loop over k-points), collinear
+    !! case: the second derivatives of <beta|psi> are one ZGEMM per block
+    !! of bands on the device, the sums over bands and projectors run on
+    !! the host. The result is added to dynwrk (Cartesian basis).
+    !
+    USE ions_base,     ONLY : nat, ityp
+    USE klist,         ONLY : xk, ngk, igk_k
+    USE gvect,         ONLY : g
+    USE cell_base,     ONLY : tpiba2
+    USE lsda_mod,      ONLY : current_spin, lsda, isk
+    USE wvfct,         ONLY : npwx, nbnd, et, wg
+    USE wavefunctions, ONLY : evc
+    USE uspp,          ONLY : nkb, vkb, okvan, ofsbeta, deeq, qq_at
+    USE uspp_param,    ONLY : nh
+    USE uspp_init,     ONLY : init_us_2
+    USE buffers,       ONLY : get_buffer
+    USE units_lr,      ONLY : iuwfc, lrwfc
+    USE qpoint,        ONLY : nksq, ikks
+    USE control_lr,    ONLY : nbnd_occ
+    USE lrus,          ONLY : becp1
+    USE phus,          ONLY : alphap
+    USE dvbare_dev,    ONLY : dvbare_blas
+    !
+    COMPLEX(DP), INTENT(INOUT) :: dynwrk(3*nat,3*nat)
+    !
+    COMPLEX(DP), ALLOCATABLE, DEVICE :: aux_d(:,:), gam_d(:,:)
+    REAL(DP), ALLOCATABLE, DEVICE :: kg_d(:,:)
+    COMPLEX(DP), ALLOCATABLE :: gam(:,:)
+    REAL(DP), ALLOCATABLE :: kg_h(:,:)
+    TYPE(cublasHandle) :: h
+    INTEGER :: ik, ikk, npw, nbo, nbc, j0, nbl, j, ig, istat, na, nt, ijkb0, nhn, ibnd, ih, jh, &
+               ikb, jkb, icart, jcart, na_icart, na_jcart, is, p, ib
+    REAL(DP) :: wgg, d, e, tp2
+    INTEGER, PARAMETER :: pidx(3,3) = RESHAPE( (/ 1, 2, 4, 2, 3, 5, 4, 5, 6 /), (/ 3, 3 /) )
+    !
+    IF ( nkb == 0 ) RETURN
+    CALL dvbare_blas( h )
+    nbc = MAX( 1, MIN( nbnd, max_tmp_elems / (6*npwx) ) )
+    ALLOCATE( aux_d(npwx,6*nbc), gam_d(nkb,6*nbnd), kg_d(3,npwx), STAT=istat )
+    IF ( istat /= 0 ) CALL errore( 'dynmat_us_nl_dev', 'device allocation failed', 1 )
+    ALLOCATE( gam(nkb,6*nbnd), kg_h(3,npwx) )
+    tp2 = tpiba2
+    !
+    DO ik = 1, nksq
+       ikk = ikks(ik)
+       IF ( lsda ) current_spin = isk(ikk)
+       is = current_spin
+       npw = ngk(ikk)
+       nbo = nbnd_occ(ikk)
+       IF ( nksq > 1 ) CALL get_buffer( evc, lrwfc, iuwfc, ikk )
+       !
+       ! ... beta functions on the device (every routine that needs them on the
+       ! ... host asks for them again; the copy of nkb*npwx numbers costs
+       ! ... seconds in large cells)
+       !
+       CALL init_us_2( npw, igk_k(1,ikk), xk(1,ikk), vkb, .TRUE. )
+       IF ( nbo < 1 ) CYCLE
+       DO ig = 1, npw
+          kg_h(:,ig) = xk(:,ikk) + g(:,igk_k(ig,ikk))
+       ENDDO
+       kg_h(:,npw+1:npwx) = 0.0_DP
+       kg_d = kg_h
+       !
+       ! ... gamma terms: <beta| -tpiba2 (k+G)_i (k+G)_j |psi>, pairs 11, 21, 22, 31, 32, 33
+       !
+       !$acc update device(evc)
+       DO j0 = 0, nbo-1, nbc
+          nbl = MIN( nbc, nbo-j0 )
+          !$acc parallel loop collapse(2) present(evc)
+          DO j = 1, nbl
+             DO ig = 1, npw
+                aux_d(ig,6*(j-1)+1) = - evc(ig,j0+j) * tp2 * kg_d(1,ig) * kg_d(1,ig)
+                aux_d(ig,6*(j-1)+2) = - evc(ig,j0+j) * tp2 * kg_d(2,ig) * kg_d(1,ig)
+                aux_d(ig,6*(j-1)+3) = - evc(ig,j0+j) * tp2 * kg_d(2,ig) * kg_d(2,ig)
+                aux_d(ig,6*(j-1)+4) = - evc(ig,j0+j) * tp2 * kg_d(3,ig) * kg_d(1,ig)
+                aux_d(ig,6*(j-1)+5) = - evc(ig,j0+j) * tp2 * kg_d(3,ig) * kg_d(2,ig)
+                aux_d(ig,6*(j-1)+6) = - evc(ig,j0+j) * tp2 * kg_d(3,ig) * kg_d(3,ig)
+             ENDDO
+          ENDDO
+          !$acc host_data use_device(vkb)
+          istat = cublasZgemm( h, CUBLAS_OP_C, CUBLAS_OP_N, nkb, 6*nbl, npw, c_one, vkb, npwx, &
+                               aux_d, npwx, c_zero, gam_d(1,6*j0+1), nkb )
+          !$acc end host_data
+          IF ( istat /= 0 ) CALL errore( 'dynmat_us_nl_dev', 'cublasZgemm failed', ABS(istat) )
+       ENDDO
+       gam = gam_d
+       !
+       ! ... sums over bands and projectors, as in the stock routine
+       !
+       !$omp parallel do private(na, nt, ijkb0, nhn, ibnd, wgg, e, ib, icart, jcart, na_icart, &
+       !$omp                     na_jcart, p, ih, jh, ikb, jkb, d) if(nkb*nbo > 2000)
+       DO na = 1, nat
+          nt = ityp(na)
+          ijkb0 = ofsbeta(na)
+          nhn = nh(nt)
+          DO ibnd = 1, nbo
+             wgg = wg(ibnd,ikk)
+             e = et(ibnd,ikk)
+             ib = 6 * (ibnd - 1)
+             DO icart = 1, 3
+                na_icart = 3 * (na - 1) + icart
+                DO jcart = 1, 3
+                   na_jcart = 3 * (na - 1) + jcart
+                   p = ib + pidx(icart,jcart)
+                   DO ih = 1, nhn
+                      ikb = ijkb0 + ih
+                      DO jh = 1, nhn
+                         jkb = ijkb0 + jh
+                         d = deeq(ih,jh,na,is)
+                         IF ( okvan ) d = d - e * qq_at(ih,jh,na)
+                         dynwrk(na_icart,na_jcart) = dynwrk(na_icart,na_jcart) + d * wgg * &
+                              ( CONJG( gam(ikb,p) ) * becp1(ik)%k(jkb,ibnd) + &
+                                CONJG( becp1(ik)%k(ikb,ibnd) ) * gam(jkb,p) + &
+                                CONJG( alphap(icart,ik)%k(ikb,ibnd) ) * alphap(jcart,ik)%k(jkb,ibnd) + &
+                                CONJG( alphap(jcart,ik)%k(ikb,ibnd) ) * alphap(icart,ik)%k(jkb,ibnd) )
+                      ENDDO
+                   ENDDO
+                ENDDO
+             ENDDO
+          ENDDO
+       ENDDO
+       !$omp end parallel do
+    ENDDO
+    DEALLOCATE( aux_d, gam_d, kg_d, gam, kg_h )
+    !
+  END SUBROUTINE dynmat_us_nl_dev
   !
 #endif
   !

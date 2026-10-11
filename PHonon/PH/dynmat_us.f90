@@ -49,7 +49,7 @@ SUBROUTINE dynmat_us()
   USE uspp_init,        ONLY : init_us_2
   USE dyn_dev,          ONLY : dyn_check
 #if defined(__CUDA)
-  USE dyn_dev,          ONLY : dyn_dev_ok, dyn_d2form, dyn_fwfft
+  USE dyn_dev,          ONLY : dyn_dev_ok, dyn_d2form, dynmat_us_nl_dev, dyn_fwfft
 #endif
 
   IMPLICIT NONE
@@ -186,6 +186,15 @@ SUBROUTINE dynmat_us()
   !
   ! Here we compute  the nonlocal Ultra-soft contribution
   !
+  CALL start_clock ('dynus_nl')
+#if defined(__CUDA)
+  IF ( on_device ) THEN
+     !
+     ! Device path: projections with ZGEMM on the device, sums on the host
+     !
+     CALL dynmat_us_nl_dev (dynwrk)
+  ELSE
+#endif
   DO ik = 1, nksq
      ikk = ikks(ik)
      IF (lsda) current_spin = isk (ikk)
@@ -283,6 +292,11 @@ SUBROUTINE dynmat_us()
         ENDDO
      ENDDO
   ENDDO
+#if defined(__CUDA)
+  ENDIF
+#endif
+  CALL stop_clock ('dynus_nl')
+  CALL dyn_check ('dynus_nl', 3*nat, dynwrk)
   !
   !   For true US pseudopotentials there is an additional term in the second
   !   derivative which is due to the change of the self consistent D part

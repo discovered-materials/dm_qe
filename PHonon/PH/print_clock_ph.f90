@@ -165,6 +165,7 @@ subroutine print_clock_ph
   call print_clock ('drhodvloc')
   call print_clock ('dynmat_nlcc')
   call print_clock ('dynus_loc')
+  call print_clock ('dynus_nl')
   call print_clock ('d2ionq_g')
   call print_clock ('d2ionq_r')
   call print_clock ('dyn_dform')
