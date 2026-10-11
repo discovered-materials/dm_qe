@@ -45,6 +45,7 @@ subroutine dvanqq
   USE eqv,        ONLY : vlocq
   USE qpoint,     ONLY : eigqts, xq
   USE control_lr, ONLY : lgamma, rec_code_read
+  USE usaug_dev,  ONLY : usaug_on, usaug_dvanqq, usaug_check
 
   implicit none
   !
@@ -71,6 +72,10 @@ subroutine dvanqq
   ! the augmentation function at G
   complex(DP), pointer :: qgmq (:)
   ! the augmentation function at q+G
+  complex(DP), allocatable :: int1_dev(:,:,:,:,:), int2_dev(:,:,:,:,:), &
+                              int4_dev(:,:,:,:,:), int5_dev(:,:,:,:,:)
+  ! results of the device code (self-test only)
+  logical :: lcheck
 
   if (.not.okvan) return
 
@@ -81,6 +86,27 @@ subroutine dvanqq
   int2(:,:,:,:,:) = (0.d0, 0.d0)
   int4(:,:,:,:,:) = (0.d0, 0.d0)
   int5(:,:,:,:,:) = (0.d0, 0.d0)
+  !
+  ! Device code: Q_ij(G) and Q_ij(q+G) are tabulated on the GPU and the four
+  ! integrals are matrix products of the tables with the potentials times
+  ! structure factors (all atoms, collinear case)
+  !
+  if (usaug_on() .and. nat_todo_input <= 0) then
+     call usaug_dvanqq (vlocq, int1, int2, int4, int5)
+     if (.not. usaug_check()) then
+        call stop_clock ('dvanqq')
+        return
+     endif
+     allocate (int1_dev, source = int1)
+     allocate (int2_dev, source = int2)
+     allocate (int4_dev, source = int4)
+     allocate (int5_dev, source = int5)
+     int1(:,:,:,:,:) = (0.d0, 0.d0)
+     int2(:,:,:,:,:) = (0.d0, 0.d0)
+     int4(:,:,:,:,:) = (0.d0, 0.d0)
+     int5(:,:,:,:,:) = (0.d0, 0.d0)
+  endif
+  !
   allocate (sk  (  ngm))
   allocate (aux1(  ngm))
   allocate(aux35(9,128))
@@ -274,6 +300,13 @@ subroutine dvanqq
   call mp_sum(  int2, intra_bgrp_comm )
   call mp_sum(  int4, intra_bgrp_comm )
   call mp_sum(  int5, intra_bgrp_comm )
+  if (allocated(int1_dev)) then
+     lcheck = usaug_check ('dvanqq int1', size(int1), int1_dev, int1)
+     lcheck = usaug_check ('dvanqq int2', size(int2), int2_dev, int2)
+     lcheck = usaug_check ('dvanqq int4', size(int4), int4_dev, int4)
+     lcheck = usaug_check ('dvanqq int5', size(int5), int5_dev, int5)
+     deallocate (int1_dev, int2_dev, int4_dev, int5_dev)
+  endif
 
   IF (noncolin) THEN
      CALL set_int12_nc(0)

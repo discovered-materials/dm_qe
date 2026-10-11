@@ -54,7 +54,7 @@ MODULE usaug_dev
   SAVE
   !
   PUBLIC :: usaug_on, usaug_check, usaug_invalidate, usaug_newdq, usaug_addusddens, &
-            usaug_interp_on
+            usaug_dvanqq, usaug_interp_on
   !
   LOGICAL :: env_read = .FALSE.
   !! the environment has been read
@@ -796,6 +796,256 @@ CONTAINS
     !
   END SUBROUTINE usaug_addusddens
   !
+  !-----------------------------------------------------------------------
+  SUBROUTINE usaug_dvanqq( vlocq, int1, int2, int4, int5 )
+    !-----------------------------------------------------------------------
+    !! The integrals of the augmentation functions and of their derivatives
+    !! with V_eff and V_loc, see dvanqq (collinear case, all atoms):
+    !!
+    !! z_k(ij;nb,is)  = sum_G Q_ij(G)   conj(V_eff(G,is)) S_nb(G) p_k(G)
+    !! z_k(ij;na,nb)  = sum_G Q_ij(q+G) conj(V_loc(q+G) S_na(G)) S_nb(G) p_k(q+G)
+    !!
+    !! with p_1..3(v) = v, p_4..9(v) = v_1 v_1, v_1 v_2, v_1 v_3, v_2 v_2,
+    !! v_2 v_3, v_3 v_3. int1 and int4 are made of the first set, int2 and
+    !! int5 of the second.
+    !
+    USE cell_base,        ONLY : omega, tpiba, tpiba2
+    USE ions_base,        ONLY : nat, ityp, ntyp => nsp
+    USE gvect,            ONLY : ngm, g, gg
+    USE scf,              ONLY : v, vltot
+    USE noncollin_module, ONLY : nspin_mag
+    USE uspp,             ONLY : ijtoh
+    USE uspp_param,       ONLY : upf, lmaxq, nh
+    USE qpoint,           ONLY : xq, eigqts
+    USE control_lr,       ONLY : lgamma
+    !
+    REAL(DP), INTENT(IN) :: vlocq(:,:)
+    !! local potential at q+G (ngm, ntyp)
+    COMPLEX(DP), INTENT(INOUT) :: int1(:,:,:,:,:), int2(:,:,:,:,:), int4(:,:,:,:,:), int5(:,:,:,:,:)
+    !
+    INTEGER, PARAMETER :: kk(3,3) = RESHAPE( (/ 4, 5, 6, 5, 7, 8, 6, 8, 9 /), (/ 3, 3 /) )
+    COMPLEX(DP), ALLOCATABLE :: veff(:,:), z_h(:,:)
+    REAL(DP), ALLOCATABLE :: qmod(:), ylm(:,:)
+    COMPLEX(DP), ALLOCATABLE, DEVICE :: vg_d(:,:), w_d(:,:), z_d(:,:), q0_d(:,:)
+    REAL(DP), ALLOCATABLE, DEVICE :: vloc_d(:,:), yl0_d(:,:), qm0_d(:)
+    INTEGER, ALLOCATABLE, DEVICE :: ityp_d(:)
+    INTEGER :: nt, is, ir, ig, natc, a0, nac, ncols, ia0, c, k, ia, na, nb, nta, ij0, nc, col, &
+               istat, ih, jh, ij, ijh, c0, a, b, n1, nqb, nijt, npair, npc, p0, npr, p, nsp_l, &
+               nat_l, tat0_l, e1, q0_e1, q0_nc
+    REAL(DP) :: xq1, xq2, xq3, v1, v2, v3, pk
+    COMPLEX(DP) :: fact, fact1, ee
+    !
+    CALL prepare_q( )
+    n1 = ngml ; nsp_l = nspin_mag ; nat_l = nat
+    xq1 = xq(1) ; xq2 = xq(2) ; xq3 = xq(3)
+    fact1 = CMPLX( 0.0_DP, - tpiba * omega, KIND=DP )
+    !
+    ! ... V_eff(G), V_loc(q+G), type of the atoms
+    !
+    ALLOCATE( veff(nnrp,nspin_mag), vg_d(ngml,nspin_mag) )
+    DO is = 1, nspin_mag
+       DO ir = 1, nnrp
+          veff(ir,is) = CMPLX( vltot(ir) + v%of_r(ir,is), 0.0_DP, KIND=DP )
+       ENDDO
+    ENDDO
+    CALL fft_to_g( veff, nspin_mag, vg_d )
+    DEALLOCATE( veff )
+    ALLOCATE( vloc_d(ngml,ntyp), ityp_d(nat) )
+    vloc_d = vlocq(1:ngm,1:ntyp)
+    ityp_d = ityp(1:nat)
+    !
+    ! ... int1 and int4 need Q_ij(G): the table when q = 0, otherwise it is
+    ! ... computed here a block at a time
+    !
+    q0_e1 = 0 ; q0_nc = 0
+    IF ( .NOT. lgamma ) THEN
+       ALLOCATE( qmod(ngm), ylm(ngm,lmaxq*lmaxq) )
+       CALL ylmr2( lmaxq*lmaxq, ngm, g, gg, ylm )
+       DO ig = 1, ngm
+          qmod(ig) = SQRT( gg(ig) ) * tpiba
+       ENDDO
+       ALLOCATE( yl0_d(ngm,lmaxq*lmaxq), qm0_d(ngm) )
+       yl0_d = ylm ; qm0_d = qmod
+       DEALLOCATE( qmod, ylm )
+    ENDIF
+    !
+    DO nt = 1, ntyp
+       IF ( .NOT. upf(nt)%tvanp .OR. tnat(nt) == 0 ) CYCLE
+       nijt = nij(nt)
+       tat0_l = tat0(nt)
+       !
+       ! ... first set: columns ((ia-1)*nspin + is-1)*9 + k
+       !
+       nqb = qblock( nt )
+       IF ( .NOT. lgamma ) THEN
+          nqb = ncol_fit( 16.0_DP * REAL(ngml,DP), nijt )
+          ALLOCATE( q0_d(ngml,nqb) )
+          q0_e1 = 0 ; q0_nc = 0
+       ENDIF
+       natc = ncol_fit( 16.0_DP * REAL(ngml,DP) * 9 * nspin_mag, tnat(nt) )
+       ALLOCATE( w_d(ngml,natc*nspin_mag*9), z_d(nijt,natc*nspin_mag*9), z_h(nijt,natc*nspin_mag*9) )
+       DO a0 = 0, tnat(nt)-1, natc
+          nac = MIN( natc, tnat(nt)-a0 )
+          ncols = nac * nspin_mag * 9
+          ia0 = tat0(nt) + a0
+          !$cuf kernel do(2)
+          DO c = 1, ncols
+             DO ig = 1, n1
+                k = MOD(c-1,9) + 1
+                is = MOD((c-1)/9,nsp_l) + 1
+                nb = atl_d(ia0 + (c-1)/(9*nsp_l) + 1)
+                v1 = g_d(1,ig) ; v2 = g_d(2,ig) ; v3 = g_d(3,ig)
+                IF ( k == 1 ) THEN
+                   pk = v1
+                ELSEIF ( k == 2 ) THEN
+                   pk = v2
+                ELSEIF ( k == 3 ) THEN
+                   pk = v3
+                ELSEIF ( k == 4 ) THEN
+                   pk = v1 * v1
+                ELSEIF ( k == 5 ) THEN
+                   pk = v1 * v2
+                ELSEIF ( k == 6 ) THEN
+                   pk = v1 * v3
+                ELSEIF ( k == 7 ) THEN
+                   pk = v2 * v2
+                ELSEIF ( k == 8 ) THEN
+                   pk = v2 * v3
+                ELSE
+                   pk = v3 * v3
+                ENDIF
+                w_d(ig,c) = CONJG( vg_d(ig,is) ) * pk * eig1_d(mill_d(1,ig),nb) * &
+                            eig2_d(mill_d(2,ig),nb) * eig3_d(mill_d(3,ig),nb)
+             ENDDO
+          ENDDO
+          DO ij0 = 0, nijt-1, nqb
+             nc = MIN( nqb, nijt-ij0 )
+             IF ( lgamma ) THEN
+                col = qcol( nt, ij0, nc )
+                istat = cublasZgemm( hblas, CUBLAS_OP_T, CUBLAS_OP_N, nc, ncols, ngml, c_one, &
+                                     qg_d(1,col), ngml, w_d, ngml, c_zero, z_d(ij0+1,1), nijt )
+             ELSE
+                e1 = ent0(nt) + ij0 + 1
+                IF ( q0_e1 /= e1 .OR. q0_nc < nc ) THEN
+                   CALL fill_qg( ngml, yl0_d, qm0_d, e1, e1+nc-1, q0_d )
+                   q0_e1 = e1 ; q0_nc = nc
+                ENDIF
+                istat = cublasZgemm( hblas, CUBLAS_OP_T, CUBLAS_OP_N, nc, ncols, ngml, c_one, &
+                                     q0_d, ngml, w_d, ngml, c_zero, z_d(ij0+1,1), nijt )
+             ENDIF
+             IF ( istat /= 0 ) CALL errore( 'usaug_dvanqq', 'cublasZgemm failed', ABS(istat) )
+          ENDDO
+          z_h(:,1:ncols) = z_d(:,1:ncols)
+          !
+          DO ia = 1, nac
+             nb = atl(ia0+ia)
+             DO is = 1, nspin_mag
+                c0 = ( (ia-1)*nspin_mag + is-1 ) * 9
+                ij = 0
+                DO ih = 1, nh(nt)
+                   DO jh = ih, nh(nt)
+                      ij = ij + 1
+                      ijh = ijtoh(ih,jh,nt)
+                      DO k = 1, 3
+                         int1(ih,jh,k,nb,is) = - fact1 * CONJG( z_h(ij,c0+k) )
+                         int1(jh,ih,k,nb,is) = int1(ih,jh,k,nb,is)
+                      ENDDO
+                      DO b = 1, 3
+                         DO a = 1, 3
+                            int4(ijh,a,b,nb,is) = - tpiba2 * omega * z_h(ij,c0+kk(a,b))
+                         ENDDO
+                      ENDDO
+                   ENDDO
+                ENDDO
+             ENDDO
+          ENDDO
+       ENDDO
+       DEALLOCATE( w_d, z_d, z_h )
+       IF ( .NOT. lgamma ) DEALLOCATE( q0_d )
+       !
+       ! ... second set: pair p = (ib-1)*nat + na, nb = atom ib of the type,
+       ! ... columns (p-1)*9 + k
+       !
+       nqb = qblock( nt )
+       npair = tnat(nt) * nat
+       npc = ncol_fit( 16.0_DP * REAL(ngml,DP) * 9, npair )
+       ALLOCATE( w_d(ngml,npc*9), z_d(nijt,npc*9), z_h(nijt,npc*9) )
+       DO p0 = 0, npair-1, npc
+          npr = MIN( npc, npair-p0 )
+          ncols = npr * 9
+          !$cuf kernel do(2)
+          DO c = 1, ncols
+             DO ig = 1, n1
+                k = MOD(c-1,9) + 1
+                p = p0 + (c-1)/9 + 1
+                na = MOD(p-1,nat_l) + 1
+                nb = atl_d(tat0_l + (p-1)/nat_l + 1)
+                v1 = g_d(1,ig) + xq1 ; v2 = g_d(2,ig) + xq2 ; v3 = g_d(3,ig) + xq3
+                IF ( k == 1 ) THEN
+                   pk = v1
+                ELSEIF ( k == 2 ) THEN
+                   pk = v2
+                ELSEIF ( k == 3 ) THEN
+                   pk = v3
+                ELSEIF ( k == 4 ) THEN
+                   pk = v1 * v1
+                ELSEIF ( k == 5 ) THEN
+                   pk = v1 * v2
+                ELSEIF ( k == 6 ) THEN
+                   pk = v1 * v3
+                ELSEIF ( k == 7 ) THEN
+                   pk = v2 * v2
+                ELSEIF ( k == 8 ) THEN
+                   pk = v2 * v3
+                ELSE
+                   pk = v3 * v3
+                ENDIF
+                ee = vloc_d(ig,ityp_d(na)) * eig1_d(mill_d(1,ig),na) * eig2_d(mill_d(2,ig),na) * &
+                     eig3_d(mill_d(3,ig),na)
+                w_d(ig,c) = CONJG( ee ) * pk * eig1_d(mill_d(1,ig),nb) * &
+                            eig2_d(mill_d(2,ig),nb) * eig3_d(mill_d(3,ig),nb)
+             ENDDO
+          ENDDO
+          DO ij0 = 0, nijt-1, nqb
+             nc = MIN( nqb, nijt-ij0 )
+             col = qcol( nt, ij0, nc )
+             istat = cublasZgemm( hblas, CUBLAS_OP_T, CUBLAS_OP_N, nc, ncols, ngml, c_one, &
+                                  qg_d(1,col), ngml, w_d, ngml, c_zero, z_d(ij0+1,1), nijt )
+             IF ( istat /= 0 ) CALL errore( 'usaug_dvanqq', 'cublasZgemm failed', ABS(istat) )
+          ENDDO
+          z_h(:,1:ncols) = z_d(:,1:ncols)
+          !
+          DO p = p0+1, p0+npr
+             na = MOD(p-1,nat) + 1
+             nb = atl(tat0(nt) + (p-1)/nat + 1)
+             c0 = (p-p0-1) * 9
+             fact = eigqts(na) * CONJG( eigqts(nb) )
+             ij = 0
+             DO ih = 1, nh(nt)
+                DO jh = ih, nh(nt)
+                   ij = ij + 1
+                   ijh = ijtoh(ih,jh,nt)
+                   DO k = 1, 3
+                      int2(ih,jh,k,na,nb) = CONJG( z_h(ij,c0+k) ) * fact * fact1
+                      int2(jh,ih,k,na,nb) = int2(ih,jh,k,na,nb)
+                   ENDDO
+                   DO b = 1, 3
+                      DO a = 1, 3
+                         int5(ijh,a,b,na,nb) = CONJG(fact) * tpiba2 * omega * z_h(ij,c0+kk(a,b))
+                      ENDDO
+                   ENDDO
+                ENDDO
+             ENDDO
+          ENDDO
+       ENDDO
+       DEALLOCATE( w_d, z_d, z_h )
+    ENDDO
+    !
+    DEALLOCATE( vg_d, vloc_d, ityp_d )
+    IF ( .NOT. lgamma ) DEALLOCATE( yl0_d, qm0_d )
+    !
+  END SUBROUTINE usaug_dvanqq
+  !
 #else
   !
   ! ... stubs for builds without CUDA: usaug_on is false and these are never called
@@ -821,6 +1071,12 @@ CONTAINS
     COMPLEX(DP), INTENT(INOUT) :: drhop(dfftp%nnr,nspin_mag,npert)
     CALL errore( 'usaug_addusddens', 'not available without CUDA', 1 )
   END SUBROUTINE usaug_addusddens
+  !
+  SUBROUTINE usaug_dvanqq( vlocq, int1, int2, int4, int5 )
+    REAL(DP), INTENT(IN) :: vlocq(:,:)
+    COMPLEX(DP), INTENT(INOUT) :: int1(:,:,:,:,:), int2(:,:,:,:,:), int4(:,:,:,:,:), int5(:,:,:,:,:)
+    CALL errore( 'usaug_dvanqq', 'not available without CUDA', 1 )
+  END SUBROUTINE usaug_dvanqq
   !
 #endif
   !
