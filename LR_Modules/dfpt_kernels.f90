@@ -122,7 +122,7 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
                                     dbecsum_cond_nc, drhos_cond, ef_shift_wfc_twochem
    USE localdos_mod,         ONLY : localdos_new
    USE dfpt_dev,             ONLY : dfpt_dev_begin, dfpt_dev_end, dfpt_dev_flush, &
-                                    dfpt_dev_in_session, dfpt_dev_agree, &
+                                    dfpt_dev_in_session, dfpt_dev_set_eta, dfpt_dev_agree, &
                                     dfpt_dev_keeping
    USE mp_images,            ONLY : intra_image_comm
    USE dfpt_dev_grid,        ONLY : dfpt_dev_dv_of_drho
@@ -177,6 +177,12 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
    !! True if the response potential was computed on the device
    LOGICAL :: dev_mix
    !! True if the mixing history is kept in memory (device engine in use)
+   REAL(DP) :: eta_in, eta_fac, eta_now
+   LOGICAL :: eta_off
+   !! Device engine: from now on the linear systems are solved to thresh (set when
+   !! self-consistency was reached in an iteration with a relative tolerance)
+   !! Device engine: relative tolerance of the linear solver while the self-consistency
+   !! error is more than eta_fac times its threshold (environment QE_PH_ETA, QE_PH_ETAFAC)
    CHARACTER(LEN=32) :: envval
    INTEGER :: lenv, ierr
    LOGICAL :: stop_now, convt_rec
@@ -263,12 +269,21 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
       CALL dfpt_dev_agree(dev_mix)
       dev_mix = dfpt_dev_in_session()
    ENDIF
+   eta_in = 0.0_DP
+   eta_fac = 100.0_DP
+   eta_off = .FALSE.
    rec_sec = 30.0_DP
    CALL SYSTEM_CLOCK(clk_rec, clk_rate)
    IF (dev_mix) THEN
+      CALL get_environment_variable('QE_PH_ETA', envval, lenv, ierr)
+      IF (ierr == 0 .AND. lenv > 0) READ(envval, *, IOSTAT=ierr) eta_in
+      IF (ierr /= 0) eta_in = 0.0_DP
       CALL get_environment_variable('QE_PH_REC_SEC', envval, lenv, ierr)
       IF (ierr == 0 .AND. lenv > 0) READ(envval, *, IOSTAT=ierr) rec_sec
       IF (ierr /= 0) rec_sec = 30.0_DP
+      CALL get_environment_variable('QE_PH_ETAFAC', envval, lenv, ierr)
+      IF (ierr == 0 .AND. lenv > 0) READ(envval, *, IOSTAT=ierr) eta_fac
+      IF (ierr /= 0) eta_fac = 100.0_DP
    ENDIF
    !
    ! Loop over DFPT self-consistent iterations
@@ -302,6 +317,16 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
          thresh = min(1.d-1 * sqrt(dr2), 1.0d-2)
       ELSE
          thresh = min(1.d-1 * sqrt(dr2), thresh)
+      ENDIF
+      !
+      ! Device engine: far from self-consistency the linear systems need not be solved
+      ! beyond a fixed reduction of their residual; the last iterations use thresh alone
+      !
+      eta_now = 0.0_DP
+      IF (dev_mix) THEN
+         IF (kter > 1 .AND. .NOT. first_iter .AND. .NOT. eta_off .AND. &
+             dr2 > eta_fac * tr2_ph / npol) eta_now = eta_in
+         CALL dfpt_dev_set_eta(eta_now)
       ENDIF
       !
       ! DFPT+U: at each ph iteration calculate dnsscf,
@@ -462,6 +487,14 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
       ENDIF
       !
       !   fft_interpolate or copy potential from hard to smooth grid: dvscfp -> dvscfs
+      !
+      ! Self-consistency reached with linear systems solved to a relative tolerance only:
+      ! not accepted. The iterations continue with the linear systems solved to thresh.
+      !
+      IF (convt .AND. eta_now > 0.0_DP) THEN
+         convt = .FALSE.
+         eta_off = .TRUE.
+      ENDIF
       !
       CALL start_clock('dk_p2s')
       CALL dfpt_dvscfp_to_dvscfs(dfpt_data)
