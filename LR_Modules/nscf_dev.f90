@@ -37,6 +37,7 @@ MODULE nscf_dev
   PRIVATE
   SAVE
   !
+  PUBLIC :: c_bands_nscf_dev
   !
 #if defined(__CUDA)
   COMPLEX(DP), PARAMETER :: c_one = (1.0_DP, 0.0_DP), c_zero = (0.0_DP, 0.0_DP)
@@ -65,6 +66,550 @@ MODULE nscf_dev
 #endif
   !
 CONTAINS
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE c_bands_nscf_dev( done )
+    !-----------------------------------------------------------------------
+    !! Bands of all k-points of the non-scf calculation. done = .FALSE. on
+    !! exit: the case is not served and nothing was done.
+    !
+#if defined(__CUDA)
+    USE io_global,            ONLY : stdout
+    USE io_files,             ONLY : iunwfc, nwordwfc
+    USE buffers,              ONLY : save_buffer
+    USE klist,                ONLY : nkstot, nks, xk, ngk, igk_k
+    USE uspp,                 ONLY : vkb, nkb, okvan, deeq, qq_at, ofsbeta
+    USE uspp_param,           ONLY : nh, nhm
+    USE uspp_init,            ONLY : init_us_2
+    USE ions_base,            ONLY : nat, ityp
+    USE wvfct,                ONLY : et, nbnd, nbndx, npwx, current_k, g2kin, btype
+    USE control_flags,        ONLY : ethr, restart, isolve, io_level, use_gpu, gamma_only, &
+                                     use_para_diag, scissor
+    USE ldaU,                 ONLY : lda_plus_u
+    USE lsda_mod,             ONLY : current_spin, lsda, isk, nspin
+    USE wavefunctions,        ONLY : evc
+    USE noncollin_module,     ONLY : noncolin, npol
+    USE fft_base,             ONLY : dffts
+    USE scf,                  ONLY : vrs
+    USE g_psi_mod,            ONLY : h_diag, s_diag
+    USE mp_bands,             ONLY : nproc_bgrp, nbgrp
+    USE mp_pools,             ONLY : inter_pool_comm
+    USE mp_images,            ONLY : intra_image_comm, nproc_image
+    USE mp,                   ONLY : mp_sum
+    USE realus,               ONLY : real_space
+    USE xc_lib,               ONLY : exx_is_active, xclib_dft_is
+    USE bp,                   ONLY : lelfield
+    USE starting_scf,         ONLY : starting_wfc
+#endif
+    !
+    LOGICAL, INTENT(OUT) :: done
+    !
+#if defined(__CUDA)
+    CHARACTER(LEN=16) :: val
+    INTEGER :: ln, ierr, istat, ik, ig, ibnd, ikb, na, ih, jh, is, ir, npw, i, j, n, m, np, nb1, &
+               iter, nactk, npair, nbn, info, tot_iter, nrun, k1, k2, irun, nnotconv_tot, nserve
+    REAL(DP) :: need, avg_iter, empty_ethr
+    LOGICAL :: batched
+    INTEGER(KIND=cuda_count_kind) :: mfree, mtot
+    INTEGER, ALLOCATABLE :: ivec(:), nl_h(:), nbase(:), notcnv(:), kter(:), ntry(:), state(:), &
+                            inotcnv(:,:), flag_h(:), pk_h(:), pn_h(:), run1(:), run2(:), nbold(:)
+    ! state: 0 = active, 1 = converged, 2 = given up (ntry exhausted)
+    LOGICAL, ALLOCATABLE :: conv(:,:), vzero(:)
+    REAL(DP), ALLOCATABLE :: e(:,:), ew_h(:,:), ewk(:)
+    COMPLEX(DP), ALLOCATABLE :: hc(:,:,:), sc(:,:,:), vc(:,:,:), hcn_h(:,:,:), scn_h(:,:,:), &
+                                vcr(:,:,:), hk(:,:), sk(:,:), vk(:,:), stage(:,:)
+    !
+    done = .FALSE.
+    CALL get_environment_variable( 'QE_PH_DEV', val, ln, ierr )
+    IF ( ierr == 0 .AND. ln > 0 .AND. val(1:1) == '0' ) RETURN
+    CALL get_environment_variable( 'QE_PH_NSCF_DEV', val, ln, ierr )
+    IF ( ierr == 0 .AND. ln > 0 .AND. val(1:1) == '0' ) RETURN
+    IF ( .NOT. use_gpu .OR. isolve /= 0 .OR. noncolin .OR. lda_plus_u .OR. gamma_only .OR. &
+         real_space .OR. scissor .OR. lelfield .OR. exx_is_active() .OR. xclib_dft_is('meta') .OR. &
+         use_para_diag .OR. restart .OR. dffts%has_task_groups .OR. nproc_bgrp /= 1 .OR. &
+         nbgrp /= 1 .OR. npol /= 1 ) RETURN
+    IF ( dffts%nnr /= dffts%nr1*dffts%nr2*dffts%nr3 .OR. dffts%nr1 /= dffts%nr1x .OR. &
+         dffts%nr2 /= dffts%nr2x .OR. dffts%nr3 /= dffts%nr3x ) RETURN
+    IF ( TRIM(starting_wfc) == 'file' ) RETURN
+    IF ( nbnd > nbndx / 2 ) RETURN
+    !
+    nk = nks ; nvec = nbnd ; nvecx = nbndx ; npwxl = npwx ; nkbl = nkb
+    nnr = dffts%nnr ; nr1 = dffts%nr1 ; nr2 = dffts%nr2 ; nr3 = dffts%nr3
+    nspl = nspin ; nhml = nhm ; natl = nat
+    lus = okvan
+    !
+    ! ... what follows depends on the rank (k-points of the pool, device and host
+    ! ... memory): the stock loop has collective MPI calls that this routine has not,
+    ! ... so it serves either all the ranks of the image or none
+    !
+    need = 16.0_DP * REAL(npwx,DP) * nk * ( 2.0_DP*nvecx + 3.0_DP*nvec + nkb ) + &
+           16.0_DP * REAL(npwx,DP) * nk * 2.0_DP
+    IF ( lus ) need = need + 16.0_DP * REAL(npwx,DP) * nk * nvecx
+    istat = cudaMemGetInfo( mfree, mtot )
+    nserve = 1
+    IF ( nks < 4 .OR. need > 0.6_DP * REAL(mfree,DP) ) nserve = 0
+    ! reduced matrices of all k-points on the host
+    IF ( 80.0_DP * REAL(nvecx,DP)**2 * nk > 8.0E9_DP ) nserve = 0
+    CALL mp_sum( nserve, intra_image_comm )
+    IF ( nserve /= nproc_image ) RETURN
+    !
+    CALL start_clock( 'c_bands' )
+    CALL start_clock( 'nscfd_init' )
+    WRITE( stdout, '(5X,"Davidson diagonalization with overlap")' )
+    WRITE( stdout, '(5X,"(all k-points together on the device)")' )
+    !
+    ALLOCATE( psi_d(npwx,nvecx,nk), hpsi_d(npwx,nvecx,nk) )
+    IF ( lus ) ALLOCATE( spsi_d(npwx,nvecx,nk), swrk_d(npwx,nvec,nk) )
+    ALLOCATE( wrk_d(npwx,nvec,nk), hwrk_d(npwx,nvec,nk) )
+    ALLOCATE( vkb_d(npwx,MAX(nkb,1),nk), bw_d(MAX(nkb,1),nvec,nk), bw2_d(MAX(nkb,1),nvec,nk), &
+              bw3_d(MAX(nkb,1),nvec,nk) )
+    ALLOCATE( vc_d(nvecx,nvec,nk), hcn_d(nvec,nvecx,nk), scn_d(nvec,nvecx,nk) )
+    ALLOCATE( g2_d(npwx,nk), hd_d(npwx,nk), sd_d(npwx,nk), ew_d(nvec,nk), nrm_d(nvec,nk) )
+    ALLOCATE( v_d(nnr,nspin), deeq_d(nhm,nhm,nat,nspin), qq_d(nhm,nhm,nat) )
+    ALLOCATE( nl_d(npwx,nk), npw_d(nk), spin_d(nk), nbase_d(nk), flag_d(nk) )
+    ALLOCATE( kbna_d(MAX(nkb,1)), kbof_d(MAX(nkb,1)), kbnh_d(MAX(nkb,1)) )
+    ALLOCATE( pk_d(nvec*nk), pn_d(nvec*nk) )
+    !
+    IF ( .NOT. blas_ready ) THEN
+       istat = cublasCreate( hblas )
+       blas_ready = .TRUE.
+    ENDIF
+    !
+    !$acc parallel loop collapse(4) present(deeq)
+    DO is = 1, nspl
+       DO na = 1, natl
+          DO jh = 1, nhml
+             DO ih = 1, nhml
+                deeq_d(ih,jh,na,is) = deeq(ih,jh,na,is)
+             ENDDO
+          ENDDO
+       ENDDO
+    ENDDO
+    !$acc parallel loop collapse(3) present(qq_at)
+    DO na = 1, natl
+       DO jh = 1, nhml
+          DO ih = 1, nhml
+             qq_d(ih,jh,na) = qq_at(ih,jh,na)
+          ENDDO
+       ENDDO
+    ENDDO
+    !$acc parallel loop collapse(2) present(vrs)
+    DO is = 1, nspl
+       DO ir = 1, nnr
+          v_d(ir,is) = vrs(ir,is)
+       ENDDO
+    ENDDO
+    IF ( nkb > 0 ) THEN
+       ALLOCATE( ivec(nkb) )
+       DO na = 1, nat
+          DO ih = 1, nh(ityp(na))
+             ivec(ofsbeta(na)+ih) = na
+          ENDDO
+       ENDDO
+       kbna_d = ivec
+       DO na = 1, nat
+          DO ih = 1, nh(ityp(na))
+             ivec(ofsbeta(na)+ih) = ofsbeta(na)
+          ENDDO
+       ENDDO
+       kbof_d = ivec
+       DO na = 1, nat
+          DO ih = 1, nh(ityp(na))
+             ivec(ofsbeta(na)+ih) = nh(ityp(na))
+          ENDDO
+       ENDDO
+       kbnh_d = ivec
+       DEALLOCATE( ivec )
+    ENDIF
+    !
+    nfb = MAX( 1, MIN( nvec*nk, 33554432 / nnr, 8192 ) )
+    ALLOCATE( psig_d(nnr*nfb), psic_d(nnr*nfb) )
+    psig_d = c_zero
+    CALL make_plans( )
+    !
+    ! ... starting wavefunctions, beta functions and preconditioner: for all
+    ! ... k-points together, or (fallback) k-point by k-point with the stock
+    ! ... routines, exactly as c_bands_nscf_ph / diag_bands prepare them
+    !
+    psi_d = c_zero ; hpsi_d = c_zero
+    IF ( lus ) spsi_d = c_zero
+    vkb_d = c_zero
+    batched = .FALSE.
+    CALL get_environment_variable( 'QE_PH_NSCF_INIT', val, ln, ierr )
+    IF ( .NOT. ( ierr == 0 .AND. ln > 0 .AND. val(1:1) == '0' ) ) CALL init_batched( batched )
+    IF ( .NOT. batched ) THEN
+       ALLOCATE( h_diag(npwx,npol), s_diag(npwx,npol) )
+       !$acc enter data create(h_diag, s_diag)
+       ALLOCATE( nl_h(npwx), ivec(nk) )
+       DO ik = 1, nk
+          current_k = ik
+          IF ( lsda ) current_spin = isk(ik)
+          npw = ngk(ik)
+          CALL g2_kin( ik )
+          IF ( nkb > 0 ) CALL init_us_2( npw, igk_k(1,ik), xk(1,ik), vkb, .TRUE. )
+          !$acc update host(vkb)
+          CALL init_wfc( ik )
+          CALL usnldiag( npw, npol, h_diag, s_diag )
+          !
+          nl_h(:) = 1
+          DO ig = 1, npw
+             nl_h(ig) = dffts%nl(igk_k(ig,ik))
+          ENDDO
+          nl_d(:,ik) = nl_h(:)
+          ivec(ik) = 1
+          IF ( lsda ) ivec(ik) = isk(ik)
+          !$acc parallel loop collapse(2) present(evc)
+          DO ibnd = 1, nvec
+             DO ig = 1, npwxl
+                IF ( ig <= npw ) psi_d(ig,ibnd,ik) = evc(ig,ibnd)
+             ENDDO
+          ENDDO
+          IF ( nkb > 0 ) THEN
+             !$acc parallel loop collapse(2) present(vkb)
+             DO ikb = 1, nkbl
+                DO ig = 1, npwxl
+                   IF ( ig <= npw ) vkb_d(ig,ikb,ik) = vkb(ig,ikb)
+                ENDDO
+             ENDDO
+          ENDIF
+          !$acc parallel loop present(g2kin, h_diag, s_diag)
+          DO ig = 1, npwxl
+             IF ( ig <= npw ) THEN
+                g2_d(ig,ik) = g2kin(ig)
+                hd_d(ig,ik) = h_diag(ig,1)
+                sd_d(ig,ik) = s_diag(ig,1)
+             ELSE
+                g2_d(ig,ik) = 0.0_DP
+                hd_d(ig,ik) = 1.0_DP
+                sd_d(ig,ik) = 1.0_DP
+             ENDIF
+          ENDDO
+       ENDDO
+       spin_d = ivec
+       ivec(:) = ngk(1:nk)
+       npw_d = ivec
+       DEALLOCATE( nl_h, ivec )
+       !$acc exit data delete(h_diag, s_diag)
+       DEALLOCATE( h_diag, s_diag )
+    ENDIF
+    CALL stop_clock( 'nscfd_init' )
+    !
+    ! ... Davidson, all k-points in lockstep
+    !
+    CALL start_clock( 'nscfd_dav' )
+    empty_ethr = MAX( ethr*5.0_DP, 1.0E-5_DP )
+    ALLOCATE( nbase(nk), notcnv(nk), kter(nk), ntry(nk), state(nk), inotcnv(nvec,nk), flag_h(nk), &
+              pk_h(nvec*nk), pn_h(nvec*nk), run1(nk), run2(nk), nbold(nk), conv(nvec,nk), vzero(nk) )
+    ALLOCATE( e(nvec,nk), ew_h(nvec,nk), hc(nvecx,nvecx,nk), sc(nvecx,nvecx,nk), vc(nvecx,nvec,nk), &
+              hcn_h(nvec,nvecx,nk), scn_h(nvec,nvecx,nk), vcr(nvecx,nvec,nk) )
+    state = 0 ; kter = 0 ; ntry = 0 ; tot_iter = 0
+    nbase = nvec ; notcnv = nvec ; conv = .FALSE.
+    hc = c_zero ; sc = c_zero ; vc = c_zero ; vcr = c_zero ; vzero = .TRUE.
+    !
+    ! ... H and S on the starting vectors; reduced matrices; e = diag (lrot)
+    !
+    npair = 0
+    DO ik = 1, nk
+       DO np = 1, nvec
+          npair = npair + 1
+          pk_h(npair) = ik ; pn_h(npair) = np
+       ENDDO
+       run1(1) = 1 ; run2(1) = nk
+    ENDDO
+    nrun = 1
+    pk_d = pk_h ; pn_d = pn_h
+    CALL copy_block( psi_d, wrk_d, 0, nvec )
+    CALL hs_apply( npair, nrun, run1, run2 )
+    CALL put_block( hwrk_d, hpsi_d, 0, nvec )
+    IF ( lus ) CALL put_block( swrk_d, spsi_d, 0, nvec )
+    DO irun = 1, nrun
+       k1 = run1(irun) ; k2 = run2(irun)
+       CALL gemm_b( CUBLAS_OP_C, nvec, nvec, npwxl, hwrk_d(1,1,k1), npwxl, INT(npwxl,8)*nvec, &
+                    wrk_d(1,1,k1), npwxl, INT(npwxl,8)*nvec, c_zero, hcn_d(1,1,k1), nvec, &
+                    INT(nvec,8)*nvecx, k2-k1+1 )
+       IF ( lus ) THEN
+          CALL gemm_b( CUBLAS_OP_C, nvec, nvec, npwxl, swrk_d(1,1,k1), npwxl, INT(npwxl,8)*nvec, &
+                       wrk_d(1,1,k1), npwxl, INT(npwxl,8)*nvec, c_zero, scn_d(1,1,k1), nvec, &
+                       INT(nvec,8)*nvecx, k2-k1+1 )
+       ELSE
+          CALL gemm_b( CUBLAS_OP_C, nvec, nvec, npwxl, wrk_d(1,1,k1), npwxl, INT(npwxl,8)*nvec, &
+                       wrk_d(1,1,k1), npwxl, INT(npwxl,8)*nvec, c_zero, scn_d(1,1,k1), nvec, &
+                       INT(nvec,8)*nvecx, k2-k1+1 )
+       ENDIF
+    ENDDO
+    hcn_h = hcn_d ; scn_h = scn_d
+    DO ik = 1, nk
+       ! hcn(n,m) = <H psi_n|psi_m> = conj(hc(m,n)): rows n of the lower triangle of hc
+       DO n = 1, nvec
+          DO m = 1, n
+             hc(n,m,ik) = hcn_h(n,m,ik)
+             sc(n,m,ik) = scn_h(n,m,ik)
+          ENDDO
+       ENDDO
+       DO n = 1, nvec
+          hc(n,n,ik) = CMPLX( DBLE(hc(n,n,ik)), 0.0_DP, KIND=DP )
+          sc(n,n,ik) = CMPLX( DBLE(sc(n,n,ik)), 0.0_DP, KIND=DP )
+          DO m = n+1, nvec
+             hc(n,m,ik) = CONJG( hc(m,n,ik) )
+             sc(n,m,ik) = CONJG( sc(m,n,ik) )
+          ENDDO
+          e(n,ik) = DBLE( hc(n,n,ik) )
+          vc(n,n,ik) = c_one
+       ENDDO
+    ENDDO
+    !
+    DO iter = 1, 6*maxter + 6
+       !
+       nactk = COUNT( state == 0 )
+       IF ( nactk == 0 ) EXIT
+       !
+       ! ... lists of the active k-points (runs) and of their unconverged roots
+       !
+       ! ... (a run may include up to maxgap finished k-points between two
+       ! ... active ones: their columns of vcr are zero and what is computed
+       ! ... for them is not used; this bounds the number of device calls)
+       !
+       nrun = 0 ; npair = 0
+       ew_h = 0.0_DP
+       DO ik = 1, nk
+          IF ( state(ik) /= 0 ) THEN
+             IF ( .NOT. vzero(ik) ) THEN
+                vcr(:,:,ik) = c_zero
+                vzero(ik) = .TRUE.
+             ENDIF
+             CYCLE
+          ENDIF
+          vcr(:,:,ik) = c_zero
+          vzero(ik) = .FALSE.
+          IF ( nrun > 0 ) THEN
+             IF ( ik - run2(nrun) <= maxgap + 1 ) THEN
+                run2(nrun) = ik
+             ELSE
+                nrun = nrun + 1 ; run1(nrun) = ik ; run2(nrun) = ik
+             ENDIF
+          ELSE
+             nrun = 1 ; run1(1) = ik ; run2(1) = ik
+          ENDIF
+          kter(ik) = kter(ik) + 1
+          np = 0
+          DO n = 1, nvec
+             IF ( .NOT. conv(n,ik) ) THEN
+                np = np + 1
+                inotcnv(np,ik) = n
+                npair = npair + 1
+                pk_h(npair) = ik ; pn_h(npair) = np
+                vcr(1:nbase(ik),np,ik) = vc(1:nbase(ik),n,ik)
+                ew_h(np,ik) = e(n,ik)
+             ENDIF
+          ENDDO
+          notcnv(ik) = np
+       ENDDO
+       pk_d(1:npair) = pk_h(1:npair) ; pn_d(1:npair) = pn_h(1:npair)
+       DO irun = 1, nrun
+          k1 = run1(irun) ; k2 = run2(irun)
+          vc_d(:,:,k1:k2) = vcr(:,:,k1:k2)
+       ENDDO
+       ew_d = ew_h
+       nbase_d = nbase
+       !
+       ! ... correction vectors ( H - e S ) psi vc, preconditioned and normalized
+       !
+       DO irun = 1, nrun
+          k1 = run1(irun) ; k2 = run2(irun)
+          IF ( lus ) THEN
+             CALL gemm_b( CUBLAS_OP_N, npwxl, nvec, nvecx, spsi_d(1,1,k1), npwxl, INT(npwxl,8)*nvecx, &
+                          vc_d(1,1,k1), nvecx, INT(nvecx,8)*nvec, c_zero, wrk_d(1,1,k1), npwxl, &
+                          INT(npwxl,8)*nvec, k2-k1+1 )
+          ELSE
+             CALL gemm_b( CUBLAS_OP_N, npwxl, nvec, nvecx, psi_d(1,1,k1), npwxl, INT(npwxl,8)*nvecx, &
+                          vc_d(1,1,k1), nvecx, INT(nvecx,8)*nvec, c_zero, wrk_d(1,1,k1), npwxl, &
+                          INT(npwxl,8)*nvec, k2-k1+1 )
+          ENDIF
+       ENDDO
+       CALL scale_minus_e( npair )
+       DO irun = 1, nrun
+          k1 = run1(irun) ; k2 = run2(irun)
+          CALL gemm_b( CUBLAS_OP_N, npwxl, nvec, nvecx, hpsi_d(1,1,k1), npwxl, INT(npwxl,8)*nvecx, &
+                       vc_d(1,1,k1), nvecx, INT(nvecx,8)*nvec, c_one, wrk_d(1,1,k1), npwxl, &
+                       INT(npwxl,8)*nvec, k2-k1+1 )
+       ENDDO
+       CALL precond_normalize( npair )
+       !
+       ! ... H and S on the new vectors; append them to the basis
+       !
+       CALL hs_apply( npair, nrun, run1, run2 )
+       CALL append_block( npair )
+       !
+       ! ... new rows of the reduced matrices
+       !
+       DO irun = 1, nrun
+          k1 = run1(irun) ; k2 = run2(irun)
+          CALL gemm_b( CUBLAS_OP_C, nvec, nvecx, npwxl, hwrk_d(1,1,k1), npwxl, INT(npwxl,8)*nvec, &
+                       psi_d(1,1,k1), npwxl, INT(npwxl,8)*nvecx, c_zero, hcn_d(1,1,k1), nvec, &
+                       INT(nvec,8)*nvecx, k2-k1+1 )
+          IF ( lus ) THEN
+             CALL gemm_b( CUBLAS_OP_C, nvec, nvecx, npwxl, swrk_d(1,1,k1), npwxl, INT(npwxl,8)*nvec, &
+                          psi_d(1,1,k1), npwxl, INT(npwxl,8)*nvecx, c_zero, scn_d(1,1,k1), nvec, &
+                          INT(nvec,8)*nvecx, k2-k1+1 )
+          ELSE
+             CALL gemm_b( CUBLAS_OP_C, nvec, nvecx, npwxl, wrk_d(1,1,k1), npwxl, INT(npwxl,8)*nvec, &
+                          psi_d(1,1,k1), npwxl, INT(npwxl,8)*nvecx, c_zero, scn_d(1,1,k1), nvec, &
+                          INT(nvec,8)*nvecx, k2-k1+1 )
+          ENDIF
+       ENDDO
+       DO irun = 1, nrun
+          k1 = run1(irun) ; k2 = run2(irun)
+          hcn_h(:,:,k1:k2) = hcn_d(:,:,k1:k2)
+          scn_h(:,:,k1:k2) = scn_d(:,:,k1:k2)
+       ENDDO
+       !
+       ! ... reduced eigenproblems, convergence, restart decisions (host)
+       !
+       flag_h = 0
+       !$omp parallel do schedule(dynamic,8) private(ik, nb1, nbn, n, m, np, hk, sk, vk, ewk, info)
+       DO ik = 1, nk
+          IF ( state(ik) /= 0 ) CYCLE
+          nb1 = nbase(ik) + 1
+          nbn = nbase(ik) + notcnv(ik)
+          DO np = 1, notcnv(ik)
+             ! row nb1+np-1 of hc: <H psi_new|psi_m>, m = 1 ... nbn
+             DO m = 1, nbn
+                hc(nb1+np-1,m,ik) = hcn_h(np,m,ik)
+                sc(nb1+np-1,m,ik) = scn_h(np,m,ik)
+             ENDDO
+          ENDDO
+          nbase(ik) = nbn
+          DO n = 1, nbn
+             IF ( n >= nb1 ) THEN
+                hc(n,n,ik) = CMPLX( DBLE(hc(n,n,ik)), 0.0_DP, KIND=DP )
+                sc(n,n,ik) = CMPLX( DBLE(sc(n,n,ik)), 0.0_DP, KIND=DP )
+             ENDIF
+             DO m = MAX(n+1,nb1), nbn
+                hc(n,m,ik) = CONJG( hc(m,n,ik) )
+                sc(n,m,ik) = CONJG( sc(m,n,ik) )
+             ENDDO
+          ENDDO
+          ALLOCATE( hk(nbn,nbn), sk(nbn,nbn), vk(nbn,nvec), ewk(nbn) )
+          hk(:,:) = hc(1:nbn,1:nbn,ik)
+          sk(:,:) = sc(1:nbn,1:nbn,ik)
+          CALL diag_small( nbn, nvec, hk, sk, ewk, vk, info )
+          IF ( info /= 0 ) THEN
+             state(ik) = -info
+          ELSE
+             vc(:,:,ik) = c_zero
+             vc(1:nbn,1:nvec,ik) = vk(:,:)
+             DO n = 1, nvec
+                IF ( btype(n,ik) == 1 ) THEN
+                   conv(n,ik) = ABS( ewk(n) - e(n,ik) ) < ethr
+                ELSE
+                   conv(n,ik) = ABS( ewk(n) - e(n,ik) ) < empty_ethr
+                ENDIF
+                e(n,ik) = ewk(n)
+             ENDDO
+             notcnv(ik) = COUNT( .NOT. conv(:,ik) )
+             IF ( notcnv(ik) == 0 .OR. nbn + notcnv(ik) > nvecx .OR. kter(ik) == maxter ) flag_h(ik) = 1
+          ENDIF
+          DEALLOCATE( hk, sk, vk, ewk )
+       ENDDO
+       !$omp end parallel do
+       IF ( ANY( state < 0 ) ) CALL errore( 'c_bands_nscf_dev', &
+            'reduced eigenproblem failed (S matrix not positive definite?)', 1 )
+       !
+       ! ... refresh of the basis where needed: psi <- psi vc (and H psi, S psi)
+       !
+       IF ( ANY( flag_h == 1 ) ) THEN
+          flag_d = flag_h
+          DO irun = 1, nrun
+             k1 = run1(irun) ; k2 = run2(irun)
+             vc_d(:,:,k1:k2) = vc(:,:,k1:k2)
+             CALL gemm_b( CUBLAS_OP_N, npwxl, nvec, nvecx, psi_d(1,1,k1), npwxl, INT(npwxl,8)*nvecx, &
+                          vc_d(1,1,k1), nvecx, INT(nvecx,8)*nvec, c_zero, wrk_d(1,1,k1), npwxl, &
+                          INT(npwxl,8)*nvec, k2-k1+1 )
+             CALL gemm_b( CUBLAS_OP_N, npwxl, nvec, nvecx, hpsi_d(1,1,k1), npwxl, INT(npwxl,8)*nvecx, &
+                          vc_d(1,1,k1), nvecx, INT(nvecx,8)*nvec, c_zero, hwrk_d(1,1,k1), npwxl, &
+                          INT(npwxl,8)*nvec, k2-k1+1 )
+             IF ( lus ) CALL gemm_b( CUBLAS_OP_N, npwxl, nvec, nvecx, spsi_d(1,1,k1), npwxl, &
+                          INT(npwxl,8)*nvecx, vc_d(1,1,k1), nvecx, INT(nvecx,8)*nvec, c_zero, &
+                          swrk_d(1,1,k1), npwxl, INT(npwxl,8)*nvec, k2-k1+1 )
+          ENDDO
+          CALL refresh_block( )
+          DO ik = 1, nk
+             IF ( flag_h(ik) /= 1 ) CYCLE
+             IF ( notcnv(ik) == 0 ) THEN
+                state(ik) = 1
+                tot_iter = tot_iter + kter(ik)
+             ELSE
+                IF ( kter(ik) == maxter ) THEN
+                   ! end of a cegterg call with unconverged roots: next call or give up
+                   tot_iter = tot_iter + kter(ik)
+                   ntry(ik) = ntry(ik) + 1
+                   kter(ik) = 0
+                   IF ( ntry(ik) > 5 ) state(ik) = 2
+                ENDIF
+                nbase(ik) = nvec
+                hc(:,:,ik) = c_zero ; sc(:,:,ik) = c_zero ; vc(:,:,ik) = c_zero
+                DO n = 1, nvec
+                   hc(n,n,ik) = CMPLX( e(n,ik), 0.0_DP, KIND=DP )
+                   sc(n,n,ik) = c_one
+                   vc(n,n,ik) = c_one
+                ENDDO
+                IF ( state(ik) == 0 .AND. kter(ik) == 0 ) conv(:,ik) = .FALSE.
+             ENDIF
+          ENDDO
+       ENDIF
+       !
+    ENDDO
+    CALL stop_clock( 'nscfd_dav' )
+    !
+    nnotconv_tot = 0
+    DO ik = 1, nk
+       IF ( state(ik) /= 1 ) THEN
+          nnotconv_tot = nnotconv_tot + notcnv(ik)
+          IF ( notcnv(ik) > MAX( 5, nbnd/4 ) ) CALL errore( 'c_bands', &
+               'too many bands are not converged', 1 )
+          WRITE( stdout, '(5x,"c_bands: ",i2," eigenvalues not converged at k-point ",i6)' ) notcnv(ik), ik
+       ENDIF
+    ENDDO
+    !
+    ! ... eigenvalues and wavefunctions where the rest of the code expects them
+    !
+    CALL start_clock( 'nscfd_out' )
+    ALLOCATE( stage(npwx,nvec) )
+    DO ik = 1, nk
+       et(1:nvec,ik) = e(1:nvec,ik)
+       !$acc update device(et(1:nvec,ik))
+       stage(:,:) = psi_d(:,1:nvec,ik)
+       evc(:,:) = c_zero
+       evc(1:npwx,1:nvec) = stage(:,:)
+       IF ( io_level > -1 ) CALL save_buffer( evc, nwordwfc, iunwfc, ik )
+    ENDDO
+    !$acc update device(evc)
+    DEALLOCATE( stage )
+    CALL stop_clock( 'nscfd_out' )
+    !
+    avg_iter = DBLE(tot_iter)
+    CALL mp_sum( avg_iter, inter_pool_comm )
+    avg_iter = avg_iter / nkstot
+    WRITE( stdout, '(/,5X,"ethr = ",1PE9.2,",  avg # of iterations =",0PF5.1)' ) ethr, avg_iter
+    !
+    DEALLOCATE( nbase, notcnv, kter, ntry, state, inotcnv, flag_h, pk_h, pn_h, run1, run2, nbold, conv, vzero )
+    DEALLOCATE( e, ew_h, hc, sc, vc, hcn_h, scn_h, vcr )
+    DEALLOCATE( psi_d, hpsi_d, wrk_d, hwrk_d, vkb_d, bw_d, bw2_d, bw3_d, vc_d, hcn_d, scn_d )
+    IF ( lus ) DEALLOCATE( spsi_d, swrk_d )
+    DEALLOCATE( g2_d, hd_d, sd_d, ew_d, nrm_d, v_d, deeq_d, qq_d, nl_d, npw_d, spin_d, nbase_d, flag_d )
+    DEALLOCATE( kbna_d, kbof_d, kbnh_d, pk_d, pn_d, psig_d, psic_d )
+    DO i = 1, nplan
+       IF ( plan(i) /= 0 ) istat = cufftDestroy( plan(i) )
+    ENDDO
+    plan = 0 ; plan_nb = 0 ; nplan = 0
+    !
+    done = .TRUE.
+    CALL stop_clock( 'c_bands' )
+#else
+    done = .FALSE.
+#endif
+    !
+  END SUBROUTINE c_bands_nscf_dev
   !
 #if defined(__CUDA)
   !-----------------------------------------------------------------------
