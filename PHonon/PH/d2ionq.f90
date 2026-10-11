@@ -30,6 +30,10 @@ subroutine d2ionq( nat, ntyp, ityp, zv, tau, alat, omega, q, at, &
   USE partial,        ONLY : atomo, nat_todo, nat_todo_input, set_local_atomo
   USE symm_base,      ONLY : irt 
   USE lr_symm_base,   ONLY : nsymq
+  USE dyn_dev,        ONLY : dyn_check
+#if defined(__CUDA)
+  USE dyn_dev,        ONLY : dyn_dev_ok, d2ionq_g_dev
+#endif
   !
   implicit none
   !
@@ -92,8 +96,14 @@ subroutine d2ionq( nat, ntyp, ityp, zv, tau, alat, omega, q, at, &
   integer            :: na_s, na_e, mykey
   integer            :: na_i, nb_i
   integer            :: allocstat
+  integer            :: idum(1)
+  logical            :: on_device
 
   call start_clock ('d2ionq')
+  on_device = .false.
+#if defined(__CUDA)
+  on_device = dyn_dev_ok( )
+#endif
   !
   if (nat_todo_input > 0 ) then 
     call set_local_atomo(nat, nat_todo, atomo, nsymq, irt, nat_l, atomo_l) 
@@ -157,6 +167,20 @@ subroutine d2ionq( nat, ntyp, ityp, zv, tau, alat, omega, q, at, &
   !
   ! G-space sums here
   !
+  call start_clock ('d2ionq_g')
+#if defined(__CUDA)
+  IF ( on_device ) THEN
+     !
+     ! Device path: the same sums over G for all pairs of atoms in one kernel
+     !
+     IF ( allocated(atomo_l) ) THEN
+        CALL d2ionq_g_dev (nat, ntyp, ityp, zv, tau, q, ngm, g, fac, facq, nat_l, atomo_l, dy3)
+     ELSE
+        idum(1) = 0
+        CALL d2ionq_g_dev (nat, ntyp, ityp, zv, tau, q, ngm, g, fac, facq, nat_l, idum, dy3)
+     ENDIF
+  ELSE
+#endif
 !$omp parallel do &
 !$omp private(na, na_l, na_i, nta, dy2, nb, nb_i, ntb, zvab, dtau, argq, dy1) &
 !$omp private(ng, arg, fnat, facg, icart, jcart) shared(dy3,atomo_l) &
@@ -202,6 +226,11 @@ subroutine d2ionq( nat, ntyp, ityp, zv, tau, alat, omega, q, at, &
      dy3( na_i + 1: na_i+3,  na_i + 1:na_i+3) = dy3( na_i+1: na_i+3,  na_i+1:na_i+3) - dy2(1:3,1:3)
   enddo
 !$omp end parallel do
+#if defined(__CUDA)
+  ENDIF
+#endif
+  call stop_clock ('d2ionq_g')
+  call dyn_check ('d2ionq_g', 3*nat, dy3)
   deallocate(facq, fac)
   !
   CALL block_distribute(nat_l, me_bgrp, nproc_bgrp, na_s, na_e, mykey ) 
@@ -210,6 +239,7 @@ subroutine d2ionq( nat, ntyp, ityp, zv, tau, alat, omega, q, at, &
   !
   if ( mykey>0 ) goto 100
   !
+  call start_clock ('d2ionq_r')
   rmax = 5.d0 / sqrt (alpha) / alat
   !
   ! with this choice terms up to ZiZj*erfc(5) are counted (erfc(5)=2x10^-1
@@ -262,6 +292,7 @@ subroutine d2ionq( nat, ntyp, ityp, zv, tau, alat, omega, q, at, &
         enddo 
      enddo
   enddo
+  call stop_clock ('d2ionq_r')
 100 continue
   call mp_sum ( dy3, intra_bgrp_comm )
   !
@@ -269,6 +300,7 @@ subroutine d2ionq( nat, ntyp, ityp, zv, tau, alat, omega, q, at, &
   !   it on the basis of the modes
   !
   dy3 = -dy3
+  call dyn_check ('d2ionq', 3*nat, dy3)
   !
   CALL rotate_pattern_add(nat, u, dyn, dy3)
   !

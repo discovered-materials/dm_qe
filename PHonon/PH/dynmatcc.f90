@@ -27,6 +27,10 @@ subroutine dynmatcc
   USE dynmat,    ONLY : dyn
   USE mp_bands,  ONLY: intra_bgrp_comm
   USE mp,        ONLY: mp_sum
+  USE dyn_dev,   ONLY : dyn_check
+#if defined(__CUDA)
+  USE dyn_dev,   ONLY : dyn_dev_ok, dyn_d2form, dyn_fwfft
+#endif
 
   implicit none
 
@@ -38,6 +42,9 @@ subroutine dynmatcc
   !
   integer :: i, j, ir, is, isup, isdw, ig, na, nta, na_i, na_j, &
        na_icart, nb_jcart, nu_i, nu_j
+  complex(DP), allocatable :: s6(:,:)
+  integer, parameter :: pidx(3,3) = RESHAPE( (/ 1, 2, 4, 2, 3, 5, 4, 5, 6 /), (/ 3, 3 /) )
+  logical :: on_device
   !
   ! return immediately if nlcc is not present
   !
@@ -65,7 +72,17 @@ subroutine dynmatcc
   end if
   deallocate (v)
   !
+  on_device = .false.
+#if defined(__CUDA)
+  on_device = dyn_dev_ok( )
+  IF ( on_device ) THEN
+     CALL dyn_fwfft (dfftp%nr1, dfftp%nr2, dfftp%nr3, dfftp%nnr, vxc)
+  ELSE
+     CALL fwfft ('Rho', vxc, dfftp)
+  ENDIF
+#else
   CALL fwfft ('Rho', vxc, dfftp)
+#endif
   !
   ! vxc is the spin-averaged XC potential (in G-space)
   !
@@ -76,6 +93,30 @@ subroutine dynmatcc
   !
   dynwrk (:,:) = (0.d0, 0.d0)
   allocate (work (dfftp%nnr))
+#if defined(__CUDA)
+  IF ( on_device ) THEN
+     !
+     ! Device path: sum_G g_i g_j drc(G) conj(vxc(G)) e^{-i G tau} for all
+     ! the atoms in one kernel (dyn_d2form)
+     !
+     allocate (s6 (6, nat))
+     do ig = 1, ngm
+        work (ig) = CONJG(vxc (dfftp%nl (ig) ) )
+     enddo
+     CALL dyn_d2form (ngm, ngm, drc, work, s6)
+     do na = 1, nat
+        do i = 1, 3
+           na_i = 3 * (na - 1) + i
+           do j = 1, 3
+              na_j = 3 * (na - 1) + j
+              dynwrk (na_i, na_j) = - tpiba2 * s6 (pidx (i, j), na)
+           enddo
+        enddo
+     enddo
+     deallocate (s6)
+  ENDIF
+#endif
+  IF ( .NOT. on_device ) THEN
   do na = 1, nat
      nta = ityp (na)
      work (:) = (0.d0, 0.d0)
@@ -96,9 +137,11 @@ subroutine dynmatcc
         enddo
      enddo
   enddo
+  ENDIF
   call mp_sum (dynwrk,intra_bgrp_comm)
   !
   dynwrk = dynwrk * omega
+  call dyn_check ('dynmatcc', 3*nat, dynwrk)
   !
   ! calculate drc for later use in calculation of non diagonal term
   !

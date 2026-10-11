@@ -44,8 +44,8 @@ MODULE dyn_dev
   LOGICAL :: check_read = .FALSE., check_on = .FALSE.
   !
 #if defined(__CUDA)
-  PUBLIC :: dyn_dform, &
-            dyn_fwfft
+  PUBLIC :: dyn_dform, dyn_d2form, &
+            d2ionq_g_dev, dyn_fwfft
   !
   COMPLEX(DP), PARAMETER :: c_one = (1.0_DP, 0.0_DP), c_zero = (0.0_DP, 0.0_DP)
   INTEGER, PARAMETER :: max_tmp_elems = 8388608
@@ -246,6 +246,200 @@ CONTAINS
     CALL stop_clock( 'dyn_dform' )
     !
   END SUBROUTINE dyn_dform
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE dyn_d2form( ngl, ldc, c, z, s )
+    !-----------------------------------------------------------------------
+    !! s(p,na) = sum_G g_i g_j c(G,type(na)) z(G) e^{-i G tau_na} for the
+    !! pairs p = (i,j) = 11, 21, 22, 31, 32, 33 (g in units of 2pi/a):
+    !! second derivatives with respect to the position of atom na of the
+    !! integral of an atom-centred function with a field (local part of
+    !! dynmat_us, dynmatcc).
+    !
+    USE constants, ONLY : tpi
+    USE ions_base, ONLY : nat, ityp, ntyp => nsp, tau
+    USE gvect,     ONLY : g
+    !
+    INTEGER, INTENT(IN) :: ngl, ldc
+    REAL(DP), INTENT(IN) :: c(ldc,ntyp)
+    COMPLEX(DP), INTENT(IN) :: z(ngl)
+    COMPLEX(DP), INTENT(OUT) :: s(6,nat)
+    !
+    REAL(DP), ALLOCATABLE, DEVICE :: c_d(:,:), s_d(:,:), tau_d(:,:)
+    COMPLEX(DP), ALLOCATABLE, DEVICE :: z_d(:)
+    INTEGER, ALLOCATABLE, DEVICE :: ityp_d(:)
+    REAL(DP), ALLOCATABLE :: s_h(:,:)
+    INTEGER :: na, nt, ig, natl, p, istat
+    REAL(DP) :: arg, tr, ti, g1, g2, g3, t1, t2, t3, &
+                a1r, a1i, a2r, a2i, a3r, a3i, a4r, a4i, a5r, a5i, a6r, a6i
+    COMPLEX(DP) :: t
+    !
+    ALLOCATE( c_d(ldc,ntyp), z_d(ngl), s_d(12,nat), tau_d(3,nat), ityp_d(nat), STAT=istat )
+    IF ( istat /= 0 ) CALL errore( 'dyn_d2form', 'device allocation failed', 1 )
+    ALLOCATE( s_h(12,nat) )
+    c_d = c
+    z_d = z
+    tau_d = tau
+    ityp_d = ityp
+    natl = nat
+    !
+    !$acc parallel loop gang present(g) private(nt, t1, t2, t3, a1r, a1i, a2r, a2i, a3r, a3i, &
+    !$acc                                       a4r, a4i, a5r, a5i, a6r, a6i)
+    DO na = 1, natl
+       nt = ityp_d(na)
+       t1 = tau_d(1,na) ; t2 = tau_d(2,na) ; t3 = tau_d(3,na)
+       a1r = 0.0_DP ; a1i = 0.0_DP ; a2r = 0.0_DP ; a2i = 0.0_DP ; a3r = 0.0_DP ; a3i = 0.0_DP
+       a4r = 0.0_DP ; a4i = 0.0_DP ; a5r = 0.0_DP ; a5i = 0.0_DP ; a6r = 0.0_DP ; a6i = 0.0_DP
+       !$acc loop vector private(arg, t, tr, ti, g1, g2, g3) &
+       !$acc      reduction(+:a1r,a1i,a2r,a2i,a3r,a3i,a4r,a4i,a5r,a5i,a6r,a6i)
+       DO ig = 1, ngl
+          g1 = g(1,ig) ; g2 = g(2,ig) ; g3 = g(3,ig)
+          arg = tpi * ( g1 * t1 + g2 * t2 + g3 * t3 )
+          t = c_d(ig,nt) * z_d(ig) * CMPLX( COS(arg), -SIN(arg), KIND=DP )
+          tr = DBLE(t) ; ti = AIMAG(t)
+          a1r = a1r + tr * g1 * g1 ; a1i = a1i + ti * g1 * g1
+          a2r = a2r + tr * g2 * g1 ; a2i = a2i + ti * g2 * g1
+          a3r = a3r + tr * g2 * g2 ; a3i = a3i + ti * g2 * g2
+          a4r = a4r + tr * g3 * g1 ; a4i = a4i + ti * g3 * g1
+          a5r = a5r + tr * g3 * g2 ; a5i = a5i + ti * g3 * g2
+          a6r = a6r + tr * g3 * g3 ; a6i = a6i + ti * g3 * g3
+       ENDDO
+       s_d(1,na) = a1r ; s_d(2,na) = a1i ; s_d(3,na) = a2r ; s_d(4,na) = a2i
+       s_d(5,na) = a3r ; s_d(6,na) = a3i ; s_d(7,na) = a4r ; s_d(8,na) = a4i
+       s_d(9,na) = a5r ; s_d(10,na) = a5i ; s_d(11,na) = a6r ; s_d(12,na) = a6i
+    ENDDO
+    s_h = s_d
+    DO na = 1, nat
+       DO p = 1, 6
+          s(p,na) = CMPLX( s_h(2*p-1,na), s_h(2*p,na), KIND=DP )
+       ENDDO
+    ENDDO
+    DEALLOCATE( c_d, z_d, s_d, tau_d, ityp_d, s_h )
+    !
+  END SUBROUTINE dyn_d2form
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE d2ionq_g_dev( nat, ntyp, ityp, zv, tau, q, ngm, g, fac, facq, nat_l, atomo_l, dy3 )
+    !-----------------------------------------------------------------------
+    !! Reciprocal-space sums of d2ionq (same formulas), added to dy3.
+    !! With all atoms displaced the pairs (nb,na) with nb < na are the
+    !! conjugate of (na,nb) and are not computed.
+    !
+    USE constants, ONLY : tpi
+    !
+    INTEGER, INTENT(IN) :: nat, ntyp, ngm, nat_l
+    INTEGER, INTENT(IN) :: ityp(nat), atomo_l(*)
+    REAL(DP), INTENT(IN) :: zv(ntyp), tau(3,nat), q(3), g(3,ngm), fac(ngm), facq(ngm)
+    COMPLEX(DP), INTENT(INOUT) :: dy3(3*nat,3*nat)
+    !
+    REAL(DP), ALLOCATABLE, DEVICE :: g_d(:,:), fac_d(:), facq_d(:), tau_d(:,:), zv_d(:), r_d(:,:,:)
+    INTEGER, ALLOCATABLE, DEVICE :: ityp_d(:), atl_d(:)
+    REAL(DP), ALLOCATABLE :: r_h(:,:,:)
+    INTEGER, ALLOCATABLE :: atl_h(:)
+    INTEGER :: na_l, na, nb, ng, na_i, nb_i, ic, jc, p, istat, natl, ngl
+    LOGICAL :: sym
+    REAL(DP) :: q1, q2, q3, d1, d2, d3, zvab, argq, arg, fn, fr, fi, g1, g2, g3, p1, p2, p3, &
+                a1r, a1i, a2r, a2i, a3r, a3i, a4r, a4i, a5r, a5i, a6r, a6i, b1, b2, b3, b4, b5, b6
+    COMPLEX(DP) :: dy1(3,3), dy2(3,3)
+    INTEGER, PARAMETER :: pidx(3,3) = RESHAPE( (/ 1, 2, 4, 2, 3, 5, 4, 5, 6 /), (/ 3, 3 /) )
+    !
+    sym = ( nat_l == nat )
+    ALLOCATE( g_d(3,ngm), fac_d(ngm), facq_d(ngm), tau_d(3,nat), zv_d(ntyp), ityp_d(nat), &
+              atl_d(nat_l), r_d(18,nat,nat_l), STAT=istat )
+    IF ( istat /= 0 ) CALL errore( 'd2ionq_g_dev', 'device allocation failed', 1 )
+    ALLOCATE( r_h(18,nat,nat_l), atl_h(nat_l) )
+    DO na_l = 1, nat_l
+       IF ( nat_l < nat ) THEN
+          atl_h(na_l) = atomo_l(na_l)
+       ELSE
+          atl_h(na_l) = na_l
+       ENDIF
+    ENDDO
+    g_d = g ; fac_d = fac ; facq_d = facq ; tau_d = tau ; zv_d = zv ; ityp_d = ityp ; atl_d = atl_h
+    q1 = q(1) ; q2 = q(2) ; q3 = q(3)
+    natl = nat ; ngl = ngm
+    !
+    !$acc parallel loop gang collapse(2) &
+    !$acc   private(na, zvab, d1, d2, d3, argq, a1r, a1i, a2r, a2i, a3r, a3i, a4r, a4i, a5r, a5i, &
+    !$acc           a6r, a6i, b1, b2, b3, b4, b5, b6)
+    DO na_l = 1, nat_l
+       DO nb = 1, natl
+          na = atl_d(na_l)
+          a1r = 0.0_DP ; a1i = 0.0_DP ; a2r = 0.0_DP ; a2i = 0.0_DP ; a3r = 0.0_DP ; a3i = 0.0_DP
+          a4r = 0.0_DP ; a4i = 0.0_DP ; a5r = 0.0_DP ; a5i = 0.0_DP ; a6r = 0.0_DP ; a6i = 0.0_DP
+          b1 = 0.0_DP ; b2 = 0.0_DP ; b3 = 0.0_DP ; b4 = 0.0_DP ; b5 = 0.0_DP ; b6 = 0.0_DP
+          IF ( .NOT. sym .OR. nb >= na ) THEN
+             zvab = zv_d(ityp_d(na)) * zv_d(ityp_d(nb))
+             d1 = tau_d(1,na) - tau_d(1,nb)
+             d2 = tau_d(2,na) - tau_d(2,nb)
+             d3 = tau_d(3,na) - tau_d(3,nb)
+             argq = tpi * ( q1 * d1 + q2 * d2 + q3 * d3 )
+             !$acc loop vector private(arg, fn, fr, fi, g1, g2, g3, p1, p2, p3) &
+             !$acc      reduction(+:a1r,a1i,a2r,a2i,a3r,a3i,a4r,a4i,a5r,a5i,a6r,a6i,b1,b2,b3,b4,b5,b6)
+             DO ng = 1, ngl
+                g1 = g_d(1,ng) ; g2 = g_d(2,ng) ; g3 = g_d(3,ng)
+                arg = tpi * ( g1 * d1 + g2 * d2 + g3 * d3 )
+                fn = fac_d(ng) * zvab * COS(arg)
+                fr = facq_d(ng) * zvab * COS(arg + argq)
+                fi = facq_d(ng) * zvab * SIN(arg + argq)
+                p1 = q1 + g1 ; p2 = q2 + g2 ; p3 = q3 + g3
+                a1r = a1r + fr * p1 * p1 ; a1i = a1i + fi * p1 * p1
+                a2r = a2r + fr * p2 * p1 ; a2i = a2i + fi * p2 * p1
+                a3r = a3r + fr * p2 * p2 ; a3i = a3i + fi * p2 * p2
+                a4r = a4r + fr * p3 * p1 ; a4i = a4i + fi * p3 * p1
+                a5r = a5r + fr * p3 * p2 ; a5i = a5i + fi * p3 * p2
+                a6r = a6r + fr * p3 * p3 ; a6i = a6i + fi * p3 * p3
+                b1 = b1 + fn * g1 * g1
+                b2 = b2 + fn * g2 * g1
+                b3 = b3 + fn * g2 * g2
+                b4 = b4 + fn * g3 * g1
+                b5 = b5 + fn * g3 * g2
+                b6 = b6 + fn * g3 * g3
+             ENDDO
+          ENDIF
+          r_d(1,nb,na_l) = a1r ; r_d(2,nb,na_l) = a1i ; r_d(3,nb,na_l) = a2r ; r_d(4,nb,na_l) = a2i
+          r_d(5,nb,na_l) = a3r ; r_d(6,nb,na_l) = a3i ; r_d(7,nb,na_l) = a4r ; r_d(8,nb,na_l) = a4i
+          r_d(9,nb,na_l) = a5r ; r_d(10,nb,na_l) = a5i ; r_d(11,nb,na_l) = a6r ; r_d(12,nb,na_l) = a6i
+          r_d(13,nb,na_l) = b1 ; r_d(14,nb,na_l) = b2 ; r_d(15,nb,na_l) = b3
+          r_d(16,nb,na_l) = b4 ; r_d(17,nb,na_l) = b5 ; r_d(18,nb,na_l) = b6
+       ENDDO
+    ENDDO
+    r_h = r_d
+    !
+    IF ( sym ) THEN
+       DO na = 1, nat
+          DO nb = 1, na-1
+             DO p = 1, 6
+                r_h(2*p-1,nb,na) = r_h(2*p-1,na,nb)
+                r_h(2*p,nb,na) = - r_h(2*p,na,nb)
+             ENDDO
+             r_h(13:18,nb,na) = r_h(13:18,na,nb)
+          ENDDO
+       ENDDO
+    ENDIF
+    !
+    ! ... assembled as in the stock routine
+    !
+    DO na_l = 1, nat_l
+       na = atl_h(na_l)
+       na_i = 3 * (na - 1)
+       dy2(:,:) = (0.d0, 0.d0)
+       DO nb = 1, nat
+          nb_i = 3 * (nb - 1)
+          DO jc = 1, 3
+             DO ic = 1, 3
+                p = pidx(ic,jc)
+                dy1(ic,jc) = CMPLX( r_h(2*p-1,nb,na_l), r_h(2*p,nb,na_l), KIND=DP )
+                dy2(ic,jc) = dy2(ic,jc) + r_h(12+p,nb,na_l)
+             ENDDO
+          ENDDO
+          dy3(na_i+1:na_i+3,nb_i+1:nb_i+3) = dy3(na_i+1:na_i+3,nb_i+1:nb_i+3) + dy1(1:3,1:3)
+       ENDDO
+       dy3(na_i+1:na_i+3,na_i+1:na_i+3) = dy3(na_i+1:na_i+3,na_i+1:na_i+3) - dy2(1:3,1:3)
+    ENDDO
+    DEALLOCATE( g_d, fac_d, facq_d, tau_d, zv_d, ityp_d, atl_d, r_d, r_h, atl_h )
+    !
+  END SUBROUTINE d2ionq_g_dev
   !
 #endif
   !
