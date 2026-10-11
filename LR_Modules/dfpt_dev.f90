@@ -1153,6 +1153,77 @@ CONTAINS
     !
   END SUBROUTINE add_dbecsum
   !
+  !-----------------------------------------------------------------------
+  SUBROUTINE add_zprec( nact )
+    !-----------------------------------------------------------------------
+    !! Spectral part of the preconditioner: t += sum_c psi_c (psi_c^H g) /
+    !! (e_c - e_v) over the empty bands c kept at k+q, for the k-points
+    !! with active columns; then rho = Re <t|g> of the active columns.
+    !! The solution of the linear systems is not affected: only the
+    !! preconditioner (and with it the norm of the convergence test, which
+    !! becomes slightly stricter) changes.
+    !
+    INTEGER, INTENT(IN) :: nact
+    INTEGER :: i, ik, k1, k2, c, jz, ig, j, nck, nzl, zo, n1
+    REAL(DP) :: s, de
+    !
+    nck = ncolk ; nzl = nz ; zo = zoff ; n1 = npwxl
+    i = 1
+    DO WHILE ( i <= nact )
+       k1 = (act_h(i)-1)/ncolk + 1
+       k2 = k1
+       DO WHILE ( i <= nact )
+          ik = (act_h(i)-1)/ncolk + 1
+          IF ( ik > k2+1 ) EXIT
+          k2 = ik
+          i = i + 1
+       ENDDO
+       IF ( lus ) THEN
+          CALL gemm_k( CUBLAS_OP_C, nz, ncolk, npwxl, c_one, evq_d(1,zoff+1,k1), npwxl, &
+                       INT(npwxl,8)*nbq, g_d(1,(k1-1)*ncolk+1), npwxl, INT(npwxl,8)*ncolk, c_zero, &
+                       cw_d(1,(k1-1)*ncolk+1), nw, INT(nw,8)*ncolk, k2-k1+1 )
+       ELSE
+          CALL gemm_k( CUBLAS_OP_C, nz, ncolk, npwxl, c_one, w_d(1,nkbl+zoff+1,k1), npwxl, &
+                       INT(npwxl,8)*nw, g_d(1,(k1-1)*ncolk+1), npwxl, INT(npwxl,8)*ncolk, c_zero, &
+                       cw_d(1,(k1-1)*ncolk+1), nw, INT(nw,8)*ncolk, k2-k1+1 )
+       ENDIF
+       !$cuf kernel do(2)
+       DO c = (k1-1)*nck+1, k2*nck
+          DO jz = 1, nzl
+             ik = (c-1)/nck + 1
+             de = etq_d(zo+jz,ik) - e_d(c)
+             IF ( zo+jz > noccq_d(ik) .AND. de > 1.0E-3_DP ) THEN
+                cw_d(jz,c) = cw_d(jz,c) / de
+             ELSE
+                cw_d(jz,c) = (0.0_DP, 0.0_DP)
+             ENDIF
+          ENDDO
+       ENDDO
+       IF ( lus ) THEN
+          CALL gemm_k( CUBLAS_OP_N, npwxl, ncolk, nz, c_one, evq_d(1,zoff+1,k1), npwxl, &
+                       INT(npwxl,8)*nbq, cw_d(1,(k1-1)*ncolk+1), nw, INT(nw,8)*ncolk, c_one, &
+                       t_d(1,(k1-1)*ncolk+1), npwxl, INT(npwxl,8)*ncolk, k2-k1+1 )
+       ELSE
+          CALL gemm_k( CUBLAS_OP_N, npwxl, ncolk, nz, c_one, w_d(1,nkbl+zoff+1,k1), npwxl, &
+                       INT(npwxl,8)*nw, cw_d(1,(k1-1)*ncolk+1), nw, INT(nw,8)*ncolk, c_one, &
+                       t_d(1,(k1-1)*ncolk+1), npwxl, INT(npwxl,8)*ncolk, k2-k1+1 )
+       ENDIF
+    ENDDO
+    !
+    !$acc parallel loop gang private(c, s)
+    DO j = 1, nact
+       c = act_d(j)
+       s = 0.0_DP
+       !$acc loop vector reduction(+:s)
+       DO ig = 1, n1
+          s = s + DBLE( CONJG(t_d(ig,c)) * g_d(ig,c) )
+       ENDDO
+       rho_d(c) = s
+       rhoc_d(j) = s
+    ENDDO
+    !
+  END SUBROUTINE add_zprec
+  !
 #else
   !
   ! ... stubs for builds without CUDA: the engine is never active
