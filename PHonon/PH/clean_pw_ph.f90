@@ -22,11 +22,16 @@ SUBROUTINE clean_pw_ph(iq)
 
   USE lr_symm_base,    ONLY : nsymq
   !
+  USE beta_cache,       ONLY : beta_cache_free
   IMPLICIT NONE
   !
   INTEGER, INTENT(IN) :: iq
   !
   INTEGER :: irr
+  !
+  ! ... device data of this q-point (engine, augmentation tables, work arrays)
+  !
+  CALL beta_cache_free()
   !
   done_iq(iq)=.TRUE.
   DO irr=1,nirr
