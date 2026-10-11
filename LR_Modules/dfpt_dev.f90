@@ -1445,6 +1445,281 @@ CONTAINS
   END SUBROUTINE add_zprec_sp
   !
   !-----------------------------------------------------------------------
+  RECURSIVE SUBROUTINE cg_solve_sp( zero_guess, thresh, all_conv, avg_iter )
+    !-----------------------------------------------------------------------
+    !! As cg_solve, in mixed precision: the residual g = A dpsi - d0psi is
+    !! computed in double precision, the conjugate-gradient iterations that
+    !! reduce it run in single precision (operator, vectors), the solution
+    !! is accumulated in double precision. A column whose residual has to
+    !! drop by more than sp_red in one go gets its double-precision
+    !! residual recomputed and continues (iterative refinement), so the
+    !! convergence test acts on a residual that single-precision rounding
+    !! has not degraded.
+    !
+    USE io_global,        ONLY : stdout
+    USE mp,               ONLY : mp_sum
+    USE mp_pools,         ONLY : inter_pool_comm
+    !
+    LOGICAL, INTENT(IN) :: zero_guess
+    REAL(DP), INTENT(IN) :: thresh
+    LOGICAL, INTENT(OUT) :: all_conv
+    REAL(DP), INTENT(OUT) :: avg_iter
+    !
+    REAL(DP), PARAMETER :: sp_red = 1.0E-4_DP
+    INTEGER :: iter, citer, nact, nact_new, npend, j, c, ik, ig, kp, tot_iter, tot_calls, nck, n1, n2
+    REAL(DP) :: lam, s, s2, ep, gam, anorm, eta
+    COMPLEX(SP) :: gg, zz
+    REAL(DP), ALLOCATABLE :: rho_h(:), kter_eff(:), anorm_kp(:), anorm0(:), anormc(:)
+    INTEGER, ALLOCATABLE :: nun(:), pend(:)
+    LOGICAL :: first_cycle, lgon
+    INTEGER :: ncyc
+    !
+    IF ( real_on .AND. .NOT. real_skip ) THEN
+       CALL cg_solve_real( zero_guess, thresh, all_conv, avg_iter )
+       RETURN
+    ENDIF
+    lgon = use_lg
+    nck = ncolk ; n1 = npwxl ; n2 = ncol
+    eta = eta_rel
+    IF ( zero_guess ) eta = 0.0_DP
+    CALL start_clock( 'dfptd_cg' )
+    ALLOCATE( rho_h(ncol), kter_eff(nks*npe), nun(nks*npe), anorm_kp(nks*npe), anorm0(ncol), &
+              anormc(ncol), pend(ncol) )
+    kter_eff = 0.0_DP ; anorm_kp = 0.0_DP
+    nact = nlive
+    act_h(1:nact) = live_h(1:nact)
+    act_d = act_h
+    !
+    ! ... d0psi is kept in h_d (double precision work array, free here)
+    !
+    !$cuf kernel do(2)
+    DO c = 1, n2
+       DO ig = 1, n1
+          h_d(ig,c) = g_d(ig,c)
+       ENDDO
+    ENDDO
+    IF ( zero_guess ) THEN
+       !$cuf kernel do(2)
+       DO c = 1, n2
+          DO ig = 1, n1
+             g_d(ig,c) = - g_d(ig,c)
+             dpsi_d(ig,c) = (0.0_DP, 0.0_DP)
+          ENDDO
+       ENDDO
+    ELSE
+       CALL apply_h( nact, dpsi_d, t_d )
+       !$acc parallel loop gang private(c)
+       DO j = 1, nact
+          c = act_d(j)
+          !$acc loop vector
+          DO ig = 1, n1
+             g_d(ig,c) = t_d(ig,c) - h_d(ig,c)
+          ENDDO
+       ENDDO
+    ENDIF
+    dpsi_dirty = .TRUE.
+    !
+    all_conv = .TRUE.
+    iter = 0
+    first_cycle = .TRUE.
+    ncyc = 0
+    refine: DO
+       !
+       ! ... single-precision copy of the residual of the active columns
+       !
+       !$acc parallel loop gang private(c)
+       DO j = 1, nact
+          c = act_d(j)
+          !$acc loop vector
+          DO ig = 1, n1
+             gs_d(ig,c) = CMPLX( g_d(ig,c), KIND=SP )
+          ENDDO
+       ENDDO
+       npend = 0
+       citer = 0
+       DO
+          iter = iter + 1
+          citer = citer + 1
+          IF ( citer == 1 ) THEN
+             !$acc parallel loop gang private(c, ik, ep, s)
+             DO j = 1, nact
+                c = act_d(j)
+                ik = (c-1)/nck + 1
+                ep = ep_d(c)
+                s = 0.0_DP
+                !$acc loop vector reduction(+:s) private(gg, zz)
+                DO ig = 1, n1
+                   gg = gs_d(ig,c)
+                   IF ( lgon ) THEN
+                      zz = gg / REAL( MAX( 0.1_DP, hdg_d(ig,ik) - e_d(c)*sdg_d(ig,ik) ), SP )
+                      s = s + DBLE( CONJG(gg) * gg ) / MAX( 1.0_DP, g2_d(ig,ik)/ep )
+                   ELSE
+                      zz = gg / REAL( MAX( 1.0_DP, g2_d(ig,ik)/ep ), SP )
+                      s = s + DBLE( CONJG(zz) * gg )
+                   ENDIF
+                   ts_d(ig,c) = zz
+                ENDDO
+                rho_d(c) = s
+                rhoc_d(j) = s
+             ENDDO
+          ELSE
+             !$acc parallel loop gang private(c, ik, ep, s, lam)
+             DO j = 1, nact
+                c = act_d(j)
+                ik = (c-1)/nck + 1
+                ep = ep_d(c)
+                lam = - a_d(c) / c_d(c)
+                s = 0.0_DP
+                !$acc loop vector reduction(+:s) private(gg, zz)
+                DO ig = 1, n1
+                   dpsi_d(ig,c) = dpsi_d(ig,c) + lam * hs_d(ig,c)
+                   gg = gs_d(ig,c) + REAL( lam, SP ) * ts_d(ig,c)
+                   gs_d(ig,c) = gg
+                   IF ( lgon ) THEN
+                      zz = gg / REAL( MAX( 0.1_DP, hdg_d(ig,ik) - e_d(c)*sdg_d(ig,ik) ), SP )
+                      s = s + DBLE( CONJG(gg) * gg ) / MAX( 1.0_DP, g2_d(ig,ik)/ep )
+                   ELSE
+                      zz = gg / REAL( MAX( 1.0_DP, g2_d(ig,ik)/ep ), SP )
+                      s = s + DBLE( CONJG(zz) * gg )
+                   ENDIF
+                   ts_d(ig,c) = zz
+                ENDDO
+                rhoold_d(c) = rho_d(c)
+                rho_d(c) = s
+                rhoc_d(j) = s
+             ENDDO
+          ENDIF
+          IF ( lgon ) THEN
+             CALL lowg_apply_sp( nact )
+          ELSEIF ( use_z ) THEN
+             CALL add_zprec_sp( nact )
+          ENDIF
+          rho_h(1:nact) = rhoc_d(1:nact)
+          !
+          nun = 0
+          DO j = 1, nact
+             kp = (act_h(j)-1)/nbo + 1
+             nun(kp) = nun(kp) + 1
+          ENDDO
+          DO kp = 1, nks*npe
+             ik = (kp-1)/npe + 1
+             IF ( nun(kp) > 0 ) kter_eff(kp) = kter_eff(kp) + DBLE(nun(kp)) / DBLE(nocc_h(ik))
+          ENDDO
+          nact_new = 0
+          DO j = 1, nact
+             c = act_h(j)
+             anorm = SQRT( rho_h(j) )
+             kp = (c-1)/nbo + 1
+             IF ( citer == 1 ) THEN
+                anormc(c) = anorm
+                IF ( first_cycle ) anorm0(c) = anorm
+             ENDIF
+             IF ( anorm < thresh .OR. anorm < eta * anorm0(c) ) THEN
+                CONTINUE                                  ! converged
+             ELSEIF ( anorm < sp_red * anormc(c) ) THEN
+                npend = npend + 1                         ! needs a fresh double-precision residual
+                pend(npend) = c
+             ELSE
+                nact_new = nact_new + 1
+                act_h(nact_new) = c
+                anorm_kp(kp) = MAX( anorm_kp(kp), anorm )
+             ENDIF
+          ENDDO
+          IF ( nact_new /= nact ) THEN
+             nact = nact_new
+             IF ( nact > 0 ) act_d(1:nact) = act_h(1:nact)
+          ENDIF
+          IF ( nact == 0 ) EXIT
+          IF ( citer >= maxter ) THEN
+             all_conv = .FALSE.
+             EXIT refine
+          ENDIF
+          anorm_kp = 0.0_DP
+          !
+          IF ( citer == 1 ) THEN
+             !$acc parallel loop gang private(c)
+             DO j = 1, nact
+                c = act_d(j)
+                !$acc loop vector
+                DO ig = 1, n1
+                   hs_d(ig,c) = - ts_d(ig,c)
+                ENDDO
+             ENDDO
+          ELSE
+             !$acc parallel loop gang private(c, gam)
+             DO j = 1, nact
+                c = act_d(j)
+                gam = rho_d(c) / rhoold_d(c)
+                !$acc loop vector
+                DO ig = 1, n1
+                   hs_d(ig,c) = - ts_d(ig,c) + REAL( gam, SP ) * hs_d(ig,c)
+                ENDDO
+             ENDDO
+          ENDIF
+          !
+          CALL apply_h_sp( nact )
+          !$acc parallel loop gang private(c, s, s2)
+          DO j = 1, nact
+             c = act_d(j)
+             s = 0.0_DP ; s2 = 0.0_DP
+             !$acc loop vector reduction(+:s,s2)
+             DO ig = 1, n1
+                s = s + DBLE( CONJG(hs_d(ig,c)) * gs_d(ig,c) )
+                s2 = s2 + DBLE( CONJG(hs_d(ig,c)) * ts_d(ig,c) )
+             ENDDO
+             a_d(c) = s
+             c_d(c) = s2
+          ENDDO
+       ENDDO
+       !
+       ! ... columns that used up the single-precision reduction: new
+       ! ... double-precision residual, then they continue
+       !
+       IF ( npend == 0 ) EXIT refine
+       ncyc = ncyc + 1
+       IF ( ncyc >= 60 ) THEN
+          all_conv = .FALSE.
+          WRITE( stdout, '(5x,"DFPT device engine: ",i7," linear systems not converged after ",i3, &
+               &" refinement cycles")' ) npend, ncyc
+          EXIT refine
+       ENDIF
+       first_cycle = .FALSE.
+       nact = npend
+       CALL isort_small( nact, pend )
+       act_h(1:nact) = pend(1:nact)
+       act_d(1:nact) = act_h(1:nact)
+       CALL apply_h( nact, dpsi_d, t_d )
+       !$acc parallel loop gang private(c)
+       DO j = 1, nact
+          c = act_d(j)
+          !$acc loop vector
+          DO ig = 1, n1
+             g_d(ig,c) = t_d(ig,c) - h_d(ig,c)
+          ENDDO
+       ENDDO
+    ENDDO refine
+    !
+    IF ( .NOT. all_conv ) THEN
+       DO kp = 1, nks*npe
+          IF ( anorm_kp(kp) > 0.0_DP ) WRITE( stdout, "(5x,'kpoint',i4,' sternheimer_kernel: &
+               &root not converged, thresh < ',es10.3)" ) (kp-1)/npe + 1, anorm_kp(kp)
+       ENDDO
+    ENDIF
+    tot_iter = 0
+    DO kp = 1, nks*npe
+       tot_iter = tot_iter + INT( kter_eff(kp) )
+    ENDDO
+    tot_calls = nks * npe
+    CALL mp_sum( tot_iter, inter_pool_comm )
+    CALL mp_sum( tot_calls, inter_pool_comm )
+    avg_iter = REAL(tot_iter,DP) / REAL(tot_calls,DP)
+    DEALLOCATE( rho_h, kter_eff, nun, anorm_kp, anorm0, anormc, pend )
+    CALL check_true_res( 'complex', thresh, ncyc+1 )
+    CALL stop_clock( 'dfptd_cg' )
+    !
+  END SUBROUTINE cg_solve_sp
+  !
+  !-----------------------------------------------------------------------
   SUBROUTINE setup_real( )
     !-----------------------------------------------------------------------
     !! Real mode of the single-precision iterations, for q = 0 and k-points
@@ -2130,6 +2405,341 @@ CONTAINS
     CALL stop_clock( 'dfptd_hpsi' )
     !
   END SUBROUTINE apply_h_real
+  !
+  !-----------------------------------------------------------------------
+  RECURSIVE SUBROUTINE cg_solve_real( zero_guess, thresh, all_conv, avg_iter )
+    !-----------------------------------------------------------------------
+    !! As cg_solve_sp, with the single-precision iterations in the real mode
+    !! (setup_real). Each cycle: the gradient in double precision of the
+    !! pending columns (with the other bands of their degenerate groups) is
+    !! rotated and split into its two K-symmetric parts, which are then
+    !! independent real linear systems; the imaginary part is iterated only
+    !! where it is not already below the threshold; the corrections are
+    !! rotated back and added to dpsi. Thresholds: thresh/sqrt(2) on each
+    !! part when both are iterated, else thresh on the real part.
+    !
+    USE io_global,        ONLY : stdout
+    USE mp,               ONLY : mp_sum
+    USE mp_pools,         ONLY : inter_pool_comm
+    !
+    LOGICAL, INTENT(IN) :: zero_guess
+    REAL(DP), INTENT(IN) :: thresh
+    LOGICAL, INTENT(OUT) :: all_conv
+    REAL(DP), INTENT(OUT) :: avg_iter
+    !
+    REAL(DP), PARAMETER :: sp_red = 1.0E-4_DP, afrac = 0.01_DP
+    !! afrac: the imaginary part of a column is iterated unless below afrac*thresh
+    !! (left alone it is the same in every DFPT iteration and slows the mixing down)
+    INTEGER, PARAMETER :: maxcyc = 30
+    !! cycles after which the solve is handed to the complex iterations
+    REAL(DP) :: red
+    INTEGER :: ncyc
+    INTEGER :: iter, citer, nact, nar, j, c, rc, ik, ig, ir, kp, tot_iter, tot_calls, nck, n1, n2, &
+               nrr, ib, c0, cl, m
+    REAL(DP) :: lam, s, s2, ep, gam, anorm, eta, thr
+    REAL(SP) :: gg, zz
+    REAL(DP), ALLOCATABLE :: rho_h(:), kter_eff(:), anorm_kp(:), anorm0(:), anormc(:)
+    INTEGER, ALLOCATABLE :: nun(:)
+    LOGICAL, ALLOCATABLE :: actf(:), pendc(:), a_on(:)
+    LOGICAL :: first_cycle, changed, giveup, pnd, lgon
+    !
+    lgon = use_lgr .AND. ALLOCATED( glr_d )
+    nck = ncolk ; n1 = npwxl ; n2 = ncol ; nrr = 2*nhx
+    eta = eta_rel
+    IF ( zero_guess ) eta = 0.0_DP
+    CALL start_clock( 'dfptd_cg' )
+    ALLOCATE( rho_h(2*ncol), kter_eff(nks*npe), nun(nks*npe), anorm_kp(nks*npe), anorm0(2*ncol), &
+              anormc(2*ncol), actf(2*ncol), pendc(ncol), a_on(ncol) )
+    kter_eff = 0.0_DP ; anorm_kp = 0.0_DP ; anorm0 = 0.0_DP ; anormc = 0.0_DP
+    nact = nlive
+    act_h(1:nact) = live_h(1:nact)
+    act_d = act_h
+    !
+    ! ... d0psi is kept in h_d; starting gradient g = A dpsi - d0psi
+    !
+    !$cuf kernel do(2)
+    DO c = 1, n2
+       DO ig = 1, n1
+          h_d(ig,c) = g_d(ig,c)
+       ENDDO
+    ENDDO
+    IF ( zero_guess ) THEN
+       !$cuf kernel do(2)
+       DO c = 1, n2
+          DO ig = 1, n1
+             g_d(ig,c) = - g_d(ig,c)
+             dpsi_d(ig,c) = (0.0_DP, 0.0_DP)
+          ENDDO
+       ENDDO
+    ELSE
+       CALL apply_h( nact, dpsi_d, t_d )
+       !$acc parallel loop gang private(c)
+       DO j = 1, nact
+          c = act_d(j)
+          !$acc loop vector
+          DO ig = 1, n1
+             g_d(ig,c) = t_d(ig,c) - h_d(ig,c)
+          ENDDO
+       ENDDO
+    ENDIF
+    dpsi_dirty = .TRUE.
+    !
+    ! ... the real operator differs from the one of the residual by terms of
+    ! ... the order of eps_real: a cycle may reduce a column by no more than
+    ! ... that allows before its gradient is computed anew. (With eps_real =
+    ! ... 1e-6 and the plain limit 1e-4 the true residuals of the 216- and
+    ! ... 54-atom Si cells end within 3% of the threshold, QE_PH_CHECK_RES; the
+    ! ... factor 30 acts for bands worse than 3e-6.)
+    !
+    red = MAX( sp_red, 30.0_DP * eps_real )
+    all_conv = .TRUE.
+    giveup = .FALSE.
+    iter = 0
+    ncyc = 0
+    first_cycle = .TRUE.
+    refine: DO
+       !
+       ncyc = ncyc + 1
+       CALL to_real( nact )
+       actf = .FALSE.
+       DO j = 1, nact
+          actf(act_h(j)) = .TRUE.
+          actf(ncol+act_h(j)) = .TRUE.
+       ENDDO
+       CALL real_list( actf, nar )
+       pendc = .FALSE. ; a_on = .FALSE.
+       citer = 0
+       DO
+          iter = iter + 1
+          citer = citer + 1
+          IF ( citer == 1 ) THEN
+             !$acc parallel loop gang private(rc, c, ik, ep, s)
+             DO j = 1, nar
+                rc = actr_d(j)
+                c = rc
+                IF ( rc > n2 ) c = rc - n2
+                ik = (c-1)/nck + 1
+                ep = ep_d(c)
+                s = 0.0_DP
+                !$acc loop vector reduction(+:s) private(gg, zz)
+                DO ir = 1, nrr
+                   gg = gr_d(ir,rc)
+                   IF ( lgon ) THEN
+                      zz = gg / REAL( MAX( 0.1_DP, hdr_d((ir+1)/2,ik) - er_d(c)*sdr_d((ir+1)/2,ik) ), SP )
+                      s = s + DBLE(gg) * DBLE(gg) / MAX( 1.0_DP, g2h_d((ir+1)/2,ik)/ep )
+                   ELSE
+                      zz = gg / REAL( MAX( 1.0_DP, g2h_d((ir+1)/2,ik)/ep ), SP )
+                      s = s + DBLE(zz) * DBLE(gg)
+                   ENDIF
+                   tr_d(ir,rc) = zz
+                ENDDO
+                rhor_d(rc) = 2.0_DP * s
+                rhocr_d(j) = 2.0_DP * s
+             ENDDO
+          ELSE
+             !$acc parallel loop gang private(rc, c, ik, ep, s, lam)
+             DO j = 1, nar
+                rc = actr_d(j)
+                c = rc
+                IF ( rc > n2 ) c = rc - n2
+                ik = (c-1)/nck + 1
+                ep = ep_d(c)
+                lam = - ar_d(rc) / cr_d(rc)
+                s = 0.0_DP
+                !$acc loop vector reduction(+:s) private(gg, zz)
+                DO ir = 1, nrr
+                   dr_d(ir,rc) = dr_d(ir,rc) + REAL( lam, SP ) * hr_d(ir,rc)
+                   gg = gr_d(ir,rc) + REAL( lam, SP ) * tr_d(ir,rc)
+                   gr_d(ir,rc) = gg
+                   IF ( lgon ) THEN
+                      zz = gg / REAL( MAX( 0.1_DP, hdr_d((ir+1)/2,ik) - er_d(c)*sdr_d((ir+1)/2,ik) ), SP )
+                      s = s + DBLE(gg) * DBLE(gg) / MAX( 1.0_DP, g2h_d((ir+1)/2,ik)/ep )
+                   ELSE
+                      zz = gg / REAL( MAX( 1.0_DP, g2h_d((ir+1)/2,ik)/ep ), SP )
+                      s = s + DBLE(zz) * DBLE(gg)
+                   ENDIF
+                   tr_d(ir,rc) = zz
+                ENDDO
+                rhooldr_d(rc) = rhor_d(rc)
+                rhor_d(rc) = 2.0_DP * s
+                rhocr_d(j) = 2.0_DP * s
+             ENDDO
+          ENDIF
+          IF ( lgon ) CALL lowg_apply_real( nar )
+          rho_h(1:nar) = rhocr_d(1:nar)
+          !
+          ! ... iteration count as in cgsolve_all (real parts only)
+          !
+          nun = 0
+          DO j = 1, nar
+             rc = actr_h(j)
+             IF ( rc <= ncol ) THEN
+                kp = (rc-1)/nbo + 1
+                nun(kp) = nun(kp) + 1
+             ENDIF
+          ENDDO
+          DO kp = 1, nks*npe
+             ik = (kp-1)/npe + 1
+             IF ( nun(kp) > 0 ) kter_eff(kp) = kter_eff(kp) + DBLE(nun(kp)) / DBLE(nocc_h(ik))
+          ENDDO
+          IF ( citer == 1 ) THEN
+             DO j = 1, nar
+                rc = actr_h(j)
+                anormc(rc) = SQRT( rho_h(j) )
+                IF ( first_cycle ) anorm0(rc) = anormc(rc)
+                IF ( rc > ncol ) a_on(rc-ncol) = anormc(rc) >= afrac * thresh
+             ENDDO
+          ENDIF
+          changed = .FALSE.
+          DO j = 1, nar
+             rc = actr_h(j)
+             c = rc
+             IF ( rc > ncol ) c = rc - ncol
+             anorm = SQRT( rho_h(j) )
+             kp = (c-1)/nbo + 1
+             IF ( rc > ncol .AND. .NOT. a_on(c) ) THEN
+                actf(rc) = .FALSE.                         ! imaginary part below the threshold
+                changed = .TRUE.
+                CYCLE
+             ENDIF
+             thr = SQRT( 1.0_DP - afrac*afrac ) * thresh
+             IF ( a_on(c) ) thr = SQRT( 0.5_DP ) * thresh
+             IF ( anorm < thr .OR. anorm < eta * anorm0(rc) ) THEN
+                actf(rc) = .FALSE.                         ! converged
+                changed = .TRUE.
+             ELSEIF ( anorm < red * anormc(rc) ) THEN
+                actf(rc) = .FALSE.                         ! needs a fresh double-precision gradient
+                pendc(c) = .TRUE.
+                changed = .TRUE.
+             ELSE
+                anorm_kp(kp) = MAX( anorm_kp(kp), anorm )
+             ENDIF
+          ENDDO
+          IF ( changed ) CALL real_list( actf, nar )
+          IF ( nar == 0 ) EXIT
+          IF ( citer >= maxter ) THEN
+             all_conv = .FALSE.
+             giveup = .TRUE.
+             EXIT
+          ENDIF
+          anorm_kp = 0.0_DP
+          !
+          IF ( citer == 1 ) THEN
+             !$acc parallel loop gang private(rc)
+             DO j = 1, nar
+                rc = actr_d(j)
+                !$acc loop vector
+                DO ir = 1, nrr
+                   hr_d(ir,rc) = - tr_d(ir,rc)
+                ENDDO
+             ENDDO
+          ELSE
+             !$acc parallel loop gang private(rc, gam)
+             DO j = 1, nar
+                rc = actr_d(j)
+                gam = rhor_d(rc) / rhooldr_d(rc)
+                !$acc loop vector
+                DO ir = 1, nrr
+                   hr_d(ir,rc) = - tr_d(ir,rc) + REAL( gam, SP ) * hr_d(ir,rc)
+                ENDDO
+             ENDDO
+          ENDIF
+          !
+          CALL apply_h_real( nar )
+          !$acc parallel loop gang private(rc, s, s2)
+          DO j = 1, nar
+             rc = actr_d(j)
+             s = 0.0_DP ; s2 = 0.0_DP
+             !$acc loop vector reduction(+:s,s2)
+             DO ir = 1, nrr
+                s = s + DBLE(hr_d(ir,rc)) * DBLE(gr_d(ir,rc))
+                s2 = s2 + DBLE(hr_d(ir,rc)) * DBLE(tr_d(ir,rc))
+             ENDDO
+             ar_d(rc) = 2.0_DP * s
+             cr_d(rc) = 2.0_DP * s2
+          ENDDO
+       ENDDO
+       !
+       ! ... corrections of this cycle into dpsi
+       !
+       CALL from_real( nact )
+       IF ( giveup .OR. .NOT. ANY( pendc ) ) EXIT refine
+       IF ( ncyc >= maxcyc ) THEN
+          !
+          ! ... the real iterations do not contract: the same solve, from the
+          ! ... present dpsi, with complex iterations
+          !
+          WRITE( stdout, '(5x,"DFPT device engine: real iterations stall, complex iterations for this solve")' )
+          !$cuf kernel do(2)
+          DO c = 1, n2
+             DO ig = 1, n1
+                g_d(ig,c) = h_d(ig,c)
+             ENDDO
+          ENDDO
+          DEALLOCATE( rho_h, kter_eff, nun, anorm_kp, anorm0, anormc, actf, pendc, a_on )
+          CALL stop_clock( 'dfptd_cg' )
+          ! (the relative tolerance of the caller: none for a solve from zero)
+          eta = eta_rel
+          IF ( zero_guess ) eta_rel = 0.0_DP
+          real_skip = .TRUE.
+          CALL cg_solve_sp( .FALSE., thresh, all_conv, avg_iter )
+          real_skip = .FALSE.
+          eta_rel = eta
+          RETURN
+       ENDIF
+       !
+       ! ... pending columns, with the other bands of their groups: new
+       ! ... gradient in double precision, then they continue
+       !
+       first_cycle = .FALSE.
+       nact = 0
+       DO c = 1, ncol
+          ib = MOD( c-1, nbo ) + 1
+          ik = (c-1)/ncolk + 1
+          IF ( ib > nocc_h(ik) ) CYCLE
+          c0 = c - ib
+          cl = clus_h(ib,ik)
+          pnd = .FALSE.
+          DO m = cl, nocc_h(ik)
+             IF ( clus_h(m,ik) /= cl ) EXIT
+             IF ( pendc(c0+m) ) pnd = .TRUE.
+          ENDDO
+          IF ( pnd ) THEN
+             nact = nact + 1
+             act_h(nact) = c
+          ENDIF
+       ENDDO
+       act_d(1:nact) = act_h(1:nact)
+       CALL apply_h( nact, dpsi_d, t_d )
+       !$acc parallel loop gang private(c)
+       DO j = 1, nact
+          c = act_d(j)
+          !$acc loop vector
+          DO ig = 1, n1
+             g_d(ig,c) = t_d(ig,c) - h_d(ig,c)
+          ENDDO
+       ENDDO
+    ENDDO refine
+    !
+    IF ( .NOT. all_conv ) THEN
+       DO kp = 1, nks*npe
+          IF ( anorm_kp(kp) > 0.0_DP ) WRITE( stdout, "(5x,'kpoint',i4,' sternheimer_kernel: &
+               &root not converged, thresh < ',es10.3)" ) (kp-1)/npe + 1, anorm_kp(kp)
+       ENDDO
+    ENDIF
+    tot_iter = 0
+    DO kp = 1, nks*npe
+       tot_iter = tot_iter + INT( kter_eff(kp) )
+    ENDDO
+    tot_calls = nks * npe
+    CALL mp_sum( tot_iter, inter_pool_comm )
+    CALL mp_sum( tot_calls, inter_pool_comm )
+    avg_iter = REAL(tot_iter,DP) / REAL(tot_calls,DP)
+    DEALLOCATE( rho_h, kter_eff, nun, anorm_kp, anorm0, anormc, actf, pendc, a_on )
+    CALL check_true_res( 'real', thresh, ncyc )
+    CALL stop_clock( 'dfptd_cg' )
+    !
+  END SUBROUTINE cg_solve_real
   !
   !-----------------------------------------------------------------------
   SUBROUTINE setup_lowg( )
@@ -2822,6 +3432,47 @@ CONTAINS
     ENDDO
     !
   END SUBROUTINE lowg_apply_real
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE check_true_res( tag, thresh, ncyc )
+    !-----------------------------------------------------------------------
+    !! Diagnostic (QE_PH_CHECK_RES set): after a solve, the residual of all
+    !! columns is computed in double precision and its largest and
+    !! root-mean-square norm (the norm of the convergence test) are printed
+    !! in units of the threshold. One more application of the operator.
+    USE io_global, ONLY : stdout
+    CHARACTER(LEN=*), INTENT(IN) :: tag
+    REAL(DP), INTENT(IN) :: thresh
+    INTEGER, INTENT(IN) :: ncyc
+    INTEGER :: j, c, ig, ik, nck, n1, nact, ln, ierr
+    REAL(DP) :: s, ep, smax, ssum
+    COMPLEX(DP) :: gg
+    CHARACTER(LEN=8) :: val
+    CALL get_environment_variable( 'QE_PH_CHECK_RES', val, ln, ierr )
+    IF ( .NOT. ( ierr == 0 .AND. ln > 0 ) ) RETURN
+    nck = ncolk ; n1 = npwxl
+    nact = nlive
+    act_h(1:nact) = live_h(1:nact)
+    act_d = act_h
+    CALL apply_h( nact, dpsi_d, t_d )
+    smax = 0.0_DP ; ssum = 0.0_DP
+    !$acc parallel loop gang private(c, ik, ep, s) reduction(max:smax) reduction(+:ssum)
+    DO j = 1, nact
+       c = act_d(j)
+       ik = (c-1)/nck + 1
+       ep = ep_d(c)
+       s = 0.0_DP
+       !$acc loop vector reduction(+:s) private(gg)
+       DO ig = 1, n1
+          gg = t_d(ig,c) - h_d(ig,c)
+          s = s + DBLE( CONJG(gg) * gg ) / MAX( 1.0_DP, g2_d(ig,ik)/ep )
+       ENDDO
+       smax = MAX( smax, s )
+       ssum = ssum + s
+    ENDDO
+    WRITE( stdout, '(5x,"check_res ",a,": thresh",es10.3,", residual/thresh max",f8.3," rms",f8.3,",",i4," cycles")' ) &
+         tag, thresh, SQRT(smax)/thresh, SQRT(ssum/nact)/thresh, ncyc
+  END SUBROUTINE check_true_res
   !
   !-----------------------------------------------------------------------
   LOGICAL FUNCTION lowg_cell_ok( )
