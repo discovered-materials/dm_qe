@@ -24,6 +24,7 @@ set(src_ph
     PH/compute_alphasum.f90
     PH/compute_becalp.f90
     PH/compute_becsum_ph.f90
+    PH/phq_setup_dev.f90
     PH/compute_drhous.f90
     PH/compute_drhous_nc.f90
     PH/compute_dvloc.f90
