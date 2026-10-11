@@ -54,7 +54,7 @@ MODULE usaug_dev
   SAVE
   !
   PUBLIC :: usaug_on, usaug_check, usaug_invalidate, usaug_newdq, usaug_addusddens, &
-            usaug_dvanqq, usaug_interp_on
+            usaug_dvanqq, usaug_addusddens_pulay, usaug_interp_on
   !
   LOGICAL :: env_read = .FALSE.
   !! the environment has been read
@@ -1046,6 +1046,142 @@ CONTAINS
     !
   END SUBROUTINE usaug_dvanqq
   !
+  !-----------------------------------------------------------------------
+  SUBROUTINE usaug_addusddens_pulay( npe, mode0, u, dbecsum, alphasum, drhop, lpaw, becsumort )
+    !-----------------------------------------------------------------------
+    !! Augmentation part of the response density at fixed wavefunctions for
+    !! the displacement modes mode0+1 ... mode0+npe, see addusddens_pulay:
+    !!
+    !! drho(G,is,ip) += sum_na S_na(q+G) sum_ij Q_ij(q+G) [ zsum(ij,na,is,ip)
+    !!                  - i tpiba (q+G).u_na,ip becsum(ij,na,is) ]
+    !!
+    !! zsum = dbecsum + alphasum.u is saved in becsumort in the PAW case.
+    !
+    USE cell_base,        ONLY : tpiba
+    USE fft_base,         ONLY : dfftp
+    USE ions_base,        ONLY : nat, ntyp => nsp
+    USE noncollin_module, ONLY : nspin_mag
+    USE uspp,             ONLY : becsum
+    USE uspp_param,       ONLY : upf, nhm
+    USE qpoint,           ONLY : xq
+    !
+    INTEGER, INTENT(IN) :: npe, mode0
+    COMPLEX(DP), INTENT(IN) :: u(3*nat,3*nat)
+    COMPLEX(DP), INTENT(IN) :: dbecsum(nhm*(nhm+1)/2,nat,nspin_mag,npe)
+    REAL(DP), INTENT(IN) :: alphasum(nhm*(nhm+1)/2,3,nat,nspin_mag)
+    COMPLEX(DP), INTENT(INOUT) :: drhop(dfftp%nnr,nspin_mag,npe)
+    LOGICAL, INTENT(IN) :: lpaw
+    COMPLEX(DP), INTENT(INOUT) :: becsumort(:,:,:,:)
+    !
+    COMPLEX(DP), ALLOCATABLE, DEVICE :: aux_d(:,:), t1_d(:,:), t2_d(:,:), d1_d(:,:), d2_d(:,:), &
+                                        uu_d(:,:)
+    COMPLEX(DP), ALLOCATABLE :: d1_h(:,:), d2_h(:,:), uu_h(:,:)
+    INTEGER :: nisp, nt, natc, a0, nac, ncols, ia0, ig, na, isp, ij0, nc, col, istat, ia, is, &
+               ipert, n1, nqb, nijt, mu, mode, ij, nsp_l, npe_l
+    REAL(DP) :: xq1, xq2, xq3, v1, v2, v3
+    COMPLEX(DP) :: sk, beta, fact, u1, u2, u3, zsum, alpha
+    LOGICAL :: moved
+    !
+    CALL prepare_q( )
+    nisp = nspin_mag * npe
+    n1 = ngml ; nsp_l = nspin_mag ; npe_l = npe
+    xq1 = xq(1) ; xq2 = xq(2) ; xq3 = xq(3)
+    fact = CMPLX( 0.0_DP, - tpiba, KIND=DP )
+    ALLOCATE( aux_d(ngml,nisp) )
+    !$cuf kernel do(2)
+    DO isp = 1, nisp
+       DO ig = 1, n1
+          aux_d(ig,isp) = (0.0_DP, 0.0_DP)
+       ENDDO
+    ENDDO
+    !
+    DO nt = 1, ntyp
+       IF ( .NOT. upf(nt)%tvanp .OR. tnat(nt) == 0 ) CYCLE
+       nijt = nij(nt)
+       nqb = qblock( nt )
+       natc = ncol_fit( 16.0_DP * REAL(ngml,DP) * (nisp + nspin_mag), tnat(nt) )
+       ALLOCATE( t1_d(ngml,natc*nisp), t2_d(ngml,natc*nspin_mag), d1_d(nijt,natc*nisp), &
+                 d2_d(nijt,natc*nspin_mag), uu_d(3,natc*npe) )
+       ALLOCATE( d1_h(nijt,natc*nisp), d2_h(nijt,natc*nspin_mag), uu_h(3,natc*npe) )
+       DO a0 = 0, tnat(nt)-1, natc
+          nac = MIN( natc, tnat(nt)-a0 )
+          ia0 = tat0(nt) + a0
+          DO ia = 1, nac
+             na = atl(ia0+ia)
+             mu = 3 * (na - 1)
+             DO ipert = 1, npe
+                mode = mode0 + ipert
+                u1 = u(mu+1,mode)
+                u2 = u(mu+2,mode)
+                u3 = u(mu+3,mode)
+                moved = ABS(u1) + ABS(u2) + ABS(u3) >= 1.0E-12_DP
+                IF ( .NOT. moved ) THEN
+                   u1 = (0.0_DP, 0.0_DP) ; u2 = (0.0_DP, 0.0_DP) ; u3 = (0.0_DP, 0.0_DP)
+                ENDIF
+                uu_h(1,(ia-1)*npe+ipert) = u1
+                uu_h(2,(ia-1)*npe+ipert) = u2
+                uu_h(3,(ia-1)*npe+ipert) = u3
+                DO is = 1, nspin_mag
+                   isp = (ipert-1)*nspin_mag + is
+                   DO ij = 1, nijt
+                      zsum = dbecsum(ij,na,is,ipert)
+                      IF ( moved ) zsum = zsum + ( alphasum(ij,1,na,is) * u1 + &
+                                                   alphasum(ij,2,na,is) * u2 + &
+                                                   alphasum(ij,3,na,is) * u3 )
+                      d1_h(ij,(ia-1)*nisp+isp) = zsum
+                      IF ( lpaw ) becsumort(ij,na,is,mode) = zsum
+                   ENDDO
+                ENDDO
+             ENDDO
+             DO is = 1, nspin_mag
+                DO ij = 1, nijt
+                   d2_h(ij,(ia-1)*nspin_mag+is) = CMPLX( becsum(ij,na,is), 0.0_DP, KIND=DP )
+                ENDDO
+             ENDDO
+          ENDDO
+          ncols = nac * nisp
+          d1_d(:,1:ncols) = d1_h(:,1:ncols)
+          d2_d(:,1:nac*nspin_mag) = d2_h(:,1:nac*nspin_mag)
+          uu_d(:,1:nac*npe) = uu_h(:,1:nac*npe)
+          !
+          beta = c_zero
+          DO ij0 = 0, nijt-1, nqb
+             nc = MIN( nqb, nijt-ij0 )
+             col = qcol( nt, ij0, nc )
+             istat = cublasZgemm( hblas, CUBLAS_OP_N, CUBLAS_OP_N, ngml, ncols, nc, c_one, &
+                                  qg_d(1,col), ngml, d1_d(ij0+1,1), nijt, beta, t1_d, ngml )
+             IF ( istat /= 0 ) CALL errore( 'usaug_addusddens_pulay', 'cublasZgemm failed', ABS(istat) )
+             istat = cublasZgemm( hblas, CUBLAS_OP_N, CUBLAS_OP_N, ngml, nac*nspin_mag, nc, c_one, &
+                                  qg_d(1,col), ngml, d2_d(ij0+1,1), nijt, beta, t2_d, ngml )
+             IF ( istat /= 0 ) CALL errore( 'usaug_addusddens_pulay', 'cublasZgemm failed', ABS(istat) )
+             beta = c_one
+          ENDDO
+          !$cuf kernel do(1)
+          DO ig = 1, n1
+             v1 = xq1 + g_d(1,ig) ; v2 = xq2 + g_d(2,ig) ; v3 = xq3 + g_d(3,ig)
+             DO ia = 1, nac
+                na = atl_d(ia0+ia)
+                sk = eig1_d(mill_d(1,ig),na) * eig2_d(mill_d(2,ig),na) * &
+                     eig3_d(mill_d(3,ig),na) * eigq_d(na)
+                DO isp = 1, nisp
+                   is = MOD(isp-1,nsp_l) + 1
+                   ipert = (isp-1)/nsp_l + 1
+                   alpha = v1 * uu_d(1,(ia-1)*npe_l+ipert) + v2 * uu_d(2,(ia-1)*npe_l+ipert) + &
+                           v3 * uu_d(3,(ia-1)*npe_l+ipert)
+                   aux_d(ig,isp) = aux_d(ig,isp) + sk * ( t1_d(ig,(ia-1)*nisp+isp) + &
+                                   fact * alpha * t2_d(ig,(ia-1)*nsp_l+is) )
+                ENDDO
+             ENDDO
+          ENDDO
+       ENDDO
+       DEALLOCATE( t1_d, t2_d, d1_d, d2_d, uu_d, d1_h, d2_h, uu_h )
+    ENDDO
+    !
+    CALL add_from_g( aux_d, nisp, drhop )
+    DEALLOCATE( aux_d )
+    !
+  END SUBROUTINE usaug_addusddens_pulay
+  !
 #else
   !
   ! ... stubs for builds without CUDA: usaug_on is false and these are never called
@@ -1077,6 +1213,21 @@ CONTAINS
     COMPLEX(DP), INTENT(INOUT) :: int1(:,:,:,:,:), int2(:,:,:,:,:), int4(:,:,:,:,:), int5(:,:,:,:,:)
     CALL errore( 'usaug_dvanqq', 'not available without CUDA', 1 )
   END SUBROUTINE usaug_dvanqq
+  !
+  SUBROUTINE usaug_addusddens_pulay( npe, mode0, u, dbecsum, alphasum, drhop, lpaw, becsumort )
+    USE fft_base,         ONLY : dfftp
+    USE ions_base,        ONLY : nat
+    USE noncollin_module, ONLY : nspin_mag
+    USE uspp_param,       ONLY : nhm
+    INTEGER, INTENT(IN) :: npe, mode0
+    COMPLEX(DP), INTENT(IN) :: u(3*nat,3*nat)
+    COMPLEX(DP), INTENT(IN) :: dbecsum(nhm*(nhm+1)/2,nat,nspin_mag,npe)
+    REAL(DP), INTENT(IN) :: alphasum(nhm*(nhm+1)/2,3,nat,nspin_mag)
+    COMPLEX(DP), INTENT(INOUT) :: drhop(dfftp%nnr,nspin_mag,npe)
+    LOGICAL, INTENT(IN) :: lpaw
+    COMPLEX(DP), INTENT(INOUT) :: becsumort(:,:,:,:)
+    CALL errore( 'usaug_addusddens_pulay', 'not available without CUDA', 1 )
+  END SUBROUTINE usaug_addusddens_pulay
   !
 #endif
   !
