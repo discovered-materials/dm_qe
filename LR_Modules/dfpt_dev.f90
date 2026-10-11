@@ -1823,6 +1823,315 @@ CONTAINS
   END SUBROUTINE real_list
   !
   !-----------------------------------------------------------------------
+  SUBROUTINE to_real( nact )
+    !-----------------------------------------------------------------------
+    !! gradient g_d of the nact columns listed in act_d (complete groups of
+    !! degenerate bands): to single precision, to the rotated bands, split
+    !! into its K-symmetric parts gr_d(:,c) + i gr_d(:,ncol+c); the
+    !! corrections dr_d of these columns are set to zero.
+    INTEGER, INTENT(IN) :: nact
+    INTEGER :: j, c, ig, jg, ik, n1, n2, nck, nhl, i, blk, c0, lastblk, istat
+    COMPLEX(SP) :: x1, x2, xs, xa
+    COMPLEX(SP), PARAMETER :: s_one = (1.0_SP, 0.0_SP), s_zero = (0.0_SP, 0.0_SP)
+    REAL(SP), PARAMETER :: rt2i = 0.70710678_SP
+    !
+    n1 = npwxl ; n2 = ncol ; nck = ncolk ; nhl = nhx
+    !$acc parallel loop gang private(c)
+    DO j = 1, nact
+       c = act_d(j)
+       !$acc loop vector
+       DO ig = 1, n1
+          gs_d(ig,c) = CMPLX( g_d(ig,c), KIND=SP )
+       ENDDO
+    ENDDO
+    lastblk = 0
+    DO i = 1, nact
+       blk = (act_h(i)-1)/nbo + 1
+       IF ( blk == lastblk ) CYCLE
+       lastblk = blk
+       c0 = (blk-1)*nbo
+       ik = c0/ncolk + 1
+       istat = cublasCgemm( hblas, CUBLAS_OP_N, CUBLAS_OP_N, npwxl, nbo, nbo, s_one, gs_d(1,c0+1), &
+                            npwxl, ur_d(1,1,ik), nbo, s_zero, hs_d(1,c0+1), npwxl )
+       IF ( istat /= 0 ) CALL errore( 'dfpt_dev', 'cublasCgemm failed', ABS(istat) )
+    ENDDO
+    !$acc parallel loop gang private(c, ik)
+    DO j = 1, nact
+       c = act_d(j)
+       ik = (c-1)/nck + 1
+       !$acc loop vector private(x1, x2, xs, xa)
+       DO jg = 1, nhl
+          IF ( jg <= nh_d(ik) ) THEN
+             x1 = hs_d(hl_d(jg,ik),c)
+             IF ( jg <= nself_d(ik) ) THEN
+                gr_d(2*jg-1,c) = REAL(x1) * rt2i
+                gr_d(2*jg,c) = 0.0_SP
+                gr_d(2*jg-1,n2+c) = AIMAG(x1) * rt2i
+                gr_d(2*jg,n2+c) = 0.0_SP
+             ELSE
+                x2 = hs_d(hm_d(jg,ik),c)
+                xs = 0.5_SP * ( x1 + CONJG(x2) )
+                xa = ( x1 - CONJG(x2) ) * CMPLX( 0.0_SP, -0.5_SP )
+                gr_d(2*jg-1,c) = REAL(xs)
+                gr_d(2*jg,c) = AIMAG(xs)
+                gr_d(2*jg-1,n2+c) = REAL(xa)
+                gr_d(2*jg,n2+c) = AIMAG(xa)
+             ENDIF
+          ELSE
+             gr_d(2*jg-1,c) = 0.0_SP
+             gr_d(2*jg,c) = 0.0_SP
+             gr_d(2*jg-1,n2+c) = 0.0_SP
+             gr_d(2*jg,n2+c) = 0.0_SP
+          ENDIF
+          dr_d(2*jg-1,c) = 0.0_SP
+          dr_d(2*jg,c) = 0.0_SP
+          dr_d(2*jg-1,n2+c) = 0.0_SP
+          dr_d(2*jg,n2+c) = 0.0_SP
+       ENDDO
+    ENDDO
+    !
+  END SUBROUTINE to_real
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE from_real( nact )
+    !-----------------------------------------------------------------------
+    !! corrections dr_d of the nact columns listed in act_d: back to complex
+    !! vectors and to the original bands, added to dpsi_d.
+    INTEGER, INTENT(IN) :: nact
+    INTEGER :: j, c, ig, jg, ik, n1, n2, nck, nhl, i, blk, c0, lastblk, istat
+    COMPLEX(SP) :: ds, da
+    COMPLEX(SP), PARAMETER :: s_one = (1.0_SP, 0.0_SP), s_zero = (0.0_SP, 0.0_SP), s_i = (0.0_SP, 1.0_SP)
+    REAL(SP), PARAMETER :: rt2 = 1.41421356_SP
+    !
+    n1 = npwxl ; n2 = ncol ; nck = ncolk ; nhl = nhx
+    !$acc parallel loop gang private(c, ik)
+    DO j = 1, nact
+       c = act_d(j)
+       ik = (c-1)/nck + 1
+       !$acc loop vector private(ds, da)
+       DO jg = 1, nhl
+          IF ( jg <= nh_d(ik) ) THEN
+             ds = CMPLX( dr_d(2*jg-1,c), dr_d(2*jg,c) )
+             da = CMPLX( dr_d(2*jg-1,n2+c), dr_d(2*jg,n2+c) )
+             IF ( jg <= nself_d(ik) ) THEN
+                ts_d(hl_d(jg,ik),c) = rt2 * CMPLX( REAL(ds), REAL(da) )
+             ELSE
+                ts_d(hl_d(jg,ik),c) = ds + s_i * da
+                ts_d(hm_d(jg,ik),c) = CONJG(ds) + s_i * CONJG(da)
+             ENDIF
+          ENDIF
+       ENDDO
+    ENDDO
+    lastblk = 0
+    DO i = 1, nact
+       blk = (act_h(i)-1)/nbo + 1
+       IF ( blk == lastblk ) CYCLE
+       lastblk = blk
+       c0 = (blk-1)*nbo
+       ik = c0/ncolk + 1
+       istat = cublasCgemm( hblas, CUBLAS_OP_N, CUBLAS_OP_C, npwxl, nbo, nbo, s_one, ts_d(1,c0+1), &
+                            npwxl, ur_d(1,1,ik), nbo, s_zero, hs_d(1,c0+1), npwxl )
+       IF ( istat /= 0 ) CALL errore( 'dfpt_dev', 'cublasCgemm failed', ABS(istat) )
+    ENDDO
+    !$acc parallel loop gang private(c)
+    DO j = 1, nact
+       c = act_d(j)
+       !$acc loop vector
+       DO ig = 1, n1
+          dpsi_d(ig,c) = dpsi_d(ig,c) + hs_d(ig,c)
+       ENDDO
+    ENDDO
+    !
+  END SUBROUTINE from_real
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE apply_h_real( nar )
+    !-----------------------------------------------------------------------
+    !! tr_d = ( H - e S + alpha_pv P_v ) hr_d for the nar columns of the real
+    !! mode listed in actr_d (ordered by k-point). Two columns of a k-point
+    !! share the FFTs: x1 + i x2 is one complex function of r, and after the
+    !! product with the (real) potential the two are separated again with
+    !! the values at G and G'. Nonlocal and projector terms: real matrix
+    !! products on the active columns of each k-point.
+    !
+    INTEGER, INTENT(IN) :: nar
+    !
+    INTEGER :: np, j, p0, nb, ip, jg, rc1, rc2, c1, c2, ik, istat, ir, n2, nck, nhl, nwl, nkl, &
+               j1, j2, nak, jj, iw, rc, c, na, iof, ih, jh, is, nrr
+    REAL(SP) :: scale
+    COMPLEX(SP) :: za, zb, z1, z2, y1, y2
+    REAL(DP) :: apv, ee, s
+    REAL(SP), PARAMETER :: rt2 = 1.41421356_SP, rt2i = 0.70710678_SP
+    COMPLEX(SP), PARAMETER :: s_i = (0.0_SP, 1.0_SP)
+    !
+    CALL start_clock( 'dfptd_hpsi' )
+    n2 = ncol ; nck = ncolk ; nhl = nhx ; nwl = nw ; nkl = nkbl ; apv = alpha_pv_l ; nrr = 2*nhx
+    scale = 1.0_SP / REAL(nnr,SP)
+    !
+    ! ... pairs of active columns of the same k-point
+    !
+    np = 0
+    j = 1
+    DO WHILE ( j <= nar )
+       np = np + 1
+       pa_h(1,np) = actr_h(j)
+       pa_h(2,np) = 0
+       IF ( j < nar ) THEN
+          IF ( kof( actr_h(j+1) ) == kof( actr_h(j) ) ) THEN
+             pa_h(2,np) = actr_h(j+1)
+             j = j + 1
+          ENDIF
+       ENDIF
+       j = j + 1
+    ENDDO
+    pa_d(:,1:np) = pa_h(:,1:np)
+    !
+    ! ... kinetic energy and local potential
+    !
+    DO p0 = 0, np-1, nfb
+       nb = MIN( nfb, np-p0 )
+       ip = pick_plan( nb )
+       !$cuf kernel do(2)
+       DO j = 1, nb
+          DO jg = 1, nhl
+             rc1 = pa_d(1,p0+j) ; rc2 = pa_d(2,p0+j)
+             c1 = rc1
+             IF ( rc1 > n2 ) c1 = rc1 - n2
+             ik = (c1-1)/nck + 1
+             IF ( jg <= nh_d(ik) ) THEN
+                za = CMPLX( hr_d(2*jg-1,rc1), hr_d(2*jg,rc1) )
+                zb = (0.0_SP, 0.0_SP)
+                IF ( rc2 > 0 ) zb = CMPLX( hr_d(2*jg-1,rc2), hr_d(2*jg,rc2) )
+                IF ( jg <= nself_d(ik) ) THEN
+                   psigs_d(nlh_d(jg,ik) + (j-1)*nnr) = rt2 * CMPLX( REAL(za), REAL(zb) )
+                ELSE
+                   psigs_d(nlh_d(jg,ik) + (j-1)*nnr) = za + s_i * zb
+                   psigs_d(nlm_d(jg,ik) + (j-1)*nnr) = CONJG(za) + s_i * CONJG(zb)
+                ENDIF
+             ENDIF
+          ENDDO
+       ENDDO
+       istat = cufftExecC2C( plans(ip), psigs_d, psics_d, CUFFT_INVERSE )
+       !$cuf kernel do(2)
+       DO j = 1, nb
+          DO jg = 1, nhl
+             rc1 = pa_d(1,p0+j)
+             c1 = rc1
+             IF ( rc1 > n2 ) c1 = rc1 - n2
+             ik = (c1-1)/nck + 1
+             IF ( jg <= nh_d(ik) ) THEN
+                psigs_d(nlh_d(jg,ik) + (j-1)*nnr) = (0.0_SP, 0.0_SP)
+                psigs_d(nlm_d(jg,ik) + (j-1)*nnr) = (0.0_SP, 0.0_SP)
+             ENDIF
+          ENDDO
+       ENDDO
+       !$cuf kernel do(2)
+       DO j = 1, nb
+          DO ir = 1, nnr
+             rc1 = pa_d(1,p0+j)
+             c1 = rc1
+             IF ( rc1 > n2 ) c1 = rc1 - n2
+             ik = (c1-1)/nck + 1
+             psics_d(ir + (j-1)*nnr) = psics_d(ir + (j-1)*nnr) * REAL( v_d(ir,spin_d(ik)), SP )
+          ENDDO
+       ENDDO
+       istat = cufftExecC2C( plans(ip), psics_d, psics_d, CUFFT_FORWARD )
+       !$cuf kernel do(2)
+       DO j = 1, nb
+          DO jg = 1, nhl
+             rc1 = pa_d(1,p0+j) ; rc2 = pa_d(2,p0+j)
+             c1 = rc1
+             IF ( rc1 > n2 ) c1 = rc1 - n2
+             ik = (c1-1)/nck + 1
+             IF ( jg <= nh_d(ik) ) THEN
+                z1 = psics_d(nlh_d(jg,ik) + (j-1)*nnr) * scale
+                IF ( jg <= nself_d(ik) ) THEN
+                   y1 = CMPLX( REAL(z1) * rt2i, 0.0_SP )
+                   y2 = CMPLX( AIMAG(z1) * rt2i, 0.0_SP )
+                ELSE
+                   z2 = psics_d(nlm_d(jg,ik) + (j-1)*nnr) * scale
+                   y1 = 0.5_SP * ( z1 + CONJG(z2) )
+                   y2 = ( z1 - CONJG(z2) ) * CMPLX( 0.0_SP, -0.5_SP )
+                ENDIF
+                ee = g2h_d(jg,ik) - er_d(c1)
+                tr_d(2*jg-1,rc1) = REAL( ee, SP ) * hr_d(2*jg-1,rc1) + REAL(y1)
+                tr_d(2*jg,rc1) = REAL( ee, SP ) * hr_d(2*jg,rc1) + AIMAG(y1)
+                IF ( rc2 > 0 ) THEN
+                   c2 = rc2
+                   IF ( rc2 > n2 ) c2 = rc2 - n2
+                   ee = g2h_d(jg,ik) - er_d(c2)
+                   tr_d(2*jg-1,rc2) = REAL( ee, SP ) * hr_d(2*jg-1,rc2) + REAL(y2)
+                   tr_d(2*jg,rc2) = REAL( ee, SP ) * hr_d(2*jg,rc2) + AIMAG(y2)
+                ENDIF
+             ELSE
+                tr_d(2*jg-1,rc1) = 0.0_SP
+                tr_d(2*jg,rc1) = 0.0_SP
+                IF ( rc2 > 0 ) THEN
+                   tr_d(2*jg-1,rc2) = 0.0_SP
+                   tr_d(2*jg,rc2) = 0.0_SP
+                ENDIF
+             ENDIF
+          ENDDO
+       ENDDO
+    ENDDO
+    !
+    ! ... nonlocal potential, e*S and projector on the valence bands
+    !
+    j1 = 1
+    DO WHILE ( j1 <= nar )
+       ik = kof( actr_h(j1) )
+       j2 = j1
+       DO WHILE ( j2 < nar )
+          IF ( kof( actr_h(j2+1) ) /= ik ) EXIT
+          j2 = j2 + 1
+       ENDDO
+       nak = j2 - j1 + 1
+       !$cuf kernel do(2)
+       DO jj = 1, nak
+          DO ir = 1, nrr
+             hcr_d(ir,jj) = hr_d(ir,actr_d(j1-1+jj))
+          ENDDO
+       ENDDO
+       istat = cublasSgemm( hblas, CUBLAS_OP_T, CUBLAS_OP_N, nw, nak, nrr, 2.0_SP, wr_d(1,1,ik), nrr, &
+                            hcr_d, nrr, 0.0_SP, cwr_d, nw )
+       IF ( istat /= 0 ) CALL errore( 'dfpt_dev', 'cublasSgemm failed', ABS(istat) )
+       !$cuf kernel do(2)
+       DO jj = 1, nak
+          DO iw = 1, nwl
+             rc = actr_d(j1-1+jj)
+             c = rc
+             IF ( rc > n2 ) c = rc - n2
+             IF ( iw <= nkl ) THEN
+                na = kbna_d(iw) ; iof = kbof_d(iw) ; ih = iw - iof
+                is = spin_d(ik) ; ee = er_d(c)
+                s = 0.0_DP
+                DO jh = 1, kbnh_d(iw)
+                   s = s + ( deeq_d(ih,jh,na,is) - ee * qq_d(ih,jh,na) ) * cwr_d(iof+jh,jj)
+                ENDDO
+                cw2r_d(iw,jj) = REAL( s, SP )
+             ELSEIF ( iw - nkl <= noccq_d(ik) ) THEN
+                cw2r_d(iw,jj) = REAL( apv, SP ) * cwr_d(iw,jj)
+             ELSE
+                cw2r_d(iw,jj) = 0.0_SP
+             ENDIF
+          ENDDO
+       ENDDO
+       istat = cublasSgemm( hblas, CUBLAS_OP_N, CUBLAS_OP_N, nrr, nak, nw, 1.0_SP, wr_d(1,1,ik), nrr, &
+                            cw2r_d, nw, 0.0_SP, tcr_d, nrr )
+       IF ( istat /= 0 ) CALL errore( 'dfpt_dev', 'cublasSgemm failed', ABS(istat) )
+       !$cuf kernel do(2)
+       DO jj = 1, nak
+          DO ir = 1, nrr
+             tr_d(ir,actr_d(j1-1+jj)) = tr_d(ir,actr_d(j1-1+jj)) + tcr_d(ir,jj)
+          ENDDO
+       ENDDO
+       j1 = j2 + 1
+    ENDDO
+    CALL stop_clock( 'dfptd_hpsi' )
+    !
+  END SUBROUTINE apply_h_real
+  !
+  !-----------------------------------------------------------------------
   SUBROUTINE isort_small( n, a )
     !-----------------------------------------------------------------------
     !! ascending sort of an integer list (the pending columns are found in
