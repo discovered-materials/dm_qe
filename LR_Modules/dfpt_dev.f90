@@ -51,6 +51,8 @@ MODULE dfpt_dev
   !
   PUBLIC :: dfpt_dev_begin, dfpt_dev_end, dfpt_dev_flush, dfpt_dev_invalidate, &
             dfpt_dev_in_session, dfpt_dev_sternheimer
+  PUBLIC :: dfpt_dev_lin_begin, dfpt_dev_lin_set_rhs, dfpt_dev_lin_solve, &
+            dfpt_dev_lin_get, dfpt_dev_lin_end
   PUBLIC :: dfpt_dev_set_eta, dfpt_dev_set_work
   PUBLIC :: dfpt_dev_keep_dpsi, dfpt_dev_agree, dfpt_dev_keeping, dfpt_dev_kept
 #if defined(__CUDA)
@@ -4401,6 +4403,115 @@ CONTAINS
     !
   END SUBROUTINE dfpt_dev_sternheimer
   !
+  !-----------------------------------------------------------------------
+  SUBROUTINE dfpt_dev_lin_begin( npert, ok )
+    !-----------------------------------------------------------------------
+    !! Start a plain linear solve ( H - e S + alpha_pv P_v ) x = b at q = 0
+    !! for npert right-hand sides per k-point and band (used for
+    !! P_c x |psi> of the electric-field perturbation). ok = .FALSE.: not
+    !! served, use the stock solver.
+    !
+    USE control_lr,  ONLY : lgamma
+    !
+    INTEGER, INTENT(IN) :: npert
+    LOGICAL, INTENT(OUT) :: ok
+    !
+    ok = .FALSE.
+    CALL release_kept( )
+    IF ( in_session ) CALL dfpt_dev_end( )
+    IF ( .NOT. lgamma ) RETURN
+    IF ( .NOT. dev_requested( ) ) RETURN
+    IF ( .NOT. dev_supported( ) ) RETURN
+    IF ( metal ) RETURN
+    IF ( .NOT. q_ready ) THEN
+       CALL setup_q( ok )
+       IF ( .NOT. ok ) THEN
+          CALL dfpt_dev_invalidate( )
+          RETURN
+       ENDIF
+       ok = .FALSE.
+    ENDIF
+    IF ( metal ) RETURN
+    IF ( .NOT. blas_ready ) CALL init_blas( )
+    CALL alloc_session( npert, .FALSE., ok )
+    IF ( .NOT. ok ) RETURN
+    g_d = c_zero ; dpsi_d = c_zero ; h_d = c_zero ; t_d = c_zero
+    in_session = .TRUE.
+    lin_session = .TRUE.
+    dpsi_dirty = .FALSE.
+    !
+  END SUBROUTINE dfpt_dev_lin_begin
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE dfpt_dev_lin_set_rhs( ik, ipert, rhs )
+    !-----------------------------------------------------------------------
+    !! right-hand side b of k-point ik and perturbation ipert (occupied bands)
+    !
+    USE wvfct,  ONLY : npwx, nbnd
+    !
+    INTEGER, INTENT(IN) :: ik, ipert
+    COMPLEX(DP), INTENT(IN) :: rhs(npwx,nbnd)
+    !
+    COMPLEX(DP), ALLOCATABLE :: stage(:,:)
+    INTEGER :: c0, ibnd
+    !
+    IF ( .NOT. lin_session ) CALL errore( 'dfpt_dev_lin_set_rhs', 'no session', 1 )
+    ALLOCATE( stage(npwxl,nbo) )
+    stage = c_zero
+    DO ibnd = 1, nocc_h(ik)
+       stage(1:npwq_h(ik),ibnd) = rhs(1:npwq_h(ik),ibnd)
+    ENDDO
+    c0 = ( (ik-1)*npe + (ipert-1) ) * nbo
+    g_d(:,c0+1:c0+nbo) = stage(:,:)
+    DEALLOCATE( stage )
+    !
+  END SUBROUTINE dfpt_dev_lin_set_rhs
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE dfpt_dev_lin_solve( thresh, all_conv )
+    !-----------------------------------------------------------------------
+    !! solve for all the right-hand sides, starting from zero
+    !
+    REAL(DP), INTENT(IN) :: thresh
+    LOGICAL, INTENT(OUT) :: all_conv
+    REAL(DP) :: avg_iter
+    !
+    IF ( .NOT. lin_session ) CALL errore( 'dfpt_dev_lin_solve', 'no session', 1 )
+    CALL start_clock( 'dfptd_lin' )
+    CALL cg_solve( .TRUE., thresh, all_conv, avg_iter )
+    CALL stop_clock( 'dfptd_lin' )
+    !
+  END SUBROUTINE dfpt_dev_lin_solve
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE dfpt_dev_lin_get( ik, ipert, sol )
+    !-----------------------------------------------------------------------
+    !! solution x of k-point ik and perturbation ipert
+    !
+    USE wvfct,  ONLY : npwx, nbnd
+    !
+    INTEGER, INTENT(IN) :: ik, ipert
+    COMPLEX(DP), INTENT(OUT) :: sol(npwx,nbnd)
+    !
+    COMPLEX(DP), ALLOCATABLE :: stage(:,:)
+    INTEGER :: c0
+    !
+    IF ( .NOT. lin_session ) CALL errore( 'dfpt_dev_lin_get', 'no session', 1 )
+    ALLOCATE( stage(npwxl,nbo) )
+    c0 = ( (ik-1)*npe + (ipert-1) ) * nbo
+    stage(:,:) = dpsi_d(:,c0+1:c0+nbo)
+    sol(:,:) = c_zero
+    sol(1:npwxl,1:nbo) = stage(:,:)
+    DEALLOCATE( stage )
+    !
+  END SUBROUTINE dfpt_dev_lin_get
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE dfpt_dev_lin_end( )
+    !-----------------------------------------------------------------------
+    IF ( lin_session ) CALL dfpt_dev_end( )
+  END SUBROUTINE dfpt_dev_lin_end
+  !
 #else
   !
   ! ... stubs for builds without CUDA: the engine is never active
@@ -4439,6 +4550,34 @@ CONTAINS
   !
   SUBROUTINE dfpt_dev_keep_dpsi( )
   END SUBROUTINE dfpt_dev_keep_dpsi
+  !
+  SUBROUTINE dfpt_dev_lin_begin( npert, ok )
+    INTEGER, INTENT(IN) :: npert
+    LOGICAL, INTENT(OUT) :: ok
+    ok = .FALSE.
+  END SUBROUTINE dfpt_dev_lin_begin
+  !
+  SUBROUTINE dfpt_dev_lin_set_rhs( ik, ipert, rhs )
+    USE wvfct,  ONLY : npwx, nbnd
+    INTEGER, INTENT(IN) :: ik, ipert
+    COMPLEX(DP), INTENT(IN) :: rhs(npwx,nbnd)
+  END SUBROUTINE dfpt_dev_lin_set_rhs
+  !
+  SUBROUTINE dfpt_dev_lin_solve( thresh, all_conv )
+    REAL(DP), INTENT(IN) :: thresh
+    LOGICAL, INTENT(OUT) :: all_conv
+    all_conv = .FALSE.
+  END SUBROUTINE dfpt_dev_lin_solve
+  !
+  SUBROUTINE dfpt_dev_lin_get( ik, ipert, sol )
+    USE wvfct,  ONLY : npwx, nbnd
+    INTEGER, INTENT(IN) :: ik, ipert
+    COMPLEX(DP), INTENT(OUT) :: sol(npwx,nbnd)
+    sol = (0.0_DP, 0.0_DP)
+  END SUBROUTINE dfpt_dev_lin_get
+  !
+  SUBROUTINE dfpt_dev_lin_end( )
+  END SUBROUTINE dfpt_dev_lin_end
   !
 #endif
   !
