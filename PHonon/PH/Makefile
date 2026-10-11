@@ -67,6 +67,7 @@ dvanqq.o \
 dvkb3.o \
 dvpsi_e.o \
 dvbare_dev.o \
+dyn_dev.o \
 dvqpsi_us.o \
 dvqpsi_us_only.o \
 dyndia.o \

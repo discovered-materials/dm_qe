@@ -54,6 +54,7 @@ set(src_ph
     PH/dvkb3.f90
     PH/dvpsi_e.f90
     PH/dvbare_dev.f90
+    PH/dyn_dev.f90
     PH/dvqpsi_us.f90
     PH/dvqpsi_us_only.f90
     PH/dyndia.f90

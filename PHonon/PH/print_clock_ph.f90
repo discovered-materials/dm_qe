@@ -162,6 +162,9 @@ subroutine print_clock_ph
   call print_clock ('dvq_dvloc')
   call print_clock ('dvq_coef')
   call print_clock ('dvq_d2h')
+  call print_clock ('drhodvloc')
+  call print_clock ('dynmat_nlcc')
+  call print_clock ('dyn_dform')
 
   WRITE( stdout, * )
   call print_clock ('firstfft')

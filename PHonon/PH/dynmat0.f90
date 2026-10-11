@@ -30,6 +30,7 @@ subroutine dynmat0_new
   USE lr_symm_base,  ONLY : minus_q, irotmq, nsymq, rtau
   USE ldaU,          ONLY : lda_plus_u
   USE dvbare_dev,    ONLY : dvbare_dev_reset
+  USE dyn_dev,       ONLY : dyn_dev_reset
 
   implicit none
 
@@ -44,6 +45,7 @@ subroutine dynmat0_new
   ! q kept on the device by dvbare_dev and dyn_dev are dropped here.
   !
   CALL dvbare_dev_reset()
+  CALL dyn_dev_reset()
   !
   IF ( .NOT. comp_irr(0) .or. done_irr(0) ) RETURN
   IF (rec_code_read > -30 ) RETURN
