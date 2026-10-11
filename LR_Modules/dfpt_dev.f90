@@ -418,6 +418,473 @@ CONTAINS
   END FUNCTION free_bytes
   !
   !-----------------------------------------------------------------------
+  SUBROUTINE setup_q( ok )
+    !-----------------------------------------------------------------------
+    !! Upload what the solver needs for the current q-point.
+    !
+    USE io_global,        ONLY : stdout
+    USE wvfct,            ONLY : nbnd, npwx, et, wg, g2kin
+    USE klist,            ONLY : xk, wk, ngk, igk_k, lgauss, ltetra, degauss, ngauss
+    USE ener,             ONLY : ef
+    USE lsda_mod,         ONLY : lsda, nspin, isk
+    USE scf,              ONLY : vrs
+    USE uspp,             ONLY : nkb, vkb, okvan, deeq, qq_at, ofsbeta
+    USE uspp_param,       ONLY : nh, nhm
+    USE uspp_init,        ONLY : init_us_2
+    USE ions_base,        ONLY : nat, ityp
+    USE cell_base,        ONLY : omega
+    USE fft_base,         ONLY : dffts
+    USE qpoint,           ONLY : nksq, ikks, ikqs
+    USE control_lr,       ONLY : nbnd_occ, alpha_pv, lgamma
+    USE units_lr,         ONLY : iuwfc, lrwfc
+    USE buffers,          ONLY : get_buffer
+    USE lrus,             ONLY : becp1
+    USE dfpt_tetra_mod,   ONLY : dfpt_tetra_beta
+    USE gvect,            ONLY : g
+    USE gvecw,            ONLY : qcutz
+    USE cell_base,        ONLY : tpiba2
+    USE beta_cache,       ONLY : beta_cache_index, bc_d
+    !
+    LOGICAL, INTENT(OUT) :: ok
+    !
+    INTEGER :: ik, ikk, ikq, npw, npwq, ibnd, jbnd, ig, na, ih, jh, ikb, istat, is, ir
+    INTEGER :: lenv, ierr, nzmax, kcm, k1, k2, kb, jc, nbql, ikl
+    LOGICAL :: chunked
+    REAL(DP) :: tp2
+    INTEGER, ALLOCATABLE :: nlk_c(:,:), nlq_c(:,:), ibc_c(:)
+    REAL(DP), ALLOCATABLE :: kqg_c(:,:,:)
+    COMPLEX(DP), ALLOCATABLE :: pk_c(:,:,:), pq_c(:,:,:), bec_c(:,:,:)
+    INTEGER, ALLOCATABLE, DEVICE :: ibc_d(:)
+    COMPLEX(DP), ALLOCATABLE, DEVICE :: tq_d(:,:,:)
+    CHARACTER(LEN=16) :: envval
+    REAL(DP), ALLOCATABLE :: etq_h(:,:), kqg_h(:,:)
+    REAL(DP) :: need, avail, wg1, w0g, wgp, deltae, theta
+    REAL(DP), EXTERNAL :: w0gauss, wgauss
+    COMPLEX(DP), ALLOCATABLE :: wfc_h(:,:), bec_h(:,:)
+    INTEGER, ALLOCATABLE :: nl_h(:), ivec(:)
+    REAL(DP), ALLOCATABLE :: wwg_h(:,:,:), wg1_h(:,:), et_h(:,:), rvec(:)
+    COMPLEX(DP), ALLOCATABLE, DEVICE :: bq_d(:,:), bq2_d(:,:)
+    !
+    CALL start_clock( 'dfptd_setup' )
+    ok = .FALSE.
+    !
+    nks = nksq ; npwxl = npwx ; nkbl = nkb ; nhml = nhm ; natl = nat
+    nnr = dffts%nnr ; nr1 = dffts%nr1 ; nr2 = dffts%nr2 ; nr3 = dffts%nr3
+    nspl = nspin
+    lus = okvan
+    metal = lgauss .OR. ltetra
+    alpha_pv_l = alpha_pv
+    lgamma_l = lgamma
+    keep_veto = metal .AND. lgamma
+    nbo = 0
+    DO ik = 1, nks
+       nbo = MAX( nbo, nbnd_occ(ikks(ik)) )
+    ENDDO
+    nbq = nbo
+    IF ( metal ) nbq = nbnd
+    DO ik = 1, nks
+       nbq = MAX( nbq, nbnd_occ(ikqs(ik)) )
+    ENDDO
+    !
+    ! ... insulators: empty bands found in the wavefunction file serve the
+    ! ... spectral preconditioner (QE_PH_NZ = largest number used; 0: none)
+    !
+    zoff = nbnd
+    DO ik = 1, nks
+       zoff = MIN( zoff, nbnd_occ(ikqs(ik)) )
+    ENDDO
+    nz = 0
+    IF ( .NOT. metal ) THEN
+       nz = nbnd - zoff
+       CALL get_environment_variable( 'QE_PH_NZ', envval, lenv, ierr )
+       IF ( ierr == 0 .AND. lenv > 0 ) THEN
+          READ( envval, *, IOSTAT=ierr ) nzmax
+          IF ( ierr == 0 .AND. nzmax >= 0 ) nz = MIN( nz, nzmax )
+       ENDIF
+       IF ( nz > 0 ) nbq = MAX( nbq, zoff + nz )
+       nz = nbq - zoff
+    ENDIF
+    use_z = nz > 0 .AND. .NOT. metal
+    nw = nkb + nbq
+    !
+    ! ... device memory needed at the q level, without the cache of psi(r)
+    !
+    need = 16.0_DP * REAL(npwx,DP) * REAL(nks,DP) * ( nbo + nw )
+    IF ( lus ) need = need + 16.0_DP * REAL(npwx,DP) * REAL(nks,DP) * nbq
+    need = need + 16.0_DP * REAL(npwx,DP) * nks
+    avail = free_bytes( )
+    IF ( need > 0.5_DP * avail ) THEN
+       WRITE( stdout, '(5x,"DFPT device engine: not enough device memory (",f8.1," GB needed), &
+            &stock solver is used")' ) need / 1.0E9_DP
+       CALL stop_clock( 'dfptd_setup' )
+       RETURN
+    ENDIF
+    !
+    ALLOCATE( npw_h(nks), npwq_h(nks), nocc_h(nks), noccq_h(nks), spin_h(nks), wk_h(nks) )
+    DO ik = 1, nks
+       ikk = ikks(ik) ; ikq = ikqs(ik)
+       npw_h(ik) = ngk(ikk) ; npwq_h(ik) = ngk(ikq)
+       nocc_h(ik) = nbnd_occ(ikk) ; noccq_h(ik) = nbnd_occ(ikq)
+       spin_h(ik) = 1
+       IF ( lsda ) spin_h(ik) = isk(ikk)
+       wk_h(ik) = wk(ikk)
+    ENDDO
+    ALLOCATE( npw_d(nks), npwq_d(nks), nocc_d(nks), noccq_d(nks), spin_d(nks), wgt_d(nks) )
+    npw_d = npw_h ; npwq_d = npwq_h ; nocc_d = nocc_h ; noccq_d = noccq_h ; spin_d = spin_h
+    ALLOCATE( rvec(nks) )
+    rvec(:) = 2.0_DP * wk_h(:) / omega
+    wgt_d = rvec
+    DEALLOCATE( rvec )
+    !
+    ALLOCATE( nlk_d(npwx,nks), nlq_d(npwx,nks), g2_d(npwx,nks), kqg_d(3,npwx,nks) )
+    ALLOCATE( psik_d(npwx,nbo,nks), w_d(npwx,nw,nks) )
+    IF ( lus ) ALLOCATE( evq_d(npwx,nbq,nks), becp1_d(MAX(nkb,1),nbo,nks) )
+    ALLOCATE( et_d(nbo,nks), eprec_d(nbo,nks), wwg_d(nbq,nbo,nks), wg1_d(nbo,nks) )
+    ALLOCATE( deeq_d(nhm,nhm,nat,nspin), qq_d(nhm,nhm,nat) )
+    ALLOCATE( kbna_d(MAX(nkb,1)), kbof_d(MAX(nkb,1)), kbnh_d(MAX(nkb,1)) )
+    ALLOCATE( v_d(nnr,nspin) )
+    !
+    ! ... D, q and the local potential: the device copies that h_psi and s_psi use
+    !
+    !$acc parallel loop collapse(4) present(deeq)
+    DO is = 1, nspl
+       DO na = 1, natl
+          DO jh = 1, nhml
+             DO ih = 1, nhml
+                deeq_d(ih,jh,na,is) = deeq(ih,jh,na,is)
+             ENDDO
+          ENDDO
+       ENDDO
+    ENDDO
+    !$acc parallel loop collapse(3) present(qq_at)
+    DO na = 1, natl
+       DO jh = 1, nhml
+          DO ih = 1, nhml
+             qq_d(ih,jh,na) = qq_at(ih,jh,na)
+          ENDDO
+       ENDDO
+    ENDDO
+    !$acc parallel loop collapse(2) present(vrs)
+    DO is = 1, nspl
+       DO ir = 1, nnr
+          v_d(ir,is) = vrs(ir,is)
+       ENDDO
+    ENDDO
+    IF ( nkb > 0 ) THEN
+       ALLOCATE( ivec(nkb) )
+       DO na = 1, nat
+          DO ih = 1, nh(ityp(na))
+             ivec(ofsbeta(na)+ih) = na
+          ENDDO
+       ENDDO
+       kbna_d = ivec
+       DO na = 1, nat
+          DO ih = 1, nh(ityp(na))
+             ivec(ofsbeta(na)+ih) = ofsbeta(na)
+          ENDDO
+       ENDDO
+       kbof_d = ivec
+       DO na = 1, nat
+          DO ih = 1, nh(ityp(na))
+             ivec(ofsbeta(na)+ih) = nh(ityp(na))
+          ENDDO
+       ENDDO
+       kbnh_d = ivec
+       DEALLOCATE( ivec )
+    ENDIF
+    !
+    ! ... weights of the projector on the valence manifold (see orthogonalize)
+    !
+    ALLOCATE( wwg_h(nbq,nbo,nks), wg1_h(nbo,nks), et_h(nbo,nks) )
+    wwg_h = 0.0_DP ; wg1_h = 0.0_DP ; et_h = 0.0_DP
+    DO ik = 1, nks
+       ikk = ikks(ik) ; ikq = ikqs(ik)
+       DO ibnd = 1, nbnd_occ(ikk)
+          et_h(ibnd,ik) = et(ibnd,ikk)
+          IF ( lgauss ) THEN
+             wg1 = wgauss( (ef-et(ibnd,ikk)) / degauss, ngauss )
+             w0g = w0gauss( (ef-et(ibnd,ikk)) / degauss, ngauss ) / degauss
+             DO jbnd = 1, nbnd
+                wgp = wgauss( (ef-et(jbnd,ikq)) / degauss, ngauss )
+                deltae = et(jbnd,ikq) - et(ibnd,ikk)
+                theta = wgauss( deltae / degauss, 0 )
+                wwg_h(jbnd,ibnd,ik) = wg1 * (1.0_DP - theta) + wgp * theta
+                IF ( jbnd <= nbnd_occ(ikq) ) THEN
+                   IF ( ABS(deltae) > 1.0E-5_DP ) THEN
+                      wwg_h(jbnd,ibnd,ik) = wwg_h(jbnd,ibnd,ik) + alpha_pv * theta * (wgp - wg1) / deltae
+                   ELSE
+                      wwg_h(jbnd,ibnd,ik) = wwg_h(jbnd,ibnd,ik) - alpha_pv * theta * w0g
+                   ENDIF
+                ENDIF
+             ENDDO
+             wg1_h(ibnd,ik) = wg1
+          ELSEIF ( ltetra ) THEN
+             wg1_h(ibnd,ik) = wg(ibnd,ikk) / wk(ikk)
+             DO jbnd = 1, nbnd
+                wwg_h(jbnd,ibnd,ik) = dfpt_tetra_beta(jbnd,ibnd,ikk)
+             ENDDO
+          ELSE
+             wg1_h(ibnd,ik) = 1.0_DP
+             wwg_h(1:nbnd_occ(ikq),ibnd,ik) = 1.0_DP
+          ENDIF
+       ENDDO
+    ENDDO
+    wwg_d = wwg_h ; wg1_d = wg1_h ; et_d = et_h
+    DEALLOCATE( wwg_h, wg1_h, et_h )
+    ALLOCATE( etq_h(nbq,nks), etq_d(nbq,nks) )
+    DO ik = 1, nks
+       etq_h(1:nbq,ik) = et(1:nbq,ikqs(ik))
+    ENDDO
+    etq_d = etq_h
+    DEALLOCATE( etq_h )
+    !
+    ! ... wavefunctions, beta functions, kinetic energies, FFT maps
+    !
+    ALLOCATE( wfc_h(npwx,nbnd), nl_h(npwx), kqg_h(3,npwx) )
+    IF ( lus ) ALLOCATE( bec_h(MAX(nkb,1),nbo), bq_d(MAX(nkb,1),nbq), bq2_d(MAX(nkb,1),nbq) )
+    psik_d = c_zero
+    w_d = c_zero
+    IF ( lus ) evq_d = c_zero
+    g2_d = 0.0_DP
+    !
+    ! ... with many k-points: host data gathered and uploaded in chunks of
+    ! ... k-points, beta functions from the cache of all k-points, one kernel
+    ! ... per chunk (the loop below costs about 0.3 ms per k-point in calls
+    ! ... and transfers alone)
+    !
+    chunked = nks >= 8 .AND. qcutz <= 0.0_DP
+    IF ( chunked .AND. nkb > 0 ) THEN
+       DO ik = 1, nks
+          ikq = ikqs(ik)
+          IF ( beta_cache_index( ngk(ikq), npwx, nkb, igk_k(1,ikq), xk(1,ikq) ) == 0 ) chunked = .FALSE.
+       ENDDO
+    ENDIF
+    IF ( chunked ) THEN
+       kcm = MAX( 1, MIN( nks, INT( 5.0E8_DP / ( 16.0_DP * REAL(npwx,DP) * MAX( nbo, nbq ) ) ) ) )
+       ALLOCATE( nlk_c(npwx,kcm), nlq_c(npwx,kcm), kqg_c(3,npwx,kcm), pk_c(npwx,nbo,kcm), &
+                 pq_c(npwx,nbq,kcm), ibc_c(kcm), ibc_d(kcm), tq_d(npwx,nbq,kcm) )
+       IF ( lus ) ALLOCATE( bec_c(MAX(nkb,1),nbo,kcm) )
+       tp2 = tpiba2 ; nbql = nbq
+       DO k1 = 1, nks, kcm
+          k2 = MIN( nks, k1+kcm-1 )
+          kb = k2 - k1 + 1
+          nlk_c = 1 ; nlq_c = 1 ; kqg_c = 0.0_DP ; ibc_c = 1
+          DO ik = k1, k2
+             jc = ik - k1 + 1
+             ikk = ikks(ik) ; ikq = ikqs(ik)
+             npw = ngk(ikk) ; npwq = ngk(ikq)
+             DO ig = 1, npw
+                nlk_c(ig,jc) = dffts%nl(igk_k(ig,ikk))
+             ENDDO
+             DO ig = 1, npwq
+                nlq_c(ig,jc) = dffts%nl(igk_k(ig,ikq))
+                kqg_c(:,ig,jc) = xk(:,ikq) + g(:,igk_k(ig,ikq))
+             ENDDO
+             CALL get_buffer( wfc_h, lrwfc, iuwfc, ikk )
+             wfc_h(npw+1:npwx,:) = c_zero
+             IF ( nocc_h(ik) < nbo ) wfc_h(:,nocc_h(ik)+1:nbo) = c_zero
+             pk_c(:,:,jc) = wfc_h(:,1:nbo)
+             CALL get_buffer( wfc_h, lrwfc, iuwfc, ikq )
+             wfc_h(npwq+1:npwx,:) = c_zero
+             pq_c(:,:,jc) = wfc_h(:,1:nbq)
+             IF ( lus ) THEN
+                bec_c(:,:,jc) = c_zero
+                DO ibnd = 1, nocc_h(ik)
+                   bec_c(:,ibnd,jc) = becp1(ik)%k(:,ibnd)
+                ENDDO
+             ENDIF
+             IF ( nkb > 0 ) ibc_c(jc) = beta_cache_index( npwq, npwx, nkb, igk_k(1,ikq), xk(1,ikq) )
+          ENDDO
+          nlk_d(:,k1:k2) = nlk_c(:,1:kb)
+          nlq_d(:,k1:k2) = nlq_c(:,1:kb)
+          kqg_d(:,:,k1:k2) = kqg_c(:,:,1:kb)
+          psik_d(:,:,k1:k2) = pk_c(:,:,1:kb)
+          tq_d(:,:,1:kb) = pq_c(:,:,1:kb)
+          ibc_d = ibc_c
+          IF ( lus ) THEN
+             becp1_d(:,:,k1:k2) = bec_c(:,:,1:kb)
+             !$cuf kernel do(3)
+             DO ik = k1, k2
+                DO ibnd = 1, nbql
+                   DO ig = 1, npwxl
+                      evq_d(ig,ibnd,ik) = tq_d(ig,ibnd,ik-k1+1)
+                   ENDDO
+                ENDDO
+             ENDDO
+          ELSE
+             !$cuf kernel do(3)
+             DO ik = k1, k2
+                DO ibnd = 1, nbql
+                   DO ig = 1, npwxl
+                      w_d(ig,nkbl+ibnd,ik) = tq_d(ig,ibnd,ik-k1+1)
+                   ENDDO
+                ENDDO
+             ENDDO
+          ENDIF
+          IF ( nkb > 0 ) THEN
+             !$cuf kernel do(3)
+             DO ik = k1, k2
+                DO ikb = 1, nkbl
+                   DO ig = 1, npwxl
+                      w_d(ig,ikb,ik) = bc_d(ig,ikb,ibc_d(ik-k1+1))
+                   ENDDO
+                ENDDO
+             ENDDO
+          ENDIF
+          !$cuf kernel do(2)
+          DO ik = k1, k2
+             DO ig = 1, npwxl
+                IF ( ig <= npwq_d(ik) ) g2_d(ig,ik) = ( kqg_d(1,ig,ik)*kqg_d(1,ig,ik) + &
+                     kqg_d(2,ig,ik)*kqg_d(2,ig,ik) + kqg_d(3,ig,ik)*kqg_d(3,ig,ik) ) * tp2
+             ENDDO
+          ENDDO
+          IF ( lus ) THEN
+             ! S * psi_{k+q}
+             IF ( .NOT. blas_ready ) CALL init_blas( )
+             DO ik = k1, k2
+                istat = cublasZgemm( hblas, CUBLAS_OP_C, CUBLAS_OP_N, nkb, nbq, npwx, c_one, &
+                                     w_d(1,1,ik), npwx, evq_d(1,1,ik), npwx, c_zero, bq_d, nkb )
+                CALL apply_qq( bq_d, bq2_d, nbq )
+                ikl = ik
+                !$cuf kernel do(2)
+                DO ibnd = 1, nbql
+                   DO ig = 1, npwxl
+                      w_d(ig,nkbl+ibnd,ikl) = evq_d(ig,ibnd,ikl)
+                   ENDDO
+                ENDDO
+                istat = cublasZgemm( hblas, CUBLAS_OP_N, CUBLAS_OP_N, npwx, nbq, nkb, c_one, &
+                                     w_d(1,1,ik), npwx, bq2_d, nkb, c_one, w_d(1,nkb+1,ik), npwx )
+             ENDDO
+          ENDIF
+       ENDDO
+       DEALLOCATE( nlk_c, nlq_c, kqg_c, pk_c, pq_c, ibc_c, ibc_d, tq_d )
+       IF ( lus ) DEALLOCATE( bec_c )
+    ELSE
+    !
+    DO ik = 1, nks
+       ikk = ikks(ik) ; ikq = ikqs(ik)
+       npw = ngk(ikk) ; npwq = ngk(ikq)
+       !
+       nl_h(:) = 1
+       DO ig = 1, npw
+          nl_h(ig) = dffts%nl(igk_k(ig,ikk))
+       ENDDO
+       nlk_d(:,ik) = nl_h(:)
+       nl_h(:) = 1
+       DO ig = 1, npwq
+          nl_h(ig) = dffts%nl(igk_k(ig,ikq))
+       ENDDO
+       nlq_d(:,ik) = nl_h(:)
+       kqg_h(:,:) = 0.0_DP
+       DO ig = 1, npwq
+          kqg_h(:,ig) = xk(:,ikq) + g(:,igk_k(ig,ikq))
+       ENDDO
+       kqg_d(:,:,ik) = kqg_h(:,:)
+       !
+       CALL get_buffer( wfc_h, lrwfc, iuwfc, ikk )
+       wfc_h(npw+1:npwx,:) = c_zero
+       IF ( nocc_h(ik) < nbo ) wfc_h(:,nocc_h(ik)+1:nbo) = c_zero
+       psik_d(:,1:nbo,ik) = wfc_h(:,1:nbo)
+       !
+       CALL get_buffer( wfc_h, lrwfc, iuwfc, ikq )
+       wfc_h(npwq+1:npwx,:) = c_zero
+       IF ( lus ) THEN
+          evq_d(:,1:nbq,ik) = wfc_h(:,1:nbq)
+          DO ibnd = 1, nocc_h(ik)
+             bec_h(:,ibnd) = becp1(ik)%k(:,ibnd)
+          ENDDO
+          IF ( nocc_h(ik) < nbo ) bec_h(:,nocc_h(ik)+1:nbo) = c_zero
+          becp1_d(:,:,ik) = bec_h(:,:)
+       ELSE
+          w_d(:,nkb+1:nw,ik) = wfc_h(:,1:nbq)
+       ENDIF
+       !
+       IF ( nkb > 0 ) THEN
+          CALL init_us_2( npwq, igk_k(1,ikq), xk(1,ikq), vkb, .TRUE. )
+          !$acc parallel loop collapse(2) present(vkb)
+          DO ikb = 1, nkbl
+             DO ig = 1, npwxl
+                IF ( ig <= npwq ) w_d(ig,ikb,ik) = vkb(ig,ikb)
+             ENDDO
+          ENDDO
+       ENDIF
+       !
+       CALL g2_kin( ikq )
+       !$acc parallel loop present(g2kin)
+       DO ig = 1, npwxl
+          IF ( ig <= npwq ) g2_d(ig,ik) = g2kin(ig)
+       ENDDO
+       !
+       ! ... S * psi_{k+q}
+       !
+       IF ( lus ) THEN
+          IF ( .NOT. blas_ready ) CALL init_blas( )
+          istat = cublasZgemm( hblas, CUBLAS_OP_C, CUBLAS_OP_N, nkb, nbq, npwx, c_one, &
+                               w_d(1,1,ik), npwx, evq_d(1,1,ik), npwx, c_zero, bq_d, nkb )
+          CALL apply_qq( bq_d, bq2_d, nbq )
+          !$cuf kernel do(2)
+          DO ibnd = 1, nbq
+             DO ig = 1, npwxl
+                w_d(ig,nkbl+ibnd,ik) = evq_d(ig,ibnd,ik)
+             ENDDO
+          ENDDO
+          istat = cublasZgemm( hblas, CUBLAS_OP_N, CUBLAS_OP_N, npwx, nbq, nkb, c_one, &
+                               w_d(1,1,ik), npwx, bq2_d, nkb, c_one, w_d(1,nkb+1,ik), npwx )
+       ENDIF
+       !
+    ENDDO
+    ENDIF
+    DEALLOCATE( wfc_h, nl_h, kqg_h )
+    IF ( lus ) DEALLOCATE( bec_h, bq_d, bq2_d )
+    !
+    ! ... preconditioner: eprec = 1.35 <psi_{k+q}|T|psi_{k+q}> (h_prec)
+    !
+    CALL set_eprec( )
+    !
+    ! ... FFT batch size and work arrays
+    !
+    nfb = MAX( 1, MIN( nbo*3*nks, 33554432 / nnr, 8192 ) )
+    need = 2.0_DP * 16.0_DP * REAL(nnr,DP) * nfb
+    IF ( need > 0.25_DP * free_bytes( ) ) nfb = MAX( 1, INT( 0.25_DP * free_bytes( ) / (32.0_DP*nnr) ) )
+    ALLOCATE( psig_d(nnr*nfb), psic_d(nnr*nfb) )
+    psig_d = c_zero
+    CALL make_plans( )
+    !
+    ! ... psi_k(r) of the occupied bands, when it fits comfortably
+    !
+    need = 16.0_DP * REAL(nnr,DP) * REAL(nbo,DP) * nks
+    have_psir = need < 0.35_DP * free_bytes( )
+    IF ( have_psir ) THEN
+       ALLOCATE( psir_d(nnr,nbo,nks) )
+       CALL fill_psir( )
+    ELSE
+       ALLOCATE( psi2_d(nnr*nfb) )
+    ENDIF
+    !
+    batched_gemm = nks > 2
+    !
+    ! ... mixed precision (QE_PH_SP=0: all in double precision)
+    !
+    CALL get_environment_variable( 'QE_PH_SP', envval, lenv, ierr )
+    use_sp = .NOT. ( ierr == 0 .AND. lenv > 0 .AND. envval(1:1) == '0' )
+    need = 8.0_DP * REAL(npwx,DP) * REAL(nks,DP) * nw + 16.0_DP * REAL(nnr,DP) * nfb
+    IF ( use_sp .AND. need > 0.3_DP * free_bytes( ) ) use_sp = .FALSE.
+    IF ( use_sp ) CALL setup_sp( )
+    IF ( use_sp ) CALL setup_real( )
+    IF ( use_sp .AND. .NOT. use_real ) CALL setup_lowg( )
+    IF ( use_real ) CALL setup_lowg_real( )
+    q_ready = .TRUE.
+    ok = .TRUE.
+    WRITE( stdout, '(/,5x,"DFPT device engine: ",i6," k-points, ",i5," bands, ",i4," FFTs per batch,",&
+         &" psi(r) cached: ",l1)' ) nks, nbo, nfb, have_psir
+    IF ( use_z ) WRITE( stdout, '(5x,"DFPT device engine: ",i5," empty bands in the preconditioner")' ) nz
+    IF ( use_sp ) WRITE( stdout, '(5x,"DFPT device engine: single-precision iterations on the ", &
+         &"double-precision residual")' )
+    CALL stop_clock( 'dfptd_setup' )
+    !
+  END SUBROUTINE setup_q
+  !
+  !-----------------------------------------------------------------------
   SUBROUTINE init_blas( )
     !-----------------------------------------------------------------------
     INTEGER :: istat
