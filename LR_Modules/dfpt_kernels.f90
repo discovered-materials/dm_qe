@@ -121,6 +121,7 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
                                     sternheimer_kernel_twochem, dbecsum_cond, &
                                     dbecsum_cond_nc, drhos_cond, ef_shift_wfc_twochem
    USE localdos_mod,         ONLY : localdos_new
+   USE dfpt_dev_grid,        ONLY : dfpt_dev_dv_of_drho
    !
    IMPLICIT NONE
    !
@@ -168,6 +169,8 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
    !
    LOGICAL :: all_conv
    !! True if sternheimer_kernel is converged at all k points and perturbations
+   LOGICAL :: dv_done
+   !! True if the response potential was computed on the device
    logical :: lmetq0,     & ! true if xq=(0,0,0) in a metal
       first_iter    ! true if first iteration where induced rho is not yet calculated
    LOGICAL :: finite_freq
@@ -378,8 +381,16 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
          ! No local field effect: set dvscf to 0
          dvscftmp(:, :, :) = (0.d0, 0.d0)
       ELSE
-         ! Compute the response HXC potential
+         ! Compute the response HXC potential (all perturbations at once on the device
+         ! when the case is served)
+         IF (ALLOCATED(dfpt_data%drhoc)) THEN
+            CALL dfpt_dev_dv_of_drho(npert, dfpt_data%drhop, dvscftmp, dv_done, &
+                                     drhoc = dfpt_data%drhoc)
+         ELSE
+            CALL dfpt_dev_dv_of_drho(npert, dfpt_data%drhop, dvscftmp, dv_done)
+         ENDIF
          DO ipert = 1, npert
+            IF (dv_done) EXIT
             CALL zcopy(dfftp%nnr*nspin_mag, dfpt_data%drhop(1,1,ipert), 1, dvscftmp(1,1,ipert), 1)
             IF (ALLOCATED(dfpt_data%drhoc)) THEN
                ! Consider core charge perturbation if present
