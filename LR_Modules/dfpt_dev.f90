@@ -3599,6 +3599,208 @@ CONTAINS
     !
   END SUBROUTINE add_zprec
   !
+  !-----------------------------------------------------------------------
+  SUBROUTINE cg_solve( zero_guess, thresh, all_conv, avg_iter )
+    !-----------------------------------------------------------------------
+    !! Preconditioned conjugate gradient of cgsolve_all on all live columns:
+    !! solves ( H - e S + alpha_pv P_v ) dpsi = d0psi. On input g_d holds
+    !! d0psi and dpsi_d the starting guess (ignored and set to zero if
+    !! zero_guess); on output dpsi_d holds the solution.
+    !
+    USE io_global,        ONLY : stdout
+    USE mp,               ONLY : mp_sum
+    USE mp_pools,         ONLY : inter_pool_comm
+    !
+    LOGICAL, INTENT(IN) :: zero_guess
+    REAL(DP), INTENT(IN) :: thresh
+    LOGICAL, INTENT(OUT) :: all_conv
+    REAL(DP), INTENT(OUT) :: avg_iter
+    !
+    INTEGER :: iter, nact, nact_new, j, c, ik, ig, kp, tot_iter, tot_calls, nck, n1
+    REAL(DP) :: lam, s, s2, ep, gam, anorm
+    COMPLEX(DP) :: gg, zz
+    REAL(DP), ALLOCATABLE :: rho_h(:), kter_eff(:), anorm_kp(:), anorm0(:)
+    INTEGER, ALLOCATABLE :: nun(:)
+    REAL(DP) :: eta
+    !
+    IF ( use_sp ) THEN
+       CALL cg_solve_sp( zero_guess, thresh, all_conv, avg_iter )
+       RETURN
+    ENDIF
+    nck = ncolk ; n1 = npwxl
+    eta = eta_rel
+    IF ( zero_guess ) eta = 0.0_DP
+    CALL start_clock( 'dfptd_cg' )
+    ALLOCATE( rho_h(ncol), kter_eff(nks*npe), nun(nks*npe), anorm_kp(nks*npe), anorm0(ncol) )
+    kter_eff = 0.0_DP ; anorm_kp = 0.0_DP
+    nact = nlive
+    act_h(1:nact) = live_h(1:nact)
+    act_d = act_h
+    !
+    ! ... starting gradient g = A dpsi - d0psi
+    !
+    IF ( zero_guess ) THEN
+       !$cuf kernel do(2)
+       DO c = 1, ncol
+          DO ig = 1, n1
+             g_d(ig,c) = - g_d(ig,c)
+             dpsi_d(ig,c) = (0.0_DP, 0.0_DP)
+          ENDDO
+       ENDDO
+    ELSE
+       CALL apply_h( nact, dpsi_d, t_d )
+       !$acc parallel loop gang private(c)
+       DO j = 1, nact
+          c = act_d(j)
+          !$acc loop vector
+          DO ig = 1, n1
+             g_d(ig,c) = t_d(ig,c) - g_d(ig,c)
+          ENDDO
+       ENDDO
+    ENDIF
+    dpsi_dirty = .TRUE.
+    !
+    all_conv = .TRUE.
+    DO iter = 1, maxter
+       !
+       ! ... new position and gradient (from the second iteration on),
+       ! ... preconditioned gradient in t, rho = <t|g>
+       !
+       IF ( iter == 1 ) THEN
+          !$acc parallel loop gang private(c, ik, ep, s)
+          DO j = 1, nact
+             c = act_d(j)
+             ik = (c-1)/nck + 1
+             ep = ep_d(c)
+             s = 0.0_DP
+             !$acc loop vector reduction(+:s) private(gg, zz)
+             DO ig = 1, n1
+                gg = g_d(ig,c)
+                zz = gg / MAX( 1.0_DP, g2_d(ig,ik)/ep )
+                t_d(ig,c) = zz
+                s = s + DBLE( CONJG(zz) * gg )
+             ENDDO
+             rho_d(c) = s
+             rhoc_d(j) = s
+          ENDDO
+       ELSE
+          !$acc parallel loop gang private(c, ik, ep, s, lam)
+          DO j = 1, nact
+             c = act_d(j)
+             ik = (c-1)/nck + 1
+             ep = ep_d(c)
+             lam = - a_d(c) / c_d(c)
+             s = 0.0_DP
+             !$acc loop vector reduction(+:s) private(gg, zz)
+             DO ig = 1, n1
+                dpsi_d(ig,c) = dpsi_d(ig,c) + lam * h_d(ig,c)
+                gg = g_d(ig,c) + lam * t_d(ig,c)
+                g_d(ig,c) = gg
+                zz = gg / MAX( 1.0_DP, g2_d(ig,ik)/ep )
+                t_d(ig,c) = zz
+                s = s + DBLE( CONJG(zz) * gg )
+             ENDDO
+             rhoold_d(c) = rho_d(c)
+             rho_d(c) = s
+             rhoc_d(j) = s
+          ENDDO
+       ENDIF
+       IF ( use_z ) CALL add_zprec( nact )
+       rho_h(1:nact) = rhoc_d(1:nact)
+       !
+       ! ... convergence of each column; iteration count as in cgsolve_all
+       !
+       nun = 0
+       DO j = 1, nact
+          kp = (act_h(j)-1)/nbo + 1
+          nun(kp) = nun(kp) + 1
+       ENDDO
+       DO kp = 1, nks*npe
+          ik = (kp-1)/npe + 1
+          IF ( nun(kp) > 0 ) kter_eff(kp) = kter_eff(kp) + DBLE(nun(kp)) / DBLE(nocc_h(ik))
+       ENDDO
+       nact_new = 0
+       DO j = 1, nact
+          anorm = SQRT( rho_h(j) )
+          kp = (act_h(j)-1)/nbo + 1
+          IF ( iter == 1 ) anorm0(act_h(j)) = anorm
+          IF ( .NOT. ( anorm < thresh .OR. anorm < eta * anorm0(act_h(j)) ) ) THEN
+             nact_new = nact_new + 1
+             act_h(nact_new) = act_h(j)
+             anorm_kp(kp) = MAX( anorm_kp(kp), anorm )
+          ENDIF
+       ENDDO
+       IF ( nact_new /= nact ) THEN
+          nact = nact_new
+          IF ( nact > 0 ) act_d(1:nact) = act_h(1:nact)
+       ENDIF
+       IF ( nact == 0 ) EXIT
+       IF ( iter == maxter ) THEN
+          all_conv = .FALSE.
+          EXIT
+       ENDIF
+       anorm_kp = 0.0_DP
+       !
+       ! ... search direction h = -t + gamma h
+       !
+       IF ( iter == 1 ) THEN
+          !$acc parallel loop gang private(c)
+          DO j = 1, nact
+             c = act_d(j)
+             !$acc loop vector
+             DO ig = 1, n1
+                h_d(ig,c) = - t_d(ig,c)
+             ENDDO
+          ENDDO
+       ELSE
+          !$acc parallel loop gang private(c, gam)
+          DO j = 1, nact
+             c = act_d(j)
+             gam = rho_d(c) / rhoold_d(c)
+             !$acc loop vector
+             DO ig = 1, n1
+                h_d(ig,c) = - t_d(ig,c) + gam * h_d(ig,c)
+             ENDDO
+          ENDDO
+       ENDIF
+       !
+       ! ... t = A h and the coefficients of the line minimization
+       !
+       CALL apply_h( nact, h_d, t_d )
+       !$acc parallel loop gang private(c, s, s2)
+       DO j = 1, nact
+          c = act_d(j)
+          s = 0.0_DP ; s2 = 0.0_DP
+          !$acc loop vector reduction(+:s,s2)
+          DO ig = 1, n1
+             s = s + DBLE( CONJG(h_d(ig,c)) * g_d(ig,c) )
+             s2 = s2 + DBLE( CONJG(h_d(ig,c)) * t_d(ig,c) )
+          ENDDO
+          a_d(c) = s
+          c_d(c) = s2
+       ENDDO
+       !
+    ENDDO
+    !
+    IF ( .NOT. all_conv ) THEN
+       DO kp = 1, nks*npe
+          IF ( anorm_kp(kp) > 0.0_DP ) WRITE( stdout, "(5x,'kpoint',i4,' sternheimer_kernel: &
+               &root not converged, thresh < ',es10.3)" ) (kp-1)/npe + 1, anorm_kp(kp)
+       ENDDO
+    ENDIF
+    tot_iter = 0
+    DO kp = 1, nks*npe
+       tot_iter = tot_iter + INT( kter_eff(kp) )
+    ENDDO
+    tot_calls = nks * npe
+    CALL mp_sum( tot_iter, inter_pool_comm )
+    CALL mp_sum( tot_calls, inter_pool_comm )
+    avg_iter = REAL(tot_iter,DP) / REAL(tot_calls,DP)
+    DEALLOCATE( rho_h, kter_eff, nun, anorm_kp, anorm0 )
+    CALL stop_clock( 'dfptd_cg' )
+    !
+  END SUBROUTINE cg_solve
+  !
 #else
   !
   ! ... stubs for builds without CUDA: the engine is never active
