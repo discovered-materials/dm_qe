@@ -2132,6 +2132,377 @@ CONTAINS
   END SUBROUTINE apply_h_real
   !
   !-----------------------------------------------------------------------
+  SUBROUTINE setup_lowg( )
+    !-----------------------------------------------------------------------
+    !! Preconditioner of the single-precision iterations with an exact block
+    !! on the plane waves of low kinetic energy. The stock preconditioner,
+    !! 1/max(1, |k+q+G|^2/eprec), ignores the potential, which is what
+    !! couples the plane waves below a few Ry. Here, for the nlg plane waves
+    !! with |k+q+G|^2 <= elow, the block L of B = H + alpha_pv P_v and of S
+    !! is built and diagonalized, B_LL v = lambda S_LL v, so that the inverse
+    !! of the block of the operator of band n, ( B - e_n S )_LL, is
+    !! v ( lambda - e_n )^-1 v^H; the other plane waves get the inverse of
+    !! the diagonal of the operator, 1/( h_GG - e_n s_GG ). The block is a
+    !! principal submatrix of a positive definite operator, so this is a
+    !! valid (positive definite) preconditioner. Convergence is still tested
+    !! on the norm that the stock preconditioner defines.
+    !! The block is diagonalized on the host (one thread per k-point), which
+    !! costs about 1e-10 s * nks * nlg^3; the solves of a q-point that it
+    !! accelerates cost about 1e-8 s * modes * bands * nks * (FFT points), so
+    !! the block is limited to the nlg lowest plane waves with
+    !! nlg^3 <= 2 * modes * bands * nnr (QE_PH_LOWG_CAP replaces the 2; between
+    !! 0.8 and 6.4 the sum of set-up and solves hardly changes), and by the
+    !! memory of the eigenvectors.
+    !! QE_PH_LOWG = elow in Ry (default 24; 0: stock preconditioner).
+    !
+    USE io_global,   ONLY : stdout
+    USE klist,       ONLY : igk_k
+    USE gvect,       ONLY : mill
+    USE qpoint,      ONLY : ikqs
+    !
+    INTEGER, PARAMETER :: nlmax = 1024
+    REAL(DP), PARAMETER :: elow_def = 24.0_DP, cap_fac = 2.0_DP
+    INTEGER :: ik, ikq, ig, i, j, n, nl, is, ikb, jkb, na, iof, ih, jh, v, istat, lenv, ierr, info, &
+               mm(3), nwl, nkl, npl, ikl, nll, lwork, lrwork, liwork, nbad, ip, nrl, nkc, k1, k2
+    CHARACTER(LEN=16) :: envval
+    REAL(DP) :: elow, emax, apv, v0, hh, ss, capf
+    INTEGER :: nm
+    INTEGER, ALLOCATABLE :: nl_h(:), li_h(:,:), kbna_h(:), kbof_h(:), kbnh_h(:), iwork(:), ind(:)
+    REAL(DP), ALLOCATABLE :: g2_h(:,:), le_h(:,:), deeq_h(:,:,:,:), qq_h(:,:,:), et_h(:,:), w(:), rwork(:), &
+                             ek_h(:), gs(:)
+    LOGICAL, ALLOCATABLE :: bad_h(:)
+    INTEGER :: ncap
+    COMPLEX(DP), ALLOCATABLE :: vg_h(:,:), wla(:,:,:), x(:,:), b(:,:), s(:,:), work(:)
+    COMPLEX(SP), ALLOCATABLE :: lv_h(:,:,:)
+    COMPLEX(DP), ALLOCATABLE, DEVICE :: wl_d(:,:,:)
+    !
+    use_lg = .FALSE.
+    elow = elow_def
+    CALL get_environment_variable( 'QE_PH_LOWG', envval, lenv, ierr )
+    IF ( ierr == 0 .AND. lenv > 0 ) THEN
+       READ( envval, *, IOSTAT=ierr ) elow
+       IF ( ierr /= 0 ) elow = elow_def
+    ENDIF
+    IF ( elow <= 0.0_DP .OR. .NOT. use_sp .OR. nbo < 1 ) RETURN
+    IF ( .NOT. lowg_cell_ok( ) ) RETURN
+    CALL start_clock( 'dfptd_lowg' )
+    nwl = nw ; nkl = nkbl ; npl = npwxl ; apv = alpha_pv_l ; nrl = nnr
+    capf = cap_fac
+    CALL get_environment_variable( 'QE_PH_LOWG_CAP', envval, lenv, ierr )
+    IF ( ierr == 0 .AND. lenv > 0 ) THEN
+       READ( envval, *, IOSTAT=ierr ) capf
+       IF ( ierr /= 0 .OR. capf <= 0.0_DP ) capf = cap_fac
+    ENDIF
+    nm = nmodes_hint
+    IF ( nm <= 0 ) nm = 3 * natl
+    ncap = NINT( ( capf * nm * nbo * REAL(nnr,DP) )**(1.0_DP/3.0_DP) )
+    ! eigenvectors of all k-points: 8 bytes * nlg^2 * nks on the device (and on the host)
+    ncap = MIN( ncap, INT( SQRT( 0.05_DP * free_bytes( ) / ( 8.0_DP * nks ) ) ) )
+    ncap = MAX( 16, MIN( nlmax, ncap ) )
+    !
+    ! ... the plane waves of the block: below elow, the ncap lowest at most
+    !
+    ALLOCATE( g2_h(npwxl,nks), nl_h(nks), et_h(nbo,nks), ek_h(nks), bad_h(nks), gs(npwxl), ind(npwxl) )
+    g2_h = g2_d ; et_h = et_d
+    DO ik = 1, nks
+       ek_h(ik) = elow
+       n = npwq_h(ik)
+       IF ( COUNT( g2_h(1:n,ik) <= elow ) > ncap ) THEN
+          gs(1:n) = g2_h(1:n,ik)
+          ind(1) = 0
+          CALL hpsort( n, gs, ind )
+          ek_h(ik) = gs(ncap)
+       ENDIF
+       nl_h(ik) = COUNT( g2_h(1:n,ik) <= ek_h(ik) )
+    ENDDO
+    DEALLOCATE( gs, ind )
+    nlg = MAXVAL( nl_h )
+    IF ( nlg < 2 .OR. nlg > 2*nlmax ) THEN
+       CALL stop_clock( 'dfptd_lowg' )
+       RETURN
+    ENDIF
+    ALLOCATE( li_h(nlg,nks) )
+    li_h = 1
+    DO ik = 1, nks
+       n = 0
+       DO ig = 1, npwq_h(ik)
+          IF ( g2_h(ig,ik) <= ek_h(ik) ) THEN
+             n = n + 1
+             li_h(n,ik) = ig
+          ENDIF
+       ENDDO
+    ENDDO
+    !
+    ! ... V(G) on the FFT grid: <G_i| V |G_j> = V(G_i - G_j)
+    !
+    ALLOCATE( vg_h(nnr,nspl) )
+    ip = pick_plan( 1 )
+    DO is = 1, nspl
+       ikl = is
+       !$cuf kernel do(1)
+       DO i = 1, nrl
+          psic_d(i) = CMPLX( v_d(i,ikl), 0.0_DP, KIND=DP )
+       ENDDO
+       istat = cufftExecZ2Z( plan(ip), psic_d, psic_d, CUFFT_FORWARD )
+       vg_h(:,is) = psic_d(1:nnr)
+    ENDDO
+    vg_h = vg_h / DBLE(nnr)
+    !
+    ALLOCATE( deeq_h(nhml,nhml,natl,nspl), qq_h(nhml,nhml,natl) )
+    ALLOCATE( kbna_h(MAX(nkbl,1)), kbof_h(MAX(nkbl,1)), kbnh_h(MAX(nkbl,1)) )
+    deeq_h = deeq_d ; qq_h = qq_d
+    kbna_h = kbna_d ; kbof_h = kbof_d ; kbnh_h = kbnh_d
+    ALLOCATE( lgn_d(nks), lgi_d(nlg,nks), lv_h(nlg,nlg,nks), le_h(nlg,nks) )
+    lgn_d = nl_h ; lgi_d = li_h
+    lv_h = (0.0_SP, 0.0_SP)
+    le_h = 1.0E30_DP
+    bad_h = .FALSE.
+    nbad = 0
+    nll = nlg
+    !
+    ! ... rows of W on the plane waves of the block, k-points in chunks of bounded size
+    !
+    nkc = MAX( 1, MIN( nks, INT( 2.0E9_DP / ( 16.0_DP * REAL(nlg,DP) * nw ) ) ) )
+    ALLOCATE( wl_d(nlg,nw,nkc), wla(nlg,nw,nkc) )
+    DO k1 = 1, nks, nkc
+       k2 = MIN( nks, k1+nkc-1 )
+       ikl = k1
+       !$cuf kernel do(3)
+       DO ik = k1, k2
+          DO j = 1, nwl
+             DO i = 1, nll
+                wl_d(i,j,ik-ikl+1) = w_d(lgi_d(i,ik),j,ik)
+             ENDDO
+          ENDDO
+       ENDDO
+       wla = wl_d
+       !$omp parallel do schedule(dynamic) default(shared) &
+       !$omp    private(ik, ikq, nl, is, b, s, w, x, i, j, mm, jkb, na, iof, jh, ih, v, lwork, lrwork, liwork, &
+       !$omp            work, rwork, iwork, info, emax)
+       DO ik = k1, k2
+          ikq = ikqs(ik)
+          nl = nl_h(ik)
+          is = spin_h(ik)
+          IF ( nl < 1 ) CYCLE
+          ALLOCATE( b(nl,nl), s(nl,nl), w(nl), x(nl,MAX(nkbl,1)) )
+          b = (0.0_DP, 0.0_DP) ; s = (0.0_DP, 0.0_DP)
+          DO j = 1, nl
+             DO i = 1, nl
+                mm(:) = mill(:,igk_k(li_h(i,ik),ikq)) - mill(:,igk_k(li_h(j,ik),ikq))
+                b(i,j) = vg_h( 1 + MODULO(mm(1),nr1) + nr1*( MODULO(mm(2),nr2) + nr2*MODULO(mm(3),nr3) ), is )
+             ENDDO
+             b(j,j) = b(j,j) + g2_h(li_h(j,ik),ik)
+             s(j,j) = (1.0_DP, 0.0_DP)
+          ENDDO
+          IF ( nkbl > 0 ) THEN
+             ! x = W_beta D, then B += x W_beta^H ; the same with q for S
+             x = (0.0_DP, 0.0_DP)
+             DO jkb = 1, nkbl
+                na = kbna_h(jkb) ; iof = kbof_h(jkb) ; jh = jkb - iof
+                DO ih = 1, kbnh_h(jkb)
+                   x(1:nl,jkb) = x(1:nl,jkb) + wla(1:nl,iof+ih,ik-k1+1) * deeq_h(ih,jh,na,is)
+                ENDDO
+             ENDDO
+             CALL ZGEMM( 'N', 'C', nl, nl, nkbl, (1.0_DP,0.0_DP), x, nl, wla(1,1,ik-k1+1), nlg, &
+                         (1.0_DP,0.0_DP), b, nl )
+             IF ( lus ) THEN
+                x = (0.0_DP, 0.0_DP)
+                DO jkb = 1, nkbl
+                   na = kbna_h(jkb) ; iof = kbof_h(jkb) ; jh = jkb - iof
+                   DO ih = 1, kbnh_h(jkb)
+                      x(1:nl,jkb) = x(1:nl,jkb) + wla(1:nl,iof+ih,ik-k1+1) * qq_h(ih,jh,na)
+                   ENDDO
+                ENDDO
+                CALL ZGEMM( 'N', 'C', nl, nl, nkbl, (1.0_DP,0.0_DP), x, nl, wla(1,1,ik-k1+1), nlg, &
+                            (1.0_DP,0.0_DP), s, nl )
+             ENDIF
+          ENDIF
+          v = noccq_h(ik)
+          IF ( v > 0 ) CALL ZGEMM( 'N', 'C', nl, nl, v, CMPLX(apv,0.0_DP,KIND=DP), wla(1,nkbl+1,ik-k1+1), &
+                                   nlg, wla(1,nkbl+1,ik-k1+1), nlg, (1.0_DP,0.0_DP), b, nl )
+          lwork = 2*nl + nl*nl + 16 ; lrwork = 1 + 5*nl + 2*nl*nl + 16 ; liwork = 3 + 5*nl + 16
+          ALLOCATE( work(lwork), rwork(lrwork), iwork(liwork) )
+          IF ( lus ) THEN
+             CALL ZHEGVD( 1, 'V', 'U', nl, b, nl, s, nl, w, work, lwork, rwork, lrwork, iwork, liwork, info )
+          ELSE
+             CALL ZHEEVD( 'V', 'U', nl, b, nl, w, work, lwork, rwork, lrwork, iwork, liwork, info )
+          ENDIF
+          emax = MAXVAL( et_h(1:nocc_h(ik),ik) )
+          IF ( info /= 0 .OR. w(1) - emax < 1.0E-3_DP ) THEN
+             bad_h(ik) = .TRUE.
+          ELSE
+             lv_h(1:nl,1:nl,ik) = CMPLX( b(1:nl,1:nl), KIND=SP )
+             le_h(1:nl,ik) = w(1:nl)
+          ENDIF
+          DEALLOCATE( b, s, w, x, work, rwork, iwork )
+       ENDDO
+       !$omp end parallel do
+    ENDDO
+    DEALLOCATE( wl_d, wla )
+    DO ik = 1, nks
+       IF ( bad_h(ik) ) nl_h(ik) = 0
+    ENDDO
+    nbad = COUNT( bad_h )
+    !
+    ALLOCATE( lgv_d(nlg,nlg,nks), lge_d(nlg,nks) )
+    lgn_d = nl_h ; lgv_d = lv_h ; lge_d = le_h
+    !
+    ! ... diagonal of B and of S for the other plane waves
+    !
+    ALLOCATE( hdg_d(npwxl,nks), sdg_d(npwxl,nks) )
+    DO is = 1, nspl
+       v0 = DBLE( vg_h(1,is) )
+       ikl = is
+       !$acc parallel loop gang collapse(2) private(hh, ss, na, iof, ih)
+       DO ik = 1, nks
+          DO ig = 1, npl
+             IF ( spin_d(ik) == ikl ) THEN
+                hh = g2_d(ig,ik) + v0
+                ss = 1.0_DP
+                !$acc loop seq
+                DO ikb = 1, nkl
+                   na = kbna_d(ikb) ; iof = kbof_d(ikb) ; ih = ikb - iof
+                   !$acc loop seq
+                   DO jh = 1, kbnh_d(ikb)
+                      hh = hh + deeq_d(ih,jh,na,ikl) * DBLE( w_d(ig,ikb,ik) * CONJG( w_d(ig,iof+jh,ik) ) )
+                      ss = ss + qq_d(ih,jh,na) * DBLE( w_d(ig,ikb,ik) * CONJG( w_d(ig,iof+jh,ik) ) )
+                   ENDDO
+                ENDDO
+                !$acc loop seq
+                DO v = 1, noccq_d(ik)
+                   hh = hh + apv * DBLE( w_d(ig,nkl+v,ik) * CONJG( w_d(ig,nkl+v,ik) ) )
+                ENDDO
+                hdg_d(ig,ik) = hh
+                sdg_d(ig,ik) = ss
+             ENDIF
+          ENDDO
+       ENDDO
+    ENDDO
+    use_lg = .TRUE.
+    WRITE( stdout, '(5x,"DFPT device engine: preconditioner with an exact block of ",i5, &
+         &" plane waves (below ",f6.2," Ry)")' ) nlg, MINVAL( ek_h )
+    IF ( nbad > 0 ) WRITE( stdout, '(5x,"DFPT device engine: ",i6," k-points without the block")' ) nbad
+    CALL stop_clock( 'dfptd_lowg' )
+    !
+  END SUBROUTINE setup_lowg
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE lowg_apply_sp( nact )
+    !-----------------------------------------------------------------------
+    !! low-G block of the preconditioned gradient: ts_L = v (lambda - e)^-1 v^H gs_L
+    !! for the active columns (all columns of runs of consecutive active
+    !! k-points), then rho = <ts|gs>.
+    INTEGER, INTENT(IN) :: nact
+    INTEGER :: i, ik, k1, k2, c, il, ig, j, nck, nll, n1
+    REAL(DP) :: s
+    COMPLEX(SP), PARAMETER :: s_one = (1.0_SP, 0.0_SP), s_zero = (0.0_SP, 0.0_SP)
+    !
+    nck = ncolk ; nll = nlg ; n1 = npwxl
+    i = 1
+    DO WHILE ( i <= nact )
+       k1 = (act_h(i)-1)/ncolk + 1
+       k2 = k1
+       DO WHILE ( i <= nact )
+          ik = (act_h(i)-1)/ncolk + 1
+          IF ( ik > k2+1 ) EXIT
+          k2 = ik
+          i = i + 1
+       ENDDO
+       !$cuf kernel do(2)
+       DO c = (k1-1)*nck+1, k2*nck
+          DO il = 1, nll
+             ik = (c-1)/nck + 1
+             IF ( il <= lgn_d(ik) ) THEN
+                gl_d(il,c) = gs_d(lgi_d(il,ik),c)
+             ELSE
+                gl_d(il,c) = (0.0_SP, 0.0_SP)
+             ENDIF
+          ENDDO
+       ENDDO
+       CALL gemm_ks( CUBLAS_OP_C, nlg, ncolk, nlg, s_one, lgv_d(1,1,k1), nlg, INT(nlg,8)*nlg, &
+                     gl_d(1,(k1-1)*ncolk+1), nlg, INT(nlg,8)*ncolk, s_zero, &
+                     cl_d(1,(k1-1)*ncolk+1), nlg, INT(nlg,8)*ncolk, k2-k1+1 )
+       !$cuf kernel do(2)
+       DO c = (k1-1)*nck+1, k2*nck
+          DO il = 1, nll
+             ik = (c-1)/nck + 1
+             cl_d(il,c) = cl_d(il,c) / REAL( MAX( 1.0E-3_DP, lge_d(il,ik) - e_d(c) ), SP )
+          ENDDO
+       ENDDO
+       CALL gemm_ks( CUBLAS_OP_N, nlg, ncolk, nlg, s_one, lgv_d(1,1,k1), nlg, INT(nlg,8)*nlg, &
+                     cl_d(1,(k1-1)*ncolk+1), nlg, INT(nlg,8)*ncolk, s_zero, &
+                     gl_d(1,(k1-1)*ncolk+1), nlg, INT(nlg,8)*ncolk, k2-k1+1 )
+    ENDDO
+    !$acc parallel loop gang private(c, ik, s)
+    DO j = 1, nact
+       c = act_d(j)
+       ik = (c-1)/nck + 1
+       !$acc loop vector
+       DO il = 1, nll
+          IF ( il <= lgn_d(ik) ) ts_d(lgi_d(il,ik),c) = gl_d(il,c)
+       ENDDO
+       s = 0.0_DP
+       !$acc loop vector reduction(+:s)
+       DO ig = 1, n1
+          s = s + DBLE( CONJG(ts_d(ig,c)) * gs_d(ig,c) )
+       ENDDO
+       rho_d(c) = s
+    ENDDO
+    !
+  END SUBROUTINE lowg_apply_sp
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE vloc_g( vg_h )
+    !-----------------------------------------------------------------------
+    !! Fourier components of the local potential on the FFT grid, each spin:
+    !! <G_i| V |G_j> = vg( position of G_i - G_j )
+    COMPLEX(DP), INTENT(OUT) :: vg_h(nnr,nspl)
+    INTEGER :: is, i, ip, istat, ikl, nrl
+    nrl = nnr
+    ip = pick_plan( 1 )
+    DO is = 1, nspl
+       ikl = is
+       !$cuf kernel do(1)
+       DO i = 1, nrl
+          psic_d(i) = CMPLX( v_d(i,ikl), 0.0_DP, KIND=DP )
+       ENDDO
+       istat = cufftExecZ2Z( plan(ip), psic_d, psic_d, CUFFT_FORWARD )
+       vg_h(:,is) = psic_d(1:nnr)
+    ENDDO
+    vg_h = vg_h / DBLE(nnr)
+  END SUBROUTINE vloc_g
+  !
+  !-----------------------------------------------------------------------
+  LOGICAL FUNCTION lowg_cell_ok( )
+    !-----------------------------------------------------------------------
+    !! The block preconditioner leaves the residual that the convergence test
+    !! allows on the plane waves above the block, where it turns into errors
+    !! of the long-wavelength density response more than the residual of the
+    !! stock preconditioner does. In small cells this has no effect on the
+    !! self-consistency (same number of iterations down to tr2_ph = 1e-19 in
+    !! all cases tried); in a 216-atom Si cell (shortest reciprocal-lattice
+    !! vector squared 0.04 Ry) it costs 10-30% more iterations, in 54- and
+    !! 63-atom cells (0.12, 0.22 Ry) none. The block is used when the
+    !! shortest reciprocal-lattice vector (in-plane ones with the 2D cutoff)
+    !! squared is above 0.1 Ry. QE_PH_LOWG_CELL=0 lifts the restriction.
+    USE cell_base,   ONLY : bg, tpiba2
+    USE Coul_cut_2D, ONLY : do_cutoff_2D
+    REAL(DP) :: b2min
+    INTEGER :: i, nb3, ln, ierr
+    CHARACTER(LEN=8) :: val
+    lowg_cell_ok = .TRUE.
+    CALL get_environment_variable( 'QE_PH_LOWG_CELL', val, ln, ierr )
+    IF ( ierr == 0 .AND. ln > 0 .AND. val(1:1) == '0' ) RETURN
+    nb3 = 3
+    IF ( do_cutoff_2D ) nb3 = 2
+    b2min = HUGE( 1.0_DP )
+    DO i = 1, nb3
+       b2min = MIN( b2min, tpiba2 * ( bg(1,i)**2 + bg(2,i)**2 + bg(3,i)**2 ) )
+    ENDDO
+    lowg_cell_ok = b2min >= 0.1_DP
+  END FUNCTION lowg_cell_ok
+  !
+  !-----------------------------------------------------------------------
   SUBROUTINE isort_small( n, a )
     !-----------------------------------------------------------------------
     !! ascending sort of an integer list (the pending columns are found in
