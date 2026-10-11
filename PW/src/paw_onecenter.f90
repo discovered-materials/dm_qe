@@ -1518,6 +1518,157 @@ MODULE paw_onecenter
   !
   !
   !---------------------------------------------------------------------------------
+  SUBROUTINE PAW_dpotential( dbecsum, becsum, int3, npe )
+    !---------------------------------------------------------------------------------
+    !! Computes dV_h and dV_xc using the "change of density" dbecsum provided.
+    !! Update the change of the descreening coefficients:
+    !! $$ D_{ij}=\int dv_{H_{xc}} p_{ij}-\int dvt_{H_{xc}}(pt_{ij}+\text{augfun}_{ij}) $$
+    !! Driver: applies the cached matrix of the linear map dbecsum -> int3
+    !! (\(\texttt{PAW_dpotential_fast}\)) or calls the original routine
+    !! (\(\texttt{PAW_dpotential_stock}\)) in the noncollinear cases and when the
+    !! environment variable QE_PH_DEV is 0. With QE_PAW_DPOT_CHECK=1 both are
+    !! computed at every call and their largest difference is printed.
+    !
+    USE ions_base,         ONLY : nat
+    USE noncollin_module,  ONLY : nspin_mag, noncolin
+    USE uspp_param,        ONLY : nhm
+    USE io_global,         ONLY : stdout, ionode
+    USE mp_images,         ONLY : root_image
+    USE mp,                ONLY : mp_bcast
+    !
+    INTEGER, INTENT(IN) :: npe
+    !! number of perturbations
+    REAL(DP), INTENT(IN) :: becsum(nhm*(nhm+1)/2,nat,nspin_mag)
+    !! cross band
+    COMPLEX(DP), INTENT(IN) :: dbecsum(nhm*(nhm+1)/2,nat,nspin_mag,npe)
+    !! occupations
+    COMPLEX(DP), INTENT(OUT) :: int3(nhm,nhm,nat,nspin_mag,npe)
+    !! change of descreening coefficients (AE - PS)
+    !
+    COMPLEX(DP), ALLOCATABLE :: int3_ref(:,:,:,:,:)
+    REAL(DP) :: dmax, rmax, erel
+    CHARACTER(LEN=16) :: val
+    INTEGER :: ln, ierr
+    !
+    IF ( dk_mode < 0 ) THEN
+       ! the environment is read once, by the root of the image for all its processes
+       dk_mode = 1
+       CALL get_environment_variable( 'QE_PH_DEV', val, ln, ierr )
+       IF ( ierr == 0 .AND. ln > 0 .AND. val(1:1) == '0' ) dk_mode = 0
+       CALL get_environment_variable( 'QE_PAW_DPOT_CHECK', val, ln, ierr )
+       IF ( dk_mode == 1 .AND. ierr == 0 .AND. ln > 0 .AND. val(1:1) == '1' ) dk_mode = 2
+       CALL mp_bcast( dk_mode, root_image, intra_image_comm )
+    ENDIF
+    !
+    IF ( dk_mode == 0 .OR. noncolin .OR. nspin_mag > 2 ) THEN
+       CALL PAW_dpotential_stock( dbecsum, becsum, int3, npe )
+       RETURN
+    ENDIF
+    !
+    CALL PAW_dpotential_fast( dbecsum, becsum, int3, npe )
+    !
+    IF ( dk_mode == 2 ) THEN
+       ALLOCATE( int3_ref(nhm,nhm,nat,nspin_mag,npe) )
+       CALL PAW_dpotential_stock( dbecsum, becsum, int3_ref, npe )
+       rmax = MAXVAL( ABS(int3_ref) )
+       dmax = MAXVAL( ABS(int3 - int3_ref) )
+       ! largest element-wise relative difference among the elements that are not tiny
+       erel = MAXVAL( ABS(int3 - int3_ref) / MAX(ABS(int3_ref), TINY(1._DP)), &
+                      MASK = ABS(int3_ref) > 1.E-6_DP*rmax )
+       IF ( rmax == 0._DP ) erel = 0._DP
+       IF ( ionode ) WRITE( stdout, '(5x,"PAW_dpot check: npe=",i2," max|int3|=",es11.4, &
+            &" max abs diff=",es9.2," /max=",es9.2," max elem. rel=",es9.2)' ) &
+            npe, rmax, dmax, dmax/MAX(rmax,TINY(1._DP)), erel
+       DEALLOCATE( int3_ref )
+    ENDIF
+    !
+  END SUBROUTINE PAW_dpotential
+  !
+  !
+  !---------------------------------------------------------------------------------
+  SUBROUTINE PAW_dpotential_fast( dbecsum, becsum, int3, npe )
+    !---------------------------------------------------------------------------------
+    !! Same result as \(\texttt{PAW_dpotential_stock}\) (collinear cases), obtained
+    !! by applying the cached matrices dk(na)%k to dbecsum. Host code: the arrays
+    !! are tiny.
+    !
+    USE ions_base,         ONLY : nat, ityp
+    USE noncollin_module,  ONLY : nspin_mag
+    USE uspp_param,        ONLY : nh, nhm, upf
+    USE constants,         ONLY : eps12
+    USE xc_lib,            ONLY : xclib_dft_is
+    !
+    INTEGER, INTENT(IN) :: npe
+    REAL(DP), INTENT(IN) :: becsum(nhm*(nhm+1)/2,nat,nspin_mag)
+    COMPLEX(DP), INTENT(IN) :: dbecsum(nhm*(nhm+1)/2,nat,nspin_mag,npe)
+    COMPLEX(DP), INTENT(OUT) :: int3(nhm,nhm,nat,nspin_mag,npe)
+    !
+    REAL(DP), ALLOCATABLE :: din(:,:), dout(:,:)
+    REAL(DP) :: xr, xi
+    INTEGER :: ia, nt, nij, nd, is, ipert, ih, jh, ijh, irebuild
+    LOGICAL :: rebuild
+    !
+    CALL start_clock( 'PAW_dpot' )
+    !
+    ! ... the matrices are valid as long as the ground state they were built for is unchanged
+    !
+    rebuild = .NOT. ALLOCATED(dk)
+    IF ( .NOT. rebuild ) rebuild = ( SIZE(dk) /= nat ) .OR. ( SIZE(dk_becsum,1) /= SIZE(becsum,1) ) &
+                              .OR. ( SIZE(dk_becsum,3) /= nspin_mag ) &
+                              .OR. ( dk_gga .NEQV. xclib_dft_is('gradient') )
+    IF ( .NOT. rebuild ) rebuild = ANY( dk_ityp(1:nat) /= ityp(1:nat) )
+    IF ( .NOT. rebuild ) rebuild = ANY( dk_becsum /= becsum )
+    ! all the processes of the image must take the same decision (the set-up communicates)
+    irebuild = 0
+    IF ( rebuild ) irebuild = 1
+    CALL mp_sum( irebuild, intra_image_comm )
+    IF ( irebuild > 0 ) CALL PAW_dk_setup( becsum )
+    !
+    CALL start_clock( 'pawd_apply' )
+    int3 = (0.0_DP, 0.0_DP)
+    !
+    DO ia = 1, nat
+       nt = ityp(ia)
+       IF ( .NOT. upf(nt)%tpawp ) CYCLE
+       nij = nh(nt)*(nh(nt)+1)/2
+       nd  = nij*nspin_mag
+       ALLOCATE( din(nd,2*npe), dout(nd,2*npe) )
+       DO ipert = 1, npe
+          DO is = 1, nspin_mag
+             DO ijh = 1, nij
+                ! real and imaginary part are thresholded separately, as PAW_rho_lm does
+                xr = DBLE(  dbecsum(ijh,ia,is,ipert) )
+                xi = AIMAG( dbecsum(ijh,ia,is,ipert) )
+                IF ( ABS(xr) < eps12 ) xr = 0._DP
+                IF ( ABS(xi) < eps12 ) xi = 0._DP
+                din((is-1)*nij+ijh,2*ipert-1) = xr
+                din((is-1)*nij+ijh,2*ipert  ) = xi
+             ENDDO
+          ENDDO
+       ENDDO
+       CALL DGEMM( 'N', 'N', nd, 2*npe, nd, 1._DP, dk(ia)%k, nd, din, nd, 0._DP, dout, nd )
+       DO ipert = 1, npe
+          DO is = 1, nspin_mag
+             ijh = (is-1)*nij
+             DO ih = 1, nh(nt)
+                DO jh = ih, nh(nt)
+                   ijh = ijh + 1
+                   int3(ih,jh,ia,is,ipert) = CMPLX( dout(ijh,2*ipert-1), dout(ijh,2*ipert), KIND=DP )
+                   int3(jh,ih,ia,is,ipert) = int3(ih,jh,ia,is,ipert)
+                ENDDO
+             ENDDO
+          ENDDO
+       ENDDO
+       DEALLOCATE( din, dout )
+    ENDDO
+    CALL stop_clock( 'pawd_apply' )
+    !
+    CALL stop_clock( 'PAW_dpot' )
+    !
+  END SUBROUTINE PAW_dpotential_fast
+  !
+  !
+  !---------------------------------------------------------------------------------
   SUBROUTINE PAW_dk_setup( becsum )
     !---------------------------------------------------------------------------------
     !! Builds the matrices dk(na)%k of the linear map dbecsum -> int3 (see the
@@ -2255,11 +2406,12 @@ MODULE paw_onecenter
   !
   !
   !---------------------------------------------------------------------------------
-  SUBROUTINE PAW_dpotential( dbecsum, becsum, int3, npe )
+  SUBROUTINE PAW_dpotential_stock( dbecsum, becsum, int3, npe )
     !---------------------------------------------------------------------------------
-    !! Computes dV_h and dV_xc using the "change of density" dbecsum provided.  
+    !! Computes dV_h and dV_xc using the "change of density" dbecsum provided.
     !! Update the change of the descreening coefficients:
     !! $$ D_{ij}=\int dv_{H_{xc}} p_{ij}-\int dvt_{H_{xc}}(pt_{ij}+\text{augfun}_{ij}) $$
+    !! Original routine: one evaluation of the response potential per call.
     !
     USE atom,              ONLY : g => rgrid
     USE ions_base,         ONLY : nat, ityp
@@ -2365,6 +2517,7 @@ MODULE paw_onecenter
              ! Compute the change of the charge density. Complex because the
              ! displacements might be complex
              !
+             CALL start_clock('pawd_a')
              DO ipert = 1, npe
                 IF (i_what == AE) THEN
                    becfake(:,ia,:) = DBLE(dbecsum(:,ia,:,ipert))
@@ -2379,12 +2532,14 @@ MODULE paw_onecenter
                 ENDIF
              ENDDO
              !
+             CALL stop_clock('pawd_a')
              savedvr_lm(:,:,:,:) = 0._DP
              savedvi_lm(:,:,:,:) = 0._DP
              !
              DO ipert = 1, npe
                 ! Change of Hartree potential
                 !
+                CALL start_clock('pawd_h')
                 CALL PAW_h_potential( i, drhor_lm(1,1,1,ipert), dv_lm(:,:,1) )
                 DO is = 1,nspin_lsda 
                    savedvr_lm(:,:,is,ipert) = dv_lm(:,:,1)
@@ -2397,6 +2552,8 @@ MODULE paw_onecenter
                 !
                 ! Change of Exchange-correlation potential
                 !
+                CALL stop_clock('pawd_h')
+                CALL start_clock('pawd_xc')
                 CALL PAW_dxc_potential( i, drhor_lm(1,1,1,ipert), &
                                         rho_lm, rho_core, dv_lm )
                 savedvr_lm(:,:,:,ipert) = savedvr_lm(:,:,:,ipert) + dv_lm(:,:,:)
@@ -2404,9 +2561,11 @@ MODULE paw_onecenter
                 CALL PAW_dxc_potential( i, drhoi_lm(1,1,1,ipert), &
                                         rho_lm, rho_core, dv_lm )
                 savedvi_lm(:,:,:,ipert) = savedvi_lm(:,:,:,ipert) + dv_lm(:,:,:)
+                CALL stop_clock('pawd_xc')
              ENDDO
              !
              !
+             CALL start_clock('pawd_pair')
              spins: DO is = 1, nspin_mag
                 nmb = 0
                 ! loop on all pfunc for this kind of pseudo
@@ -2445,6 +2604,7 @@ MODULE paw_onecenter
                    ENDDO ! mb
                 ENDDO ! nb
              ENDDO spins
+             CALL stop_clock('pawd_pair')
           ENDDO whattodo
           !
           ! cleanup
@@ -2468,7 +2628,7 @@ MODULE paw_onecenter
     !
     CALL stop_clock( 'PAW_dpot' )
     !
-  END SUBROUTINE PAW_dpotential
+  END SUBROUTINE PAW_dpotential_stock
   !
   !
   !-----------------------------------------------------------------------------
