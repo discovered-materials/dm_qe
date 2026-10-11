@@ -49,8 +49,8 @@ MODULE dfpt_dev
   PRIVATE
   SAVE
   !
-  PUBLIC :: dfpt_dev_end, dfpt_dev_flush, dfpt_dev_invalidate, &
-            dfpt_dev_in_session
+  PUBLIC :: dfpt_dev_begin, dfpt_dev_end, dfpt_dev_flush, dfpt_dev_invalidate, &
+            dfpt_dev_in_session, dfpt_dev_sternheimer
   PUBLIC :: dfpt_dev_set_eta, dfpt_dev_set_work
   PUBLIC :: dfpt_dev_keep_dpsi, dfpt_dev_agree, dfpt_dev_keeping, dfpt_dev_kept
 #if defined(__CUDA)
@@ -1138,6 +1138,87 @@ CONTAINS
     !! the device, where dfpt_dev_get_bq serves the dynamical matrix.
     IF ( in_session .AND. .NOT. lin_session ) keep_next = .TRUE.
   END SUBROUTINE dfpt_dev_keep_dpsi
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE dfpt_dev_begin( code, npert, iter0, lrdvpsi, iudvpsi )
+    !-----------------------------------------------------------------------
+    !! Start a DFPT self-consistency for npert perturbations: the bare
+    !! \(\Delta V\psi\) are read from buffer iudvpsi and kept on the device.
+    !
+    USE io_global,   ONLY : stdout
+    USE wvfct,       ONLY : nbnd, npwx
+    USE noncollin_module, ONLY : npol
+    USE qpoint,      ONLY : nksq
+    USE units_lr,    ONLY : iudwf, lrdwf
+    USE buffers,     ONLY : get_buffer
+    USE eqv,         ONLY : dvpsi, dpsi
+    USE uspp_param,  ONLY : nhm
+    USE ions_base,   ONLY : nat
+    !
+    CHARACTER(LEN=*), INTENT(IN) :: code
+    INTEGER, INTENT(IN) :: npert, iter0, lrdvpsi, iudvpsi
+    !
+    INTEGER :: ik, ipert, ibnd, c0, nrec
+    LOGICAL :: ok
+    COMPLEX(DP), ALLOCATABLE :: stage(:,:)
+    !
+    IF ( in_session .AND. prefilled .AND. .NOT. lin_session .AND. TRIM(code) == 'PHONON' &
+         .AND. npert == npe .AND. iter0 <= 0 ) THEN
+       ! the caller has already put the bare perturbation on the device
+       prefilled = .FALSE.
+       iudvb = iudvpsi ; lrdvb = lrdvpsi
+       RETURN
+    ENDIF
+    IF ( in_session ) CALL dfpt_dev_end( )
+    CALL release_kept( )
+    IF ( TRIM(code) /= 'PHONON' ) RETURN
+    IF ( .NOT. dev_requested( ) ) RETURN
+    IF ( .NOT. dev_supported( ) ) RETURN
+    !
+    IF ( .NOT. q_ready ) THEN
+       CALL setup_q( ok )
+       IF ( .NOT. ok ) THEN
+          CALL dfpt_dev_invalidate( )
+          RETURN
+       ENDIF
+    ENDIF
+    IF ( .NOT. blas_ready ) CALL init_blas( )
+    !
+    CALL start_clock( 'dfptd_begin' )
+    iudvb = iudvpsi ; lrdvb = lrdvpsi
+    CALL alloc_session( npert, .TRUE., ok )
+    IF ( .NOT. ok ) THEN
+       CALL stop_clock( 'dfptd_begin' )
+       RETURN
+    ENDIF
+    !
+    ! ... bare perturbation (and dpsi of a previous run when restarting)
+    !
+    ALLOCATE( stage(npwxl,nbo) )
+    DO ik = 1, nks
+       DO ipert = 1, npe
+          nrec = (ipert-1)*nksq + ik
+          c0 = ( (ik-1)*npe + (ipert-1) ) * nbo
+          CALL get_buffer( dvpsi, lrdvpsi, iudvpsi, nrec )
+          stage(:,:) = c_zero
+          DO ibnd = 1, nocc_h(ik)
+             stage(1:npwq_h(ik),ibnd) = dvpsi(1:npwq_h(ik),ibnd)
+          ENDDO
+          dvb_d(:,c0+1:c0+nbo) = stage(:,:)
+       ENDDO
+    ENDDO
+    DEALLOCATE( stage )
+    ! (when restarting, iter0 > 0, the response wavefunctions of the interrupted run are
+    !  not in the buffer, which the engine fills only at the end of a session: the linear
+    !  systems start from zero)
+    dpsi_d = c_zero
+    h_d = c_zero ; t_d = c_zero ; g_d = c_zero
+    !
+    in_session = .TRUE.
+    dpsi_dirty = .FALSE.
+    CALL stop_clock( 'dfptd_begin' )
+    !
+  END SUBROUTINE dfpt_dev_begin
   !
   !-----------------------------------------------------------------------
   SUBROUTINE dfpt_dev_flush( )
@@ -4268,6 +4349,58 @@ CONTAINS
     !
   END SUBROUTINE cg_solve
   !
+  !-----------------------------------------------------------------------
+  SUBROUTINE dfpt_dev_sternheimer( first_iter, npert, thresh, dvscfins, all_conv, avg_iter, &
+                                   drhoout, dbecsum )
+    !-----------------------------------------------------------------------
+    !! One pass of sternheimer_kernel for all k-points and perturbations of
+    !! the session.
+    !
+    USE io_global,        ONLY : stdout
+    USE fft_base,         ONLY : dffts
+    USE ions_base,        ONLY : nat
+    USE uspp_param,       ONLY : nhm
+    USE noncollin_module, ONLY : nspin_mag
+    USE lrus,             ONLY : int3
+    !
+    LOGICAL, INTENT(IN) :: first_iter
+    INTEGER, INTENT(IN) :: npert
+    REAL(DP), INTENT(IN) :: thresh
+    COMPLEX(DP), INTENT(IN) :: dvscfins(dffts%nnr, nspin_mag, npert)
+    LOGICAL, INTENT(OUT) :: all_conv
+    REAL(DP), INTENT(OUT) :: avg_iter
+    COMPLEX(DP), INTENT(INOUT) :: drhoout(dffts%nnr, nspin_mag, npert)
+    COMPLEX(DP), INTENT(INOUT) :: dbecsum(nhm*(nhm+1)/2, nat, nspin_mag, npert)
+    !
+    COMPLEX(DP), ALLOCATABLE :: drho_h(:,:,:)
+    !
+    IF ( npert /= npe ) CALL errore( 'dfpt_dev_sternheimer', 'wrong number of perturbations', 1 )
+    CALL start_clock( 'dfptd_sth' )
+    !
+    IF ( .NOT. first_iter ) THEN
+       dv_d = dvscfins
+       IF ( lus ) int3_d = int3(:,:,:,1:nspl,1:npe)
+    ENDIF
+    !
+    CALL build_rhs( first_iter )
+    !
+    ! ... conjugate gradient on all columns (cgsolve_all)
+    !
+    CALL cg_solve( first_iter, thresh, all_conv, avg_iter )
+    !
+    ! ... response density and, with ultrasoft PPs, dbecsum
+    !
+    CALL add_drho( )
+    ALLOCATE( drho_h(nnr,nspl,npe) )
+    drho_h = drho_d
+    drhoout(:,1:nspl,:) = drhoout(:,1:nspl,:) + drho_h(:,:,:)
+    DEALLOCATE( drho_h )
+    IF ( lus ) CALL add_dbecsum( dbecsum )
+    !
+    CALL stop_clock( 'dfptd_sth' )
+    !
+  END SUBROUTINE dfpt_dev_sternheimer
+  !
 #else
   !
   ! ... stubs for builds without CUDA: the engine is never active
@@ -4275,11 +4408,34 @@ CONTAINS
   SUBROUTINE dfpt_dev_invalidate( )
   END SUBROUTINE dfpt_dev_invalidate
   !
+  SUBROUTINE dfpt_dev_begin( code, npert, iter0, lrdvpsi, iudvpsi )
+    CHARACTER(LEN=*), INTENT(IN) :: code
+    INTEGER, INTENT(IN) :: npert, iter0, lrdvpsi, iudvpsi
+  END SUBROUTINE dfpt_dev_begin
+  !
   SUBROUTINE dfpt_dev_flush( )
   END SUBROUTINE dfpt_dev_flush
   !
   SUBROUTINE dfpt_dev_end( )
   END SUBROUTINE dfpt_dev_end
+  !
+  SUBROUTINE dfpt_dev_sternheimer( first_iter, npert, thresh, dvscfins, all_conv, avg_iter, &
+                                   drhoout, dbecsum )
+    USE fft_base,         ONLY : dffts
+    USE ions_base,        ONLY : nat
+    USE uspp_param,       ONLY : nhm
+    USE noncollin_module, ONLY : nspin_mag
+    LOGICAL, INTENT(IN) :: first_iter
+    INTEGER, INTENT(IN) :: npert
+    REAL(DP), INTENT(IN) :: thresh
+    COMPLEX(DP), INTENT(IN) :: dvscfins(dffts%nnr, nspin_mag, npert)
+    LOGICAL, INTENT(OUT) :: all_conv
+    REAL(DP), INTENT(OUT) :: avg_iter
+    COMPLEX(DP), INTENT(INOUT) :: drhoout(dffts%nnr, nspin_mag, npert)
+    COMPLEX(DP), INTENT(INOUT) :: dbecsum(nhm*(nhm+1)/2, nat, nspin_mag, npert)
+    all_conv = .FALSE. ; avg_iter = 0.0_DP
+    CALL errore( 'dfpt_dev_sternheimer', 'not available without CUDA', 1 )
+  END SUBROUTINE dfpt_dev_sternheimer
   !
   SUBROUTINE dfpt_dev_keep_dpsi( )
   END SUBROUTINE dfpt_dev_keep_dpsi
