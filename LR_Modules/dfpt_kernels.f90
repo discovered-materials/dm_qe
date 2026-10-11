@@ -122,7 +122,9 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
                                     dbecsum_cond_nc, drhos_cond, ef_shift_wfc_twochem
    USE localdos_mod,         ONLY : localdos_new
    USE dfpt_dev,             ONLY : dfpt_dev_begin, dfpt_dev_end, dfpt_dev_flush, &
-                                    dfpt_dev_in_session, dfpt_dev_agree
+                                    dfpt_dev_in_session, dfpt_dev_agree, &
+                                    dfpt_dev_keeping
+   USE mp_images,            ONLY : intra_image_comm
    USE dfpt_dev_grid,        ONLY : dfpt_dev_dv_of_drho
    !
    IMPLICIT NONE
@@ -175,6 +177,13 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
    !! True if the response potential was computed on the device
    LOGICAL :: dev_mix
    !! True if the mixing history is kept in memory (device engine in use)
+   CHARACTER(LEN=32) :: envval
+   INTEGER :: lenv, ierr
+   LOGICAL :: stop_now, convt_rec
+   INTEGER :: rec_due
+   INTEGER(8) :: clk_now, clk_rec, clk_rate
+   REAL(DP) :: rec_sec
+   !! Device engine: least time between two writes of the recover file (QE_PH_REC_SEC, default 30 s)
    logical :: lmetq0,     & ! true if xq=(0,0,0) in a metal
       first_iter    ! true if first iteration where induced rho is not yet calculated
    LOGICAL :: finite_freq
@@ -253,6 +262,13 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
       ! all the ranks of the image take the same path (device memory is a per-rank matter)
       CALL dfpt_dev_agree(dev_mix)
       dev_mix = dfpt_dev_in_session()
+   ENDIF
+   rec_sec = 30.0_DP
+   CALL SYSTEM_CLOCK(clk_rec, clk_rate)
+   IF (dev_mix) THEN
+      CALL get_environment_variable('QE_PH_REC_SEC', envval, lenv, ierr)
+      IF (ierr == 0 .AND. lenv > 0) READ(envval, *, IOSTAT=ierr) rec_sec
+      IF (ierr /= 0) rec_sec = 30.0_DP
    ENDIF
    !
    ! Loop over DFPT self-consistent iterations
@@ -518,11 +534,32 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
       !
       !    Here we save the information for recovering the run from this point
       !
+      !    (device engine: iterations take a fraction of a second, the recover file is
+      !     written at convergence, before a stop and otherwise every rec_sec seconds)
+      !
+      !    The decision is the same on all ranks (write_rec has collective MPI calls).
+      !    When the engine keeps the response wavefunctions on the device, the record is
+      !    written as "not converged": a restart then repeats the last iteration instead of
+      !    looking for wavefunctions that were never written to their buffer.
+      !
+      stop_now = check_stop_now()
       IF (PRESENT(write_rec_callback)) THEN
-         CALL write_rec_callback(where_rec, irr, dr2, iter, convt, dfpt_data)
+         rec_due = 1
+         IF (dev_mix) THEN
+            CALL SYSTEM_CLOCK(clk_now, clk_rate)
+            rec_due = 0
+            IF (REAL(clk_now - clk_rec, DP) >= rec_sec * REAL(clk_rate, DP)) rec_due = 1
+            CALL mp_sum(rec_due, intra_image_comm)
+         ENDIF
+         IF (rec_due > 0 .OR. convt .OR. stop_now .OR. kter == niter_ph) THEN
+            convt_rec = convt
+            IF (convt .AND. dfpt_dev_keeping()) convt_rec = .FALSE.
+            CALL write_rec_callback(where_rec, irr, dr2, iter, convt_rec, dfpt_data)
+            CALL SYSTEM_CLOCK(clk_rec, clk_rate)
+         ENDIF
       ENDIF
       !
-      IF (check_stop_now() .AND. PRESENT(stop_callback)) THEN
+      IF (stop_now .AND. PRESENT(stop_callback)) THEN
          CALL dfpt_dev_end()
          CALL stop_callback(.FALSE.)
       ENDIF
