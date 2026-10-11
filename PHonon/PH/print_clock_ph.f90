@@ -95,6 +95,8 @@ subroutine print_clock_ph
      call print_clock ('solve_linter')
      call print_clock ('dfpt_kernel')
      call print_clock ('sth_kernel')
+     call print_clock ('psymdvscf')
+     call print_clock ('symdvscf_dev')
      call print_clock ('paw_dpot')
      call print_clock ('pawd_setup')
      call print_clock ('pawd_apply')

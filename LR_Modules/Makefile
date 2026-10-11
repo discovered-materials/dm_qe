@@ -85,6 +85,7 @@ lanczos_nonhermitian.o \
 lanczos_pseudohermitian.o \
 lanczos_pseudohermitian_c.o \
 lanczos_nonhermitian_c.o \
+dfpt_dev_grid.o \
 response_kernels.o \
 non_scf_ph.o \
 efermi_shift.o \
