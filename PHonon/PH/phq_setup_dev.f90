@@ -50,7 +50,7 @@ MODULE phq_setup_dev
   PRIVATE
   SAVE
   !
-  PUBLIC :: phq_setup_dev_on, drhous_dev
+  PUBLIC :: phq_setup_dev_on, drhous_dev, nldyn_dev, wdyn_dev
   !
 #if defined(__CUDA)
   COMPLEX(DP), PARAMETER :: c_one = (1.0_DP, 0.0_DP), c_zero = (0.0_DP, 0.0_DP)
@@ -566,6 +566,339 @@ CONTAINS
     !
   END SUBROUTINE drhous_dev
   !
+  !-----------------------------------------------------------------------
+  SUBROUTINE nldyn_dev( dynwrk, wgg, becq, alpq, done )
+    !-----------------------------------------------------------------------
+    !! Nonlocal part of the term of the dynamical matrix due to the
+    !! orthogonality constraint, in the cartesian basis (the array dynwrk of
+    !! compute_nldyn, summed over the k-points of this pool).
+    !! done = .FALSE. on exit: nothing was computed (not enough device
+    !! memory), the caller has to use the stock code.
+    !
+    USE ions_base,   ONLY : nat, ityp
+    USE uspp,        ONLY : nkb, qq_nt, qq_at, deeq, ofsbeta
+    USE uspp_param,  ONLY : nhm, nh
+    USE lsda_mod,    ONLY : lsda, current_spin, isk
+    USE klist,       ONLY : wk
+    USE wvfct,       ONLY : nbnd, et
+    USE qpoint,      ONLY : nksq, ikks
+    USE control_lr,  ONLY : nbnd_occ
+    USE becmod,      ONLY : bec_type
+    USE phus,        ONLY : alphap, int1, int2
+    USE lrus,        ONLY : becp1
+    !
+    COMPLEX(DP), INTENT(OUT) :: dynwrk(3*nat,3*nat)
+    REAL(DP), INTENT(IN) :: wgg(nbnd,nbnd,nksq)
+    TYPE(bec_type), INTENT(IN) :: becq(nksq), alpq(3,nksq)
+    LOGICAL, INTENT(OUT) :: done
+    !
+    INTEGER :: nm, nbo, ik, ikk, nocc, isp, na, nb, ih, jh, ikb, mu, ibnd, jbnd, ipol, &
+               m0, nmc, nmcur, c, ncols, istat, iof, iofb, nkbl, nbndl, im, nhml
+    REAL(DP) :: need, de
+    COMPLEX(DP) :: s, s2, zfac
+    INTEGER, ALLOCATABLE :: ivec(:)
+    COMPLEX(DP), ALLOCATABLE :: stage(:,:,:)
+    REAL(DP), ALLOCATABLE :: qq_h(:,:,:)
+    INTEGER, ALLOCATABLE, DEVICE :: kbna_d(:), kbof_d(:), kbnh_d(:), atof_d(:), atnh_d(:)
+    REAL(DP), ALLOCATABLE, DEVICE :: qq_d(:,:,:), qqat_d(:,:,:), deeq_d(:,:,:), wgg_d(:,:), et_d(:)
+    COMPLEX(DP), ALLOCATABLE, DEVICE :: bp1_d(:,:), bq_d(:,:), alp_d(:,:,:), alq_d(:,:,:), &
+                                        ps1_d(:,:), ps2_d(:,:,:), ps3_d(:,:), ps4_d(:,:,:), &
+                                        int1_d(:,:,:,:), int2_d(:,:,:,:,:), psv_d(:,:), &
+                                        a1_d(:,:), a2_d(:,:), dyn_d(:,:)
+    !
+    done = .FALSE.
+    dynwrk(:,:) = c_zero
+    nm = 3 * nat
+    nkbl = nkb ; nbndl = nbnd ; nhml = nhm
+    nbo = 0
+    DO ik = 1, nksq
+       nbo = MAX( nbo, nbnd_occ(ikks(ik)) )
+    ENDDO
+    IF ( nkb <= 0 .OR. nbo <= 0 ) RETURN
+    !
+    need = 16.0_DP * ( 3.0_DP * nhm * nhm * nat * (nat + 1) + 10.0_DP * nkb * nbnd + &
+                       REAL(nbnd,DP) * nbo * nm )
+    IF ( need > 0.3_DP * free_bytes( ) ) RETURN
+    IF ( .NOT. blas_ready ) THEN
+       istat = cublasCreate( hblas )
+       IF ( istat /= 0 ) CALL errore( 'phq_setup_dev', 'cublasCreate failed', ABS(istat) )
+       blas_ready = .TRUE.
+    ENDIF
+    !
+    ALLOCATE( ivec(nkb), kbna_d(nkb), kbof_d(nkb), kbnh_d(nkb), atof_d(nat), atnh_d(nat) )
+    DO na = 1, nat
+       DO ih = 1, nh(ityp(na))
+          ivec(ofsbeta(na)+ih) = na
+       ENDDO
+    ENDDO
+    kbna_d = ivec
+    DO na = 1, nat
+       DO ih = 1, nh(ityp(na))
+          ivec(ofsbeta(na)+ih) = ofsbeta(na)
+       ENDDO
+    ENDDO
+    kbof_d = ivec
+    DO na = 1, nat
+       DO ih = 1, nh(ityp(na))
+          ivec(ofsbeta(na)+ih) = nh(ityp(na))
+       ENDDO
+    ENDDO
+    kbnh_d = ivec
+    DEALLOCATE( ivec )
+    ALLOCATE( ivec(nat) )
+    ivec(:) = ofsbeta(1:nat)
+    atof_d = ivec
+    DO na = 1, nat
+       ivec(na) = nh(ityp(na))
+    ENDDO
+    atnh_d = ivec
+    DEALLOCATE( ivec )
+    ALLOCATE( qq_h(nhm,nhm,nat), qq_d(nhm,nhm,nat), qqat_d(nhm,nhm,nat), deeq_d(nhm,nhm,nat) )
+    DO na = 1, nat
+       qq_h(:,:,na) = qq_nt(:,:,ityp(na))
+    ENDDO
+    qq_d = qq_h
+    qq_h(:,:,:) = qq_at(:,:,1:nat)
+    qqat_d = qq_h
+    ALLOCATE( int1_d(nhm,nhm,3,nat), int2_d(nhm,nhm,3,nat,nat) )
+    int2_d = int2
+    !
+    ALLOCATE( bp1_d(nkb,nbnd), bq_d(nkb,nbnd), alp_d(nkb,nbnd,3), alq_d(nkb,nbnd,3), &
+              wgg_d(nbnd,nbnd), et_d(nbnd) )
+    ALLOCATE( ps1_d(nkb,nbo), ps2_d(nkb,nbo,3), ps3_d(nkb,nbnd), ps4_d(nkb,nbnd,3) )
+    ALLOCATE( stage(nkb,nbnd,3) )
+    ALLOCATE( a2_d(nbnd*nbo,nm), dyn_d(nm,nm) )
+    nmc = ncol_fit( 16.0_DP * nbo * ( REAL(nkb,DP) + nbnd ), nm )
+    ALLOCATE( psv_d(nkb,nbo*nmc), a1_d(nbnd*nbo,nmc) )
+    !$cuf kernel do(2)
+    DO mu = 1, nm
+       DO c = 1, nm
+          dyn_d(c,mu) = (0.0_DP, 0.0_DP)
+       ENDDO
+    ENDDO
+    !
+    DO ik = 1, nksq
+       ikk = ikks(ik)
+       nocc = nbnd_occ(ikk)
+       IF ( lsda ) current_spin = isk(ikk)
+       isp = current_spin
+       !
+       bp1_d = becp1(ik)%k
+       bq_d = becq(ik)%k
+       DO ipol = 1, 3
+          stage(:,:,ipol) = alphap(ipol,ik)%k(:,:)
+       ENDDO
+       alp_d = stage
+       DO ipol = 1, 3
+          stage(:,:,ipol) = alpq(ipol,ik)%k(:,:)
+       ENDDO
+       alq_d = stage
+       wgg_d = wgg(:,:,ik)
+       et_d = et(1:nbnd,ikk)
+       qq_h(:,:,:) = deeq(:,:,1:nat,isp)
+       deeq_d = qq_h
+       int1_d = int1(:,:,:,:,isp)
+       !
+       ! ... the four products with the beta functions (ps1 ... ps4)
+       !
+       !$cuf kernel do(2)
+       DO ibnd = 1, nocc
+          DO ikb = 1, nkbl
+             na = kbna_d(ikb) ; iof = kbof_d(ikb) ; ih = ikb - iof
+             s = (0.0_DP, 0.0_DP)
+             DO jh = 1, kbnh_d(ikb)
+                de = deeq_d(ih,jh,na) - et_d(ibnd) * qqat_d(ih,jh,na)
+                s = s + de * bp1_d(iof+jh,ibnd)
+             ENDDO
+             ps1_d(ikb,ibnd) = s
+          ENDDO
+       ENDDO
+       !$cuf kernel do(3)
+       DO ipol = 1, 3
+          DO ibnd = 1, nocc
+             DO ikb = 1, nkbl
+                na = kbna_d(ikb) ; iof = kbof_d(ikb) ; ih = ikb - iof
+                s = (0.0_DP, 0.0_DP)
+                DO jh = 1, kbnh_d(ikb)
+                   de = deeq_d(ih,jh,na) - et_d(ibnd) * qqat_d(ih,jh,na)
+                   s = s + de * alp_d(iof+jh,ibnd,ipol) + int1_d(ih,jh,ipol,na) * bp1_d(iof+jh,ibnd)
+                ENDDO
+                ps2_d(ikb,ibnd,ipol) = s
+             ENDDO
+          ENDDO
+       ENDDO
+       !$cuf kernel do(2)
+       DO jbnd = 1, nbndl
+          DO ikb = 1, nkbl
+             na = kbna_d(ikb) ; iof = kbof_d(ikb) ; ih = ikb - iof
+             s = (0.0_DP, 0.0_DP)
+             DO jh = 1, kbnh_d(ikb)
+                s = s - qq_d(ih,jh,na) * bq_d(iof+jh,jbnd)
+             ENDDO
+             ps3_d(ikb,jbnd) = s
+          ENDDO
+       ENDDO
+       !$cuf kernel do(3)
+       DO ipol = 1, 3
+          DO jbnd = 1, nbndl
+             DO ikb = 1, nkbl
+                na = kbna_d(ikb) ; iof = kbof_d(ikb) ; ih = ikb - iof
+                s = (0.0_DP, 0.0_DP)
+                DO jh = 1, kbnh_d(ikb)
+                   s = s - qq_d(ih,jh,na) * alq_d(iof+jh,jbnd,ipol)
+                ENDDO
+                ps4_d(ikb,jbnd,ipol) = s
+             ENDDO
+          ENDDO
+       ENDDO
+       !
+       ! ... wgg(i,j) A2(j,i;nu), nu = (nb,jpol): row (ibnd-1)*nbnd + jbnd
+       !
+       !$cuf kernel do(3)
+       DO mu = 1, nm
+          DO ibnd = 1, nocc
+             DO jbnd = 1, nbndl
+                nb = (mu-1)/3 + 1
+                ipol = mu - 3*(nb-1)
+                iofb = atof_d(nb)
+                s = (0.0_DP, 0.0_DP)
+                DO ih = 1, atnh_d(nb)
+                   s = s + ps3_d(iofb+ih,jbnd) * CONJG( alp_d(iofb+ih,ibnd,ipol) ) + &
+                           ps4_d(iofb+ih,jbnd,ipol) * CONJG( bp1_d(iofb+ih,ibnd) )
+                ENDDO
+                a2_d((ibnd-1)*nbndl+jbnd,mu) = wgg_d(ibnd,jbnd) * s
+             ENDDO
+          ENDDO
+       ENDDO
+       !
+       ! ... A1(j,i;mu), mu = (na,ipol), a chunk of mu at a time
+       !
+       zfac = CMPLX( 2.0_DP * wk(ikk), 0.0_DP, KIND=DP )
+       DO m0 = 0, nm-1, nmc
+          nmcur = MIN( nmc, nm-m0 )
+          ncols = nocc * nmcur
+          !$cuf kernel do(2)
+          DO c = 1, ncols
+             DO ikb = 1, nkbl
+                im = (c-1)/nocc + 1
+                ibnd = c - (im-1)*nocc
+                mu = m0 + im
+                na = (mu-1)/3 + 1
+                ipol = mu - 3*(na-1)
+                nb = kbna_d(ikb) ; iofb = kbof_d(ikb) ; ih = ikb - iofb
+                s = (0.0_DP, 0.0_DP)
+                DO jh = 1, kbnh_d(ikb)
+                   s = s + int2_d(ih,jh,ipol,na,nb) * bp1_d(iofb+jh,ibnd)
+                ENDDO
+                psv_d(ikb,c) = s
+             ENDDO
+          ENDDO
+          IF ( nocc == nbo ) THEN
+             istat = cublasZgemm( hblas, CUBLAS_OP_C, CUBLAS_OP_N, nbnd, ncols, nkb, c_one, &
+                                  bq_d, nkb, psv_d, nkb, c_zero, a1_d, nbnd )
+             IF ( istat /= 0 ) CALL errore( 'nldyn_dev', 'cublasZgemm failed', ABS(istat) )
+          ELSE
+             DO im = 1, nmcur
+                istat = cublasZgemm( hblas, CUBLAS_OP_C, CUBLAS_OP_N, nbnd, nocc, nkb, c_one, &
+                                     bq_d, nkb, psv_d(1,(im-1)*nocc+1), nkb, c_zero, a1_d(1,im), nbnd )
+                IF ( istat /= 0 ) CALL errore( 'nldyn_dev', 'cublasZgemm failed', ABS(istat) )
+             ENDDO
+          ENDIF
+          !$cuf kernel do(3)
+          DO im = 1, nmcur
+             DO ibnd = 1, nocc
+                DO jbnd = 1, nbndl
+                   mu = m0 + im
+                   na = (mu-1)/3 + 1
+                   ipol = mu - 3*(na-1)
+                   iof = atof_d(na)
+                   s = (0.0_DP, 0.0_DP)
+                   DO ih = 1, atnh_d(na)
+                      s = s + CONJG( alq_d(iof+ih,jbnd,ipol) ) * ps1_d(iof+ih,ibnd) + &
+                              CONJG( bq_d(iof+ih,jbnd) ) * ps2_d(iof+ih,ibnd,ipol)
+                   ENDDO
+                   a1_d((ibnd-1)*nbndl+jbnd,im) = a1_d((ibnd-1)*nbndl+jbnd,im) + s
+                ENDDO
+             ENDDO
+          ENDDO
+          istat = cublasZgemm( hblas, CUBLAS_OP_T, CUBLAS_OP_N, nm, nmcur, nbnd*nocc, zfac, &
+                               a2_d, nbnd*nbo, a1_d, nbnd*nbo, c_one, dyn_d(1,m0+1), nm )
+          IF ( istat /= 0 ) CALL errore( 'nldyn_dev', 'cublasZgemm failed', ABS(istat) )
+       ENDDO
+    ENDDO
+    !
+    dynwrk = dyn_d
+    DEALLOCATE( kbna_d, kbof_d, kbnh_d, atof_d, atnh_d, qq_d, qqat_d, deeq_d, int1_d, int2_d )
+    DEALLOCATE( bp1_d, bq_d, alp_d, alq_d, wgg_d, et_d, ps1_d, ps2_d, ps3_d, ps4_d )
+    DEALLOCATE( a2_d, dyn_d, psv_d, a1_d, stage, qq_h )
+    done = .TRUE.
+    !
+  END SUBROUTINE nldyn_dev
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE wdyn_dev( drhous, wdyn, done )
+    !-----------------------------------------------------------------------
+    !! wdyn(nu_j,nu_i) = omega/N sum_is sum_r conj(drhous(r,is,nu_j)) dV_loc(r;nu_i):
+    !! the part of the orthogonality term of the dynamical matrix that
+    !! contains the local potential (the double loop over the modes of drho).
+    !! done = .FALSE. on exit: nothing was computed.
+    !
+    USE ions_base,        ONLY : nat
+    USE cell_base,        ONLY : omega
+    USE fft_base,         ONLY : dffts
+    USE noncollin_module, ONLY : nspin_lsda, nspin_mag
+    USE modes,            ONLY : u
+    !
+    COMPLEX(DP), INTENT(IN) :: drhous(dffts%nnr,nspin_mag,3*nat)
+    COMPLEX(DP), INTENT(OUT) :: wdyn(3*nat,3*nat)
+    LOGICAL, INTENT(OUT) :: done
+    !
+    INTEGER :: nm, nnr, is, i0, nbt, nbcur, i, istat
+    COMPLEX(DP) :: zfac, beta
+    COMPLEX(DP), ALLOCATABLE :: dvl_h(:,:), a_h(:,:), w_h(:,:)
+    COMPLEX(DP), ALLOCATABLE, DEVICE :: a_d(:,:,:), b_d(:,:), w_d(:,:)
+    !
+    done = .FALSE.
+    wdyn(:,:) = c_zero
+    nm = 3 * nat
+    nnr = dffts%nnr
+    IF ( 16.0_DP * REAL(nnr,DP) * nm * nspin_lsda > 0.3_DP * free_bytes( ) ) RETURN
+    IF ( .NOT. blas_ready ) THEN
+       istat = cublasCreate( hblas )
+       IF ( istat /= 0 ) CALL errore( 'phq_setup_dev', 'cublasCreate failed', ABS(istat) )
+       blas_ready = .TRUE.
+    ENDIF
+    !
+    ALLOCATE( a_d(nnr,nm,nspin_lsda), a_h(nnr,nm) )
+    DO is = 1, nspin_lsda
+       a_h(:,:) = drhous(:,is,:)
+       a_d(:,:,is) = a_h(:,:)
+    ENDDO
+    DEALLOCATE( a_h )
+    nbt = ncol_fit( 16.0_DP * REAL(nnr,DP), nm )
+    ALLOCATE( b_d(nnr,nbt), w_d(nm,nbt), dvl_h(nnr,nbt), w_h(nm,nbt) )
+    zfac = CMPLX( omega / DBLE( dffts%nr1 * dffts%nr2 * dffts%nr3 ), 0.0_DP, KIND=DP )
+    DO i0 = 0, nm-1, nbt
+       nbcur = MIN( nbt, nm-i0 )
+       DO i = 1, nbcur
+          CALL compute_dvloc( u(1,i0+i), .FALSE., dvl_h(1,i) )
+       ENDDO
+       b_d(:,1:nbcur) = dvl_h(:,1:nbcur)
+       beta = c_zero
+       DO is = 1, nspin_lsda
+          istat = cublasZgemm( hblas, CUBLAS_OP_C, CUBLAS_OP_N, nm, nbcur, nnr, zfac, &
+                               a_d(1,1,is), nnr, b_d, nnr, beta, w_d, nm )
+          IF ( istat /= 0 ) CALL errore( 'wdyn_dev', 'cublasZgemm failed', ABS(istat) )
+          beta = c_one
+       ENDDO
+       w_h(:,1:nbcur) = w_d(:,1:nbcur)
+       wdyn(:,i0+1:i0+nbcur) = w_h(:,1:nbcur)
+    ENDDO
+    DEALLOCATE( a_d, b_d, w_d, dvl_h, w_h )
+    done = .TRUE.
+    !
+  END SUBROUTINE wdyn_dev
+  !
 #else
   !
   SUBROUTINE drhous_dev( drhous, dbecsum, wgg, becq, alpq, done )
@@ -583,6 +916,30 @@ CONTAINS
     LOGICAL, INTENT(OUT) :: done
     done = .FALSE.
   END SUBROUTINE drhous_dev
+  !
+  SUBROUTINE nldyn_dev( dynwrk, wgg, becq, alpq, done )
+    USE ions_base,   ONLY : nat
+    USE wvfct,       ONLY : nbnd
+    USE qpoint,      ONLY : nksq
+    USE becmod,      ONLY : bec_type
+    COMPLEX(DP), INTENT(OUT) :: dynwrk(3*nat,3*nat)
+    REAL(DP), INTENT(IN) :: wgg(nbnd,nbnd,nksq)
+    TYPE(bec_type), INTENT(IN) :: becq(nksq), alpq(3,nksq)
+    LOGICAL, INTENT(OUT) :: done
+    dynwrk = (0.0_DP, 0.0_DP)
+    done = .FALSE.
+  END SUBROUTINE nldyn_dev
+  !
+  SUBROUTINE wdyn_dev( drhous, wdyn, done )
+    USE ions_base,        ONLY : nat
+    USE fft_base,         ONLY : dffts
+    USE noncollin_module, ONLY : nspin_mag
+    COMPLEX(DP), INTENT(IN) :: drhous(dffts%nnr,nspin_mag,3*nat)
+    COMPLEX(DP), INTENT(OUT) :: wdyn(3*nat,3*nat)
+    LOGICAL, INTENT(OUT) :: done
+    wdyn = (0.0_DP, 0.0_DP)
+    done = .FALSE.
+  END SUBROUTINE wdyn_dev
   !
 #endif
   !
