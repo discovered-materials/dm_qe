@@ -1154,6 +1154,321 @@ CONTAINS
   END SUBROUTINE add_dbecsum
   !
   !-----------------------------------------------------------------------
+  SUBROUTINE setup_sp( )
+    !-----------------------------------------------------------------------
+    !! single-precision copies of the projectors and FFT plans
+    INTEGER :: ik, iw, ig, nb, i, istat, fdim(3), n1, n2, n3, nb2
+    !
+    n1 = npwxl ; n2 = nw ; n3 = nks ; nb2 = nbq
+    ALLOCATE( ws_d(npwxl,nw,nks) )
+    !$cuf kernel do(3)
+    DO ik = 1, n3
+       DO iw = 1, n2
+          DO ig = 1, n1
+             ws_d(ig,iw,ik) = CMPLX( w_d(ig,iw,ik), KIND=SP )
+          ENDDO
+       ENDDO
+    ENDDO
+    IF ( lus .AND. use_z ) THEN
+       ALLOCATE( evqs_d(npwxl,nbq,nks) )
+       !$cuf kernel do(3)
+       DO ik = 1, n3
+          DO iw = 1, nb2
+             DO ig = 1, n1
+                evqs_d(ig,iw,ik) = CMPLX( evq_d(ig,iw,ik), KIND=SP )
+             ENDDO
+          ENDDO
+       ENDDO
+    ENDIF
+    ALLOCATE( psigs_d(nnr*nfb), psics_d(nnr*nfb) )
+    psigs_d = (0.0_SP, 0.0_SP)
+    fdim = (/ nr3, nr2, nr1 /)
+    DO i = 1, nplan
+       istat = cufftPlanMany( plans(i), 3, fdim, fdim, 1, nnr, fdim, 1, nnr, CUFFT_C2C, plan_nb(i) )
+       IF ( istat /= 0 ) CALL errore( 'dfpt_dev', 'cufftPlanMany (C2C) failed', ABS(istat) )
+    ENDDO
+    !
+  END SUBROUTINE setup_sp
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE gemm_ks( trans, m, n, k, alpha, a_dev, lda, stra, b_dev, ldb, strb, beta, &
+                      c_dev, ldc, strc, nbatch )
+    !-----------------------------------------------------------------------
+    !! single-precision twin of gemm_k
+    INTEGER, INTENT(IN) :: trans, m, n, k, lda, ldb, ldc, nbatch
+    INTEGER(8), INTENT(IN) :: stra, strb, strc
+    COMPLEX(SP), INTENT(IN) :: alpha, beta
+    COMPLEX(SP), DEVICE :: a_dev(*), b_dev(*), c_dev(*)
+    INTEGER :: istat, i
+    !
+    IF ( nbatch <= 0 .OR. m <= 0 .OR. n <= 0 ) RETURN
+    IF ( batched_gemm .AND. nbatch > 1 ) THEN
+       istat = cublasCgemmStridedBatched( hblas, trans, CUBLAS_OP_N, m, n, k, alpha, a_dev, lda, &
+                                          stra, b_dev, ldb, strb, beta, c_dev, ldc, strc, nbatch )
+       IF ( istat /= 0 ) CALL errore( 'dfpt_dev', 'cublasCgemmStridedBatched failed', ABS(istat) )
+    ELSE
+       DO i = 0, nbatch-1
+          istat = cublasCgemm( hblas, trans, CUBLAS_OP_N, m, n, k, alpha, a_dev(1+i*stra), lda, &
+                               b_dev(1+i*strb), ldb, beta, c_dev(1+i*strc), ldc )
+          IF ( istat /= 0 ) CALL errore( 'dfpt_dev', 'cublasCgemm failed', ABS(istat) )
+       ENDDO
+    ENDIF
+    !
+  END SUBROUTINE gemm_ks
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE apply_h_sp( nact )
+    !-----------------------------------------------------------------------
+    !! ts_d = ( H - e S + alpha_pv P_v ) hs_d in single precision for the
+    !! nact columns listed in act_d (see apply_h). With few k-points the
+    !! nonlocal and projector terms are computed for the active columns
+    !! only.
+    !
+    INTEGER, INTENT(IN) :: nact
+    !
+    INTEGER :: j0, nb, ip, j, ig, ir, c, ik, istat, k1, k2, i, nck, nwl, nkl, iw, &
+               na, iof, ih, jh, is, j1, j2, nak, jj, n1
+    REAL(SP) :: scale
+    REAL(DP) :: apv, ee
+    COMPLEX(DP) :: s
+    COMPLEX(SP), PARAMETER :: s_one = (1.0_SP, 0.0_SP), s_zero = (0.0_SP, 0.0_SP)
+    !
+    CALL start_clock( 'dfptd_hpsi' )
+    scale = 1.0_SP / REAL(nnr,SP)
+    nck = ncolk ; nwl = nw ; nkl = nkbl ; apv = alpha_pv_l ; n1 = npwxl
+    !
+    DO j0 = 0, nact-1, nfb
+       nb = MIN( nfb, nact-j0 )
+       ip = pick_plan( nb )
+       !$cuf kernel do(2)
+       DO j = 1, nb
+          DO ig = 1, npwxl
+             c = act_d(j0+j)
+             ik = (c-1)/nck + 1
+             IF ( ig <= npwq_d(ik) ) psigs_d(nlq_d(ig,ik) + (j-1)*nnr) = hs_d(ig,c)
+          ENDDO
+       ENDDO
+       istat = cufftExecC2C( plans(ip), psigs_d, psics_d, CUFFT_INVERSE )
+       !$cuf kernel do(2)
+       DO j = 1, nb
+          DO ig = 1, npwxl
+             c = act_d(j0+j)
+             ik = (c-1)/nck + 1
+             IF ( ig <= npwq_d(ik) ) psigs_d(nlq_d(ig,ik) + (j-1)*nnr) = (0.0_SP, 0.0_SP)
+          ENDDO
+       ENDDO
+       !$cuf kernel do(2)
+       DO j = 1, nb
+          DO ir = 1, nnr
+             c = act_d(j0+j)
+             ik = (c-1)/nck + 1
+             psics_d(ir + (j-1)*nnr) = psics_d(ir + (j-1)*nnr) * REAL( v_d(ir,spin_d(ik)), SP )
+          ENDDO
+       ENDDO
+       istat = cufftExecC2C( plans(ip), psics_d, psics_d, CUFFT_FORWARD )
+       !$cuf kernel do(2)
+       DO j = 1, nb
+          DO ig = 1, npwxl
+             c = act_d(j0+j)
+             ik = (c-1)/nck + 1
+             IF ( ig <= npwq_d(ik) ) THEN
+                ts_d(ig,c) = REAL( g2_d(ig,ik) - e_d(c), SP ) * hs_d(ig,c) + &
+                             psics_d(nlq_d(ig,ik) + (j-1)*nnr) * scale
+             ELSE
+                ts_d(ig,c) = (0.0_SP, 0.0_SP)
+             ENDIF
+          ENDDO
+       ENDDO
+    ENDDO
+    !
+    IF ( batched_gemm ) THEN
+       !
+       ! ... many k-points: all columns of runs of consecutive active k-points
+       !
+       i = 1
+       DO WHILE ( i <= nact )
+          k1 = (act_h(i)-1)/ncolk + 1
+          k2 = k1
+          DO WHILE ( i <= nact )
+             ik = (act_h(i)-1)/ncolk + 1
+             IF ( ik > k2+1 ) EXIT
+             k2 = ik
+             i = i + 1
+          ENDDO
+          CALL gemm_ks( CUBLAS_OP_C, nw, ncolk, npwxl, s_one, ws_d(1,1,k1), npwxl, INT(npwxl,8)*nw, &
+                        hs_d(1,(k1-1)*ncolk+1), npwxl, INT(npwxl,8)*ncolk, s_zero, &
+                        cws_d(1,(k1-1)*ncolk+1), nw, INT(nw,8)*ncolk, k2-k1+1 )
+          !$cuf kernel do(2)
+          DO c = (k1-1)*nck+1, k2*nck
+             DO iw = 1, nwl
+                ik = (c-1)/nck + 1
+                IF ( iw <= nkl ) THEN
+                   na = kbna_d(iw) ; iof = kbof_d(iw) ; ih = iw - iof
+                   is = spin_d(ik) ; ee = e_d(c)
+                   s = (0.0_DP, 0.0_DP)
+                   DO jh = 1, kbnh_d(iw)
+                      s = s + ( deeq_d(ih,jh,na,is) - ee * qq_d(ih,jh,na) ) * cws_d(iof+jh,c)
+                   ENDDO
+                   cw2s_d(iw,c) = CMPLX( s, KIND=SP )
+                ELSEIF ( iw - nkl <= noccq_d(ik) ) THEN
+                   cw2s_d(iw,c) = REAL( apv, SP ) * cws_d(iw,c)
+                ELSE
+                   cw2s_d(iw,c) = (0.0_SP, 0.0_SP)
+                ENDIF
+             ENDDO
+          ENDDO
+          CALL gemm_ks( CUBLAS_OP_N, npwxl, ncolk, nw, s_one, ws_d(1,1,k1), npwxl, INT(npwxl,8)*nw, &
+                        cw2s_d(1,(k1-1)*ncolk+1), nw, INT(nw,8)*ncolk, s_one, &
+                        ts_d(1,(k1-1)*ncolk+1), npwxl, INT(npwxl,8)*ncolk, k2-k1+1 )
+       ENDDO
+       !
+    ELSE
+       !
+       ! ... few k-points: the active columns of each k-point, gathered
+       !
+       j1 = 1
+       DO WHILE ( j1 <= nact )
+          ik = (act_h(j1)-1)/ncolk + 1
+          j2 = j1
+          DO WHILE ( j2 < nact )
+             IF ( (act_h(j2+1)-1)/ncolk + 1 /= ik ) EXIT
+             j2 = j2 + 1
+          ENDDO
+          nak = j2 - j1 + 1
+          !$cuf kernel do(2)
+          DO jj = 1, nak
+             DO ig = 1, n1
+                hcs_d(ig,jj) = hs_d(ig,act_d(j1-1+jj))
+             ENDDO
+          ENDDO
+          istat = cublasCgemm( hblas, CUBLAS_OP_C, CUBLAS_OP_N, nw, nak, npwxl, s_one, ws_d(1,1,ik), &
+                               npwxl, hcs_d, npwxl, s_zero, cws_d, nw )
+          !$cuf kernel do(2)
+          DO jj = 1, nak
+             DO iw = 1, nwl
+                c = act_d(j1-1+jj)
+                IF ( iw <= nkl ) THEN
+                   na = kbna_d(iw) ; iof = kbof_d(iw) ; ih = iw - iof
+                   is = spin_d(ik) ; ee = e_d(c)
+                   s = (0.0_DP, 0.0_DP)
+                   DO jh = 1, kbnh_d(iw)
+                      s = s + ( deeq_d(ih,jh,na,is) - ee * qq_d(ih,jh,na) ) * cws_d(iof+jh,jj)
+                   ENDDO
+                   cw2s_d(iw,jj) = CMPLX( s, KIND=SP )
+                ELSEIF ( iw - nkl <= noccq_d(ik) ) THEN
+                   cw2s_d(iw,jj) = REAL( apv, SP ) * cws_d(iw,jj)
+                ELSE
+                   cw2s_d(iw,jj) = (0.0_SP, 0.0_SP)
+                ENDIF
+             ENDDO
+          ENDDO
+          istat = cublasCgemm( hblas, CUBLAS_OP_N, CUBLAS_OP_N, npwxl, nak, nw, s_one, ws_d(1,1,ik), &
+                               npwxl, cw2s_d, nw, s_zero, tcs_d, npwxl )
+          !$cuf kernel do(2)
+          DO jj = 1, nak
+             DO ig = 1, n1
+                ts_d(ig,act_d(j1-1+jj)) = ts_d(ig,act_d(j1-1+jj)) + tcs_d(ig,jj)
+             ENDDO
+          ENDDO
+          j1 = j2 + 1
+       ENDDO
+       !
+    ENDIF
+    CALL stop_clock( 'dfptd_hpsi' )
+    !
+  END SUBROUTINE apply_h_sp
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE add_zprec_sp( nact )
+    !-----------------------------------------------------------------------
+    !! single-precision twin of add_zprec (operates on gs_d, ts_d)
+    INTEGER, INTENT(IN) :: nact
+    INTEGER :: i, ik, k1, k2, c, jz, ig, j, nck, nzl, zo, n1
+    REAL(DP) :: s, de
+    COMPLEX(SP), PARAMETER :: s_one = (1.0_SP, 0.0_SP), s_zero = (0.0_SP, 0.0_SP)
+    !
+    nck = ncolk ; nzl = nz ; zo = zoff ; n1 = npwxl
+    i = 1
+    DO WHILE ( i <= nact )
+       k1 = (act_h(i)-1)/ncolk + 1
+       k2 = k1
+       DO WHILE ( i <= nact )
+          ik = (act_h(i)-1)/ncolk + 1
+          IF ( ik > k2+1 ) EXIT
+          k2 = ik
+          i = i + 1
+       ENDDO
+       IF ( lus ) THEN
+          CALL gemm_ks( CUBLAS_OP_C, nz, ncolk, npwxl, s_one, evqs_d(1,zoff+1,k1), npwxl, &
+                        INT(npwxl,8)*nbq, gs_d(1,(k1-1)*ncolk+1), npwxl, INT(npwxl,8)*ncolk, s_zero, &
+                        cws_d(1,(k1-1)*ncolk+1), nw, INT(nw,8)*ncolk, k2-k1+1 )
+       ELSE
+          CALL gemm_ks( CUBLAS_OP_C, nz, ncolk, npwxl, s_one, ws_d(1,nkbl+zoff+1,k1), npwxl, &
+                        INT(npwxl,8)*nw, gs_d(1,(k1-1)*ncolk+1), npwxl, INT(npwxl,8)*ncolk, s_zero, &
+                        cws_d(1,(k1-1)*ncolk+1), nw, INT(nw,8)*ncolk, k2-k1+1 )
+       ENDIF
+       !$cuf kernel do(2)
+       DO c = (k1-1)*nck+1, k2*nck
+          DO jz = 1, nzl
+             ik = (c-1)/nck + 1
+             de = etq_d(zo+jz,ik) - e_d(c)
+             IF ( zo+jz > noccq_d(ik) .AND. de > 1.0E-3_DP ) THEN
+                cws_d(jz,c) = cws_d(jz,c) / REAL( de, SP )
+             ELSE
+                cws_d(jz,c) = (0.0_SP, 0.0_SP)
+             ENDIF
+          ENDDO
+       ENDDO
+       IF ( lus ) THEN
+          CALL gemm_ks( CUBLAS_OP_N, npwxl, ncolk, nz, s_one, evqs_d(1,zoff+1,k1), npwxl, &
+                        INT(npwxl,8)*nbq, cws_d(1,(k1-1)*ncolk+1), nw, INT(nw,8)*ncolk, s_one, &
+                        ts_d(1,(k1-1)*ncolk+1), npwxl, INT(npwxl,8)*ncolk, k2-k1+1 )
+       ELSE
+          CALL gemm_ks( CUBLAS_OP_N, npwxl, ncolk, nz, s_one, ws_d(1,nkbl+zoff+1,k1), npwxl, &
+                        INT(npwxl,8)*nw, cws_d(1,(k1-1)*ncolk+1), nw, INT(nw,8)*ncolk, s_one, &
+                        ts_d(1,(k1-1)*ncolk+1), npwxl, INT(npwxl,8)*ncolk, k2-k1+1 )
+       ENDIF
+    ENDDO
+    !
+    !$acc parallel loop gang private(c, s)
+    DO j = 1, nact
+       c = act_d(j)
+       s = 0.0_DP
+       !$acc loop vector reduction(+:s)
+       DO ig = 1, n1
+          s = s + DBLE( CONJG(ts_d(ig,c)) * gs_d(ig,c) )
+       ENDDO
+       rho_d(c) = s
+       rhoc_d(j) = s
+    ENDDO
+    !
+  END SUBROUTINE add_zprec_sp
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE isort_small( n, a )
+    !-----------------------------------------------------------------------
+    !! ascending sort of an integer list (the pending columns are found in
+    !! several passes, each one ascending)
+    INTEGER, INTENT(IN) :: n
+    INTEGER, INTENT(INOUT) :: a(n)
+    INTEGER :: i, j, v, gap
+    gap = n / 2
+    DO WHILE ( gap > 0 )
+       DO i = gap+1, n
+          v = a(i)
+          j = i
+          DO WHILE ( j > gap )
+             IF ( a(j-gap) <= v ) EXIT
+             a(j) = a(j-gap)
+             j = j - gap
+          ENDDO
+          a(j) = v
+       ENDDO
+       gap = gap / 2
+    ENDDO
+  END SUBROUTINE isort_small
+  !
+  !-----------------------------------------------------------------------
   SUBROUTINE add_zprec( nact )
     !-----------------------------------------------------------------------
     !! Spectral part of the preconditioner: t += sum_c psi_c (psi_c^H g) /
