@@ -62,7 +62,12 @@ SUBROUTINE phq_init()
   USE ldaU,                 ONLY : lda_plus_u
   USE uspp_init,            ONLY : init_us_2
   !
+  USE dfpt_dev,             ONLY : dfpt_dev_set_work
+  USE beta_cache,           ONLY : beta_cache_build
+  USE partial,              ONLY : comp_irr, done_irr
+  USE modes,                ONLY : nirr, npert
   IMPLICIT NONE
+  INTEGER :: nwork
   !
   ! ... local variables
   !
@@ -90,6 +95,22 @@ SUBROUTINE phq_init()
   IF (all_done) RETURN
   !
   CALL start_clock( 'phq_init' )
+  !
+  ! ... what the run is going to solve for at this q-point: sizes the set-up
+  ! ... work of the device solver
+  !
+  nwork = 0
+  IF ( trans ) THEN
+     DO irr = 1, nirr
+        IF ( comp_irr(irr) .AND. .NOT. done_irr(irr) ) nwork = nwork + npert(irr)
+     ENDDO
+  ENDIF
+  IF ( epsil .OR. zue ) nwork = nwork + 3
+  CALL dfpt_dev_set_work( nwork )
+  !
+  ! ... beta functions of all k and k+q, for the many routines that ask for them
+  !
+  CALL beta_cache_build( )
   !
 #if defined(__CUDA)
   Call allocate_bec_type_acc ( nkb, nbnd, bectmp )

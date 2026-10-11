@@ -49,6 +49,8 @@ subroutine drho
   USE mp,         ONLY : mp_sum
   USE becmod,     ONLY : bec_type, allocate_bec_type, deallocate_bec_type
   USE fft_interfaces, ONLY : fft_interpolate
+  USE phq_setup_dev,  ONLY : phq_setup_dev_on, wdyn_dev
+  USE usaug_dev,      ONLY : usaug_check, usaug_interp_on, usaug_interpolate
 
   implicit none
 
@@ -69,6 +71,9 @@ subroutine drho
 
 
   complex(DP) :: wdyn (3 * nat, 3 * nat)
+  complex(DP), allocatable :: wdyn_dev_ (:,:), drhoust_dev_ (:,:,:), drhoust_ref_ (:,:,:)
+  ! result of the device code (self-test only)
+  logical :: done, lcheck
   type (bec_type), pointer :: becq(:), alpq(:,:)
   complex(DP), allocatable :: dvlocin (:), drhous (:,:,:),&
        drhoust (:,:,:), dbecsum(:,:,:,:), dbecsum_nc(:,:,:,:,:)
@@ -160,18 +165,36 @@ subroutine drho
 
   wdyn (:,:) = (0.d0, 0.d0)
   nrstot = dffts%nr1 * dffts%nr2 * dffts%nr3
-  do nu_i = 1, 3 * nat
-     call compute_dvloc (u(1, nu_i), .FALSE., dvlocin)
-     do nu_j = 1, 3 * nat
-        do is = 1, nspin_lsda
-        ! FIXME: use zgemm instead of dot_product
-           wdyn (nu_j, nu_i) = wdyn (nu_j, nu_i) + &
-                dot_product (drhous(1:dffts%nnr,is,nu_j), dvlocin) * &
-                omega / DBLE (nrstot)
+  !
+  ! Device code: the scalar products of all pairs of modes are one matrix product
+  !
+  done = .false.
+  if (phq_setup_dev_on() .and. .not. noncolin) then
+     call wdyn_dev (drhous, wdyn, done)
+     if (done .and. usaug_check()) then
+        allocate (wdyn_dev_, source = wdyn)
+        wdyn (:,:) = (0.d0, 0.d0)
+        done = .false.
+     endif
+  endif
+  if (.not. done) then
+     do nu_i = 1, 3 * nat
+        call compute_dvloc (u(1, nu_i), .FALSE., dvlocin)
+        do nu_j = 1, 3 * nat
+           do is = 1, nspin_lsda
+           ! FIXME: use zgemm instead of dot_product
+              wdyn (nu_j, nu_i) = wdyn (nu_j, nu_i) + &
+                   dot_product (drhous(1:dffts%nnr,is,nu_j), dvlocin) * &
+                   omega / DBLE (nrstot)
+           enddo
         enddo
-     enddo
 
-  enddo
+     enddo
+  endif
+  if (allocated(wdyn_dev_)) then
+     lcheck = usaug_check ('drho wdyn', size(wdyn), wdyn_dev_, wdyn)
+     deallocate (wdyn_dev_)
+  endif
   !
   ! collect contributions from all pools (sum over k-points)
   !
@@ -227,7 +250,27 @@ subroutine drho
      npe_offset = 0
      do irr = irr_batch, irr_end
         npe = npert(irr)
-        if (doublegrid) then
+        if (doublegrid .and. usaug_interp_on()) then
+           !
+           ! all the perturbations of the irrep together on the device
+           !
+           call usaug_interpolate (nspin_mag*npe, .true., drhous(1,1,mode+1), &
+                                   drhoust(1,1,npe_offset+1))
+           if (usaug_check()) then
+              allocate (drhoust_dev_(dfftp%nnr,nspin_mag,npe))
+              drhoust_dev_(:,:,:) = drhoust(:,:,npe_offset+1:npe_offset+npe)
+              do is = 1, nspin_mag
+                 do iper = 1, npe
+                    call fft_interpolate (dffts, drhous(:,is,mode+iper), dfftp, &
+                                        drhoust(:,is,npe_offset+iper))
+                 enddo
+              enddo
+              allocate (drhoust_ref_(dfftp%nnr,nspin_mag,npe))
+              drhoust_ref_(:,:,:) = drhoust(:,:,npe_offset+1:npe_offset+npe)
+              lcheck = usaug_check ('drho interpolate', size(drhoust_ref_), drhoust_dev_, drhoust_ref_)
+              deallocate (drhoust_dev_, drhoust_ref_)
+           endif
+        elseif (doublegrid) then
            do is = 1, nspin_mag
               do iper = 1, npe
                  call fft_interpolate (dffts, drhous(:,is,mode+iper), dfftp, &

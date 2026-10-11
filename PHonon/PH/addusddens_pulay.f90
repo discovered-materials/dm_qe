@@ -44,6 +44,7 @@ subroutine addusddens_pulay (drhop, dbecsum, mode0, npe)
   USE phus,    ONLY : becsumort, alphasum
   USE noncollin_module, ONLY : nspin_mag
   USE qpoint,     ONLY : xq, eigqts
+  USE usaug_dev,  ONLY : usaug_on, usaug_addusddens_pulay, usaug_check
 
   implicit none
   !
@@ -97,10 +98,35 @@ subroutine addusddens_pulay (drhop, dbecsum, mode0, npe)
   ! mapping: (nt, ijh) for each entry
   ! total number of (nt,ih,jh) entries
   ! counter for entries
+  complex(DP), allocatable :: drhop_dev(:,:,:), drhop_in(:,:,:), bso_dev(:,:,:,:), bso_ref(:,:,:,:)
+  ! results of the device code and input density (self-test only)
+  logical :: lcheck
   !
   IF (.not.okvan) return
   !
   CALL start_clock ('addusddens_pulay')
+  !
+  ! Device code: the table of Q_ij(q+G) is kept on the GPU and the sum over
+  ! (ij, atoms) is two matrix products per atomic type
+  !
+  IF (usaug_on()) THEN
+     IF (usaug_check()) allocate (drhop_in, source = drhop)
+     IF (okpaw) THEN
+        call usaug_addusddens_pulay (npe, mode0, u, dbecsum, alphasum, drhop, .true., becsumort)
+     ELSE
+        allocate (bso_dev(1,1,1,1))
+        call usaug_addusddens_pulay (npe, mode0, u, dbecsum, alphasum, drhop, .false., bso_dev)
+        deallocate (bso_dev)
+     ENDIF
+     IF (.not. usaug_check()) THEN
+        call stop_clock ('addusddens_pulay')
+        return
+     ENDIF
+     allocate (drhop_dev, source = drhop)
+     drhop_dev = drhop_dev - drhop_in
+     drhop = drhop_in
+     IF (okpaw) allocate (bso_dev, source = becsumort(:,:,:,mode0+1:mode0+npe))
+  ENDIF
   !
   ! Pre-compute mode-independent quantities
   ! First count the number of (nt,ih,jh) entries
@@ -235,6 +261,16 @@ subroutine addusddens_pulay (drhop, dbecsum, mode0, npe)
         call zaxpy(dfftp%nnr, (1.d0, 0.d0), psic, 1, drhop(1,is,ipert), 1)
      enddo
   enddo
+  IF (allocated(drhop_dev)) THEN
+     drhop_in = drhop - drhop_in
+     lcheck = usaug_check ('addusddens_pulay', size(drhop), drhop_dev, drhop_in)
+     deallocate (drhop_dev, drhop_in)
+     IF (okpaw) THEN
+        allocate (bso_ref, source = becsumort(:,:,:,mode0+1:mode0+npe))
+        lcheck = usaug_check ('pulay becsumort', size(bso_dev), bso_dev, bso_ref)
+        deallocate (bso_ref, bso_dev)
+     ENDIF
+  ENDIF
   deallocate (qpg)
   deallocate (qmod)
   deallocate (qgm)

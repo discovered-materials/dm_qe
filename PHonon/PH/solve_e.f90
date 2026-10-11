@@ -59,6 +59,8 @@ subroutine solve_e
   !
   LOGICAL :: exst
   !!
+  LOGICAL :: pcx_done
+  !! P_c^+ x psi already computed for all k-points by the device engine
   INTEGER :: ikk, npw, iter0, ipol, ik
   !! counters
   INTEGER :: nnr
@@ -99,8 +101,13 @@ subroutine solve_e
        'called in the wrong case', 1)
   !
   ! Compute P_c^+ x psi for all polarization and k points and store in buffer
+  ! (all together on the device when the engine serves the case: dvpsi_e then
+  ! finds them in the buffer)
+  !
+  CALL dvpsi_e_dev(pcx_done)
   !
   DO ik = 1, nksq
+     IF (pcx_done) EXIT
      DO ipol = 1, 3
         ikk = ikks(ik)
         npw = ngk(ikk)

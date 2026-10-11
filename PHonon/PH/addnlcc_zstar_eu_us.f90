@@ -19,6 +19,7 @@ SUBROUTINE addnlcc_zstar_eu_us( drhop )
   USE uspp,   ONLY : nlcc_any
   USE modes,  ONLY : npert, nirr, u
   USE dv_of_drho_lr,    ONLY : dv_of_drho_xc
+  USE dfpt_dev_grid,    ONLY : dfpt_dev_dv_of_drho
 
   IMPLICIT NONE
 
@@ -30,39 +31,46 @@ SUBROUTINE addnlcc_zstar_eu_us( drhop )
 
   REAL(DP) :: fac
 
-  COMPLEX(DP), DIMENSION(dfftp%nnr) :: drhoc
-  COMPLEX(DP), DIMENSION(dfftp%nnr,nspin_mag) :: dvaux
+  COMPLEX(DP), ALLOCATABLE :: drhoc(:), dvall(:,:,:)
+  LOGICAL :: done
 
   IF (.NOT.nlcc_any) RETURN
 
   IF ( my_pool_id /= 0 ) RETURN
-
-  DO ipol = 1, 3
-     imode0 = 0
-     DO irr = 1, nirr
-        npe = npert(irr)
-        !
-        !  compute the exchange and correlation potential for this mode
-        !
-        nrtot = dfftp%nr1 * dfftp%nr2 * dfftp%nr3
-        fac = 1.d0 / DBLE (nspin_lsda)
-        DO ipert = 1, npe
-           mode = imode0 + ipert
-
-           dvaux = (0.0_dp,0.0_dp)
-           CALL addcore(u(1, mode), drhoc)
-           !
-           CALL dv_of_drho_xc(dvaux, drho = drhop(1, 1, ipol))
-           !
+  !
+  !  the exchange and correlation potential of the response to the field in
+  !  the three directions: it does not depend on the mode (it used to be
+  !  recomputed for every mode); on the device when the case is served
+  !
+  ALLOCATE( drhoc(dfftp%nnr), dvall(dfftp%nnr,nspin_mag,3) )
+  dvall = (0.0_dp,0.0_dp)
+  CALL dfpt_dev_dv_of_drho( 3, drhop, dvall, done, xc_only = .TRUE. )
+  IF ( .NOT. done ) THEN
+     DO ipol = 1, 3
+        dvall(:,:,ipol) = (0.0_dp,0.0_dp)
+        CALL dv_of_drho_xc(dvall(:,:,ipol), drho = drhop(1, 1, ipol))
+     ENDDO
+  ENDIF
+  !
+  nrtot = dfftp%nr1 * dfftp%nr2 * dfftp%nr3
+  fac = 1.d0 / DBLE (nspin_lsda)
+  imode0 = 0
+  DO irr = 1, nirr
+     npe = npert(irr)
+     DO ipert = 1, npe
+        mode = imode0 + ipert
+        CALL addcore(u(1, mode), drhoc)
+        DO ipol = 1, 3
            DO is = 1, nspin_lsda
               zstareu0(ipol,mode) = zstareu0(ipol,mode) -                  &
                    omega * fac / REAL(nrtot, DP) *         &
-                   DOT_PRODUCT(dvaux(1:dfftp%nnr,is),drhoc(1:dfftp%nnr))
+                   DOT_PRODUCT(dvall(1:dfftp%nnr,is,ipol),drhoc(1:dfftp%nnr))
            END DO
         END DO
-        imode0 = imode0 + npe
      END DO
+     imode0 = imode0 + npe
   END DO
+  DEALLOCATE( drhoc, dvall )
 
   RETURN
 END SUBROUTINE addnlcc_zstar_eu_us

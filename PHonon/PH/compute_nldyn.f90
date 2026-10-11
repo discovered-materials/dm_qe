@@ -34,6 +34,8 @@ subroutine compute_nldyn (wdyn, wgg, becq, alpq)
   USE becmod,           ONLY : bec_type
   USE lr_symm_base,     ONLY : nsymq
   USE symm_base,        ONLY : irt
+  USE phq_setup_dev,    ONLY : phq_setup_dev_on, nldyn_dev
+  USE usaug_dev,        ONLY : usaug_check
 
   implicit none
 
@@ -67,8 +69,30 @@ subroutine compute_nldyn (wdyn, wgg, becq, alpq)
   ! counters
   integer :: startb, lastb, ia_s, ia_e, mykey, bna, dummykey  
   integer, external :: block_size 
+  complex(DP), allocatable :: dynwrk_dev(:,:)
+  ! result of the device code
+  logical :: done, lcheck
 
   IF (rec_code_read >=-20) return
+  !
+  ! Device code: A1 and A2 (see below, aux1 and aux2) of all bands, atoms and
+  ! cartesian directions are built by kernels and a matrix product
+  !
+  if (phq_setup_dev_on()) then
+     allocate (dynwrk_dev(3*nat,3*nat))
+     call nldyn_dev (dynwrk_dev, wgg, becq, alpq, done)
+     if (done .and. .not. usaug_check()) then
+        call mp_sum ( dynwrk_dev, intra_bgrp_comm )
+        allocate(auxdyn(3*nat,3*nat))
+        call zgemm('C', 'N', 3*nat, 3*nat, 3*nat, cmplx(1.d0,0.d0,kind=dp),  u, 3*nat, dynwrk_dev, 3*nat,&
+                                                  cmplx(0.d0,0.d0,kind=dp), auxdyn, 3*nat)
+        call zgemm('N','N', 3*nat, 3* nat, 3*nat, cmplx(1.d0,0.d0,kind=dp), auxdyn, 3*nat, u, 3*nat,&
+                                                  cmplx(1.d0,0.d0,kind=dp),  wdyn , 3*nat)
+        deallocate (auxdyn, dynwrk_dev)
+        return
+     endif
+     if (.not. done) deallocate (dynwrk_dev)
+  endif
 
   IF (noncolin) THEN
      allocate (ps1_nc (  nkb, npol, nbnd))
@@ -375,6 +399,10 @@ end if
      enddo
   enddo
   call mp_sum ( dynwrk, intra_bgrp_comm )
+  if (allocated(dynwrk_dev)) then
+     lcheck = usaug_check ('nldyn', size(dynwrk), dynwrk_dev, dynwrk)
+     deallocate (dynwrk_dev)
+  endif
   allocate(auxdyn(3*nat,3*nat))
   call zgemm('C', 'N', 3*nat, 3*nat, 3*nat, cmplx(1.d0,0.d0,kind=dp),  u,     3*nat, dynwrk, 3*nat,& 
                                             cmplx(0.d0,0.d0,kind=dp), auxdyn, 3*nat) 

@@ -24,6 +24,7 @@ set(src_ph
     PH/compute_alphasum.f90
     PH/compute_becalp.f90
     PH/compute_becsum_ph.f90
+    PH/phq_setup_dev.f90
     PH/compute_drhous.f90
     PH/compute_drhous_nc.f90
     PH/compute_dvloc.f90
@@ -52,6 +53,8 @@ set(src_ph
     PH/dvanqq.f90
     PH/dvkb3.f90
     PH/dvpsi_e.f90
+    PH/dvbare_dev.f90
+    PH/dyn_dev.f90
     PH/dvqpsi_us.f90
     PH/dvqpsi_us_only.f90
     PH/dyndia.f90

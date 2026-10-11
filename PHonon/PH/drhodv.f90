@@ -56,6 +56,10 @@ subroutine drhodv (nu_i0, nper, drhos)
   USE uspp_init,        ONLY : init_us_2
   USE control_flags,    ONLY : offload_type
   USE control_ph,       ONLY : lmultipole
+  USE dyn_dev,          ONLY : dyn_check
+#if defined(__CUDA)
+  USE dyn_dev,          ONLY : dyn_dev_ok, drhodv_nl_dev
+#endif
 
   implicit none
 
@@ -82,6 +86,40 @@ subroutine drhodv (nu_i0, nper, drhos)
   TYPE (bec_type) :: bectmp
 #endif
   TYPE (bec_type), ALLOCATABLE :: dbecq(:), dalpq(:,:)
+  !
+#if defined(__CUDA)
+  !
+  ! Device path (module dyn_dev): projections of dpsi with one ZGEMM per
+  ! perturbation, sums on the host; only the rows of this representation
+  ! are rotated to the basis of the modes (the others are zero).
+  !
+  IF ( dyn_dev_ok( ) ) THEN
+     call start_clock ('drhodv')
+     dynwrk(:,:) = (0.d0, 0.d0)
+     wdyn  (:,:) = (0.d0, 0.d0)
+     call start_clock ('drhodv_nl')
+     CALL drhodv_nl_dev (nu_i0, nper, dynwrk)
+     call stop_clock ('drhodv_nl')
+     do ipert = 1, nper
+        nu_i = nu_i0 + ipert
+        do nu_j = 1, 3 * nat
+           ps = (0.0d0, 0.0d0)
+           do na_jcart = 1, 3 * nat
+              ps = ps + dynwrk (nu_i, na_jcart) * u (na_jcart, nu_j)
+           enddo
+           wdyn (nu_i, nu_j) = wdyn (nu_i, nu_j) + ps
+        enddo
+     enddo
+     call mp_sum ( wdyn, inter_pool_comm )
+     call dyn_check ('drhodv_nl', 3*nat, wdyn)
+     call drhodvloc (nu_i0, nper, drhos, wdyn)
+     call dyn_check ('drhodv', 3*nat, wdyn)
+     dyn (:,:) = dyn (:,:) + wdyn (:,:)
+     dyn_rec(:,:) = dyn_rec(:,:) + wdyn(:,:)
+     call stop_clock ('drhodv')
+     return
+  ENDIF
+#endif
   !
   !   Initialize the auxiliary matrix wdyn
   !
@@ -218,7 +256,9 @@ subroutine drhodv (nu_i0, nper, drhos)
   !
   ! add the contribution of the local part of the perturbation
   !
+  call dyn_check ('drhodv_nl', 3*nat, wdyn)
    call drhodvloc (nu_i0, nper, drhos, wdyn)
+  call dyn_check ('drhodv', 3*nat, wdyn)
   !
   ! add to the rest of the dynamical matrix
   !

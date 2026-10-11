@@ -72,6 +72,14 @@ SUBROUTINE solve_linter (irr, imode0, dfpt_data)
   USE dfpt_kernels,         ONLY : dfpt_kernel
   USE phus,                 ONLY : becsumort
   USE recover_mod,          ONLY : write_rec
+#if defined(__CUDA)
+  USE dfpt_dev,             ONLY : dfpt_dev_prefill_begin, dfpt_dev_prefill_end, &
+                                   dfpt_dev_keep_dpsi, dfpt_dev_agree, dvb_d, psik_d, w_d, &
+                                   nbo, npwxl
+  USE dyn_dev,              ONLY : dyn_dev_ok
+  USE control_ph,           ONLY : zue
+  USE dvbare_dev,           ONLY : dvbare_dev_ok, dvqpsi_us_dev
+#endif
   !
   IMPLICIT NONE
   !
@@ -107,6 +115,9 @@ SUBROUTINE solve_linter (irr, imode0, dfpt_data)
   character(len=256) :: filename
 
   integer :: nnr
+  logical :: dev_fill
+  !! the bare perturbation is written straight into the device engine
+  integer :: c0
   !
   IF (rec_code_read > 20 ) RETURN
 
@@ -159,8 +170,39 @@ SUBROUTINE solve_linter (irr, imode0, dfpt_data)
   IF (iter0==-1000) iter0=0
   !
   ! Compute dV_bare * psi and write to buffer iubar
+  ! (GPU: straight into the device engine, which then does not read the buffer;
+  !  the buffer is still written when the electron-phonon code needs it)
+  !
+  dev_fill = .FALSE.
+#if defined(__CUDA)
+  IF (nsolv == 1 .AND. iter0 == 0 .AND. .NOT. elph .AND. .NOT. lmultipole) THEN
+     IF (dvbare_dev_ok()) CALL dfpt_dev_prefill_begin(npe, dev_fill)
+     ! on all ranks or on none: without it the buffer has to be written
+     CALL dfpt_dev_agree(dev_fill)
+  ENDIF
+  IF (dev_fill) THEN
+     CALL start_clock ('dvqpsi_us')
+     DO ik = 1, nksq
+        IF (lsda) current_spin = isk(ikks(ik))
+        DO ipert = 1, npe
+           c0 = ((ik-1)*npe + (ipert-1)) * nbo
+           CALL dvqpsi_us_dev(ik, u(1, imode0+ipert), .FALSE., becp1, alphap, nbo, &
+                              dvb_d(1,c0+1), npwxl, psik_d(1,1,ik), npwxl, w_d(1,1,ik), npwxl)
+        ENDDO
+     ENDDO
+     CALL dfpt_dev_prefill_end()
+     CALL stop_clock ('dvqpsi_us')
+     !
+     ! the response wavefunctions are needed again only by drhodv, which takes their
+     ! projections from the device: no copy to the buffer (zue: add_zstar_ue reads it)
+     !
+     IF (.NOT. zue .AND. dyn_dev_ok()) CALL dfpt_dev_keep_dpsi()
+  ENDIF
+#endif
   !
   DO ik = 1, nksq
+     !
+     IF (dev_fill) EXIT
      !
      ikk  = ikks(ik)
      ikq  = ikqs(ik)
