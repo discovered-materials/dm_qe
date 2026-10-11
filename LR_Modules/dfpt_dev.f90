@@ -54,7 +54,8 @@ MODULE dfpt_dev
   PUBLIC :: dfpt_dev_lin_begin, dfpt_dev_lin_set_rhs, dfpt_dev_lin_solve, &
             dfpt_dev_lin_get, dfpt_dev_lin_end
   PUBLIC :: dfpt_dev_set_eta, dfpt_dev_set_work
-  PUBLIC :: dfpt_dev_keep_dpsi, dfpt_dev_agree, dfpt_dev_keeping, dfpt_dev_kept
+  PUBLIC :: dfpt_dev_prefill_begin, dfpt_dev_prefill_end
+  PUBLIC :: dfpt_dev_keep_dpsi, dfpt_dev_get_bq, dfpt_dev_agree, dfpt_dev_keeping, dfpt_dev_kept
 #if defined(__CUDA)
   ! ... for callers that write the bare dV|psi> straight into the engine (see dfpt_dev_prefill_begin)
   PUBLIC :: dvb_d, psik_d, w_d, nbo, npwxl
@@ -1140,6 +1141,112 @@ CONTAINS
     !! the device, where dfpt_dev_get_bq serves the dynamical matrix.
     IF ( in_session .AND. .NOT. lin_session ) keep_next = .TRUE.
   END SUBROUTINE dfpt_dev_keep_dpsi
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE dfpt_dev_get_bq( nper, nbndx, bq, ok )
+    !-----------------------------------------------------------------------
+    !! Projections of the response wavefunctions kept on the device on the
+    !! beta functions of k+q, for all k-points and the nper perturbations:
+    !! bq(:,4*(ibnd-1)+1,iper,ik) = <beta|dpsi_ibnd>,
+    !! bq(:,4*(ibnd-1)+1+alpha,iper,ik) = <beta|(k+q+G)_alpha dpsi_ibnd>
+    !! ((k+q+G) in units 2pi/a). ok = .FALSE.: nothing kept, read the buffer.
+    !
+    INTEGER, INTENT(IN) :: nper, nbndx
+    COMPLEX(DP), INTENT(OUT) :: bq(MAX(nkbl,1),4*nbndx,nper,nks)
+    LOGICAL, INTENT(OUT) :: ok
+    !
+    COMPLEX(DP), ALLOCATABLE :: bh(:,:)
+    INTEGER :: ia, c, ig, ik, ipert, ibnd, nck, n1, n2
+    !
+    ok = .FALSE.
+    IF ( .NOT. dpsi_kept .OR. nper /= npe .OR. nkbl == 0 .OR. nbndx < nbo ) RETURN
+    nck = ncolk ; n1 = npwxl ; n2 = ncol
+    ALLOCATE( bh(nw,ncol) )
+    bq = c_zero
+    DO ia = 0, 3
+       IF ( ia == 0 ) THEN
+          CALL gemm_k( CUBLAS_OP_C, nkbl, ncolk, npwxl, c_one, w_d, npwxl, INT(npwxl,8)*nw, &
+                       dpsi_d, npwxl, INT(npwxl,8)*ncolk, c_zero, cw_d, nw, INT(nw,8)*ncolk, nks )
+       ELSE
+          !$cuf kernel do(2)
+          DO c = 1, n2
+             DO ig = 1, n1
+                ik = (c-1)/nck + 1
+                g_d(ig,c) = dpsi_d(ig,c) * kqg_d(ia,ig,ik)
+             ENDDO
+          ENDDO
+          CALL gemm_k( CUBLAS_OP_C, nkbl, ncolk, npwxl, c_one, w_d, npwxl, INT(npwxl,8)*nw, &
+                       g_d, npwxl, INT(npwxl,8)*ncolk, c_zero, cw_d, nw, INT(nw,8)*ncolk, nks )
+       ENDIF
+       bh = cw_d
+       DO ik = 1, nks
+          DO ipert = 1, npe
+             DO ibnd = 1, nocc_h(ik)
+                c = ( (ik-1)*npe + (ipert-1) ) * nbo + ibnd
+                bq(1:nkbl,4*(ibnd-1)+1+ia,ipert,ik) = bh(1:nkbl,c)
+             ENDDO
+          ENDDO
+       ENDDO
+    ENDDO
+    DEALLOCATE( bh )
+    ok = .TRUE.
+    !
+  END SUBROUTINE dfpt_dev_get_bq
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE dfpt_dev_prefill_begin( npert, ok )
+    !-----------------------------------------------------------------------
+    !! Open a session for npert perturbations whose bare dV|psi> the caller
+    !! writes directly into dvb_d (column ((ik-1)*npert + ipert-1)*nbo +
+    !! ibnd, leading dimension npwxl), instead of going through the host
+    !! buffer. The caller then calls dfpt_dev_prefill_end; the following
+    !! dfpt_dev_begin for the same perturbations keeps the session.
+    !! ok = .FALSE.: not served, use the buffer.
+    !
+    INTEGER, INTENT(IN) :: npert
+    LOGICAL, INTENT(OUT) :: ok
+    !
+    ok = .FALSE.
+    CALL release_kept( )
+    IF ( in_session ) CALL dfpt_dev_end( )
+    IF ( .NOT. dev_requested( ) ) RETURN
+    IF ( .NOT. dev_supported( ) ) RETURN
+    IF ( .NOT. q_ready ) THEN
+       CALL setup_q( ok )
+       IF ( .NOT. ok ) THEN
+          CALL dfpt_dev_invalidate( )
+          RETURN
+       ENDIF
+       ok = .FALSE.
+    ENDIF
+    IF ( .NOT. blas_ready ) CALL init_blas( )
+    CALL alloc_session( npert, .TRUE., ok )
+    IF ( .NOT. ok ) RETURN
+    dvb_d = c_zero ; dpsi_d = c_zero ; h_d = c_zero ; t_d = c_zero ; g_d = c_zero
+    in_session = .TRUE.
+    prefilled = .TRUE.
+    dpsi_dirty = .FALSE.
+    !
+  END SUBROUTINE dfpt_dev_prefill_begin
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE dfpt_dev_prefill_end( )
+    !-----------------------------------------------------------------------
+    !! columns of bands that are not occupied at their k-point are zero
+    INTEGER :: c, ig, ik, ibnd, nck, nbl, n1, n2
+    !
+    IF ( .NOT. ( in_session .AND. prefilled ) ) RETURN
+    nck = ncolk ; nbl = nbo ; n1 = npwxl ; n2 = ncol
+    !$cuf kernel do(2)
+    DO c = 1, n2
+       DO ig = 1, n1
+          ik = (c-1)/nck + 1
+          ibnd = MOD(c-1,nbl) + 1
+          IF ( ibnd > nocc_d(ik) .OR. ig > npwq_d(ik) ) dvb_d(ig,c) = (0.0_DP, 0.0_DP)
+       ENDDO
+    ENDDO
+    !
+  END SUBROUTINE dfpt_dev_prefill_end
   !
   !-----------------------------------------------------------------------
   SUBROUTINE dfpt_dev_begin( code, npert, iter0, lrdvpsi, iudvpsi )
@@ -4550,6 +4657,24 @@ CONTAINS
   !
   SUBROUTINE dfpt_dev_keep_dpsi( )
   END SUBROUTINE dfpt_dev_keep_dpsi
+  !
+  SUBROUTINE dfpt_dev_get_bq( nper, nbndx, bq, ok )
+    USE uspp,      ONLY : nkb
+    USE qpoint,    ONLY : nksq
+    INTEGER, INTENT(IN) :: nper, nbndx
+    COMPLEX(DP), INTENT(OUT) :: bq(MAX(nkb,1),4*nbndx,nper,nksq)
+    LOGICAL, INTENT(OUT) :: ok
+    ok = .FALSE.
+  END SUBROUTINE dfpt_dev_get_bq
+  !
+  SUBROUTINE dfpt_dev_prefill_begin( npert, ok )
+    INTEGER, INTENT(IN) :: npert
+    LOGICAL, INTENT(OUT) :: ok
+    ok = .FALSE.
+  END SUBROUTINE dfpt_dev_prefill_begin
+  !
+  SUBROUTINE dfpt_dev_prefill_end( )
+  END SUBROUTINE dfpt_dev_prefill_end
   !
   SUBROUTINE dfpt_dev_lin_begin( npert, ok )
     INTEGER, INTENT(IN) :: npert
