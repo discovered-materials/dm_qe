@@ -768,6 +768,239 @@ CONTAINS
   END SUBROUTINE gemm_k
   !
   !-----------------------------------------------------------------------
+  SUBROUTINE apply_h( nact, src_d, dst_d )
+    !-----------------------------------------------------------------------
+    !! dst = ( H - e S + alpha_pv P_v ) src for the nact columns listed in
+    !! act_d (ch_psi_all). The nonlocal and projector terms are computed for
+    !! all columns of the k-points that have an active column.
+    !
+    INTEGER, INTENT(IN) :: nact
+    COMPLEX(DP), DEVICE, INTENT(IN) :: src_d(npwxl,ncol)
+    COMPLEX(DP), DEVICE, INTENT(INOUT) :: dst_d(npwxl,ncol)
+    !
+    INTEGER :: j0, nb, ip, j, ig, ir, c, ik, istat, k1, k2, i, nck, nwl, nkl, nbql, iw, cc, &
+               na, iof, ih, jh, is
+    REAL(DP) :: scale, apv, ee
+    COMPLEX(DP) :: s
+    !
+    CALL start_clock( 'dfptd_hpsi' )
+    scale = 1.0_DP / DBLE(nnr)
+    nck = ncolk ; nwl = nw ; nkl = nkbl ; nbql = nbq ; apv = alpha_pv_l
+    !
+    ! ... kinetic energy and local potential
+    !
+    DO j0 = 0, nact-1, nfb
+       nb = MIN( nfb, nact-j0 )
+       ip = pick_plan( nb )
+       !$cuf kernel do(2)
+       DO j = 1, nb
+          DO ig = 1, npwxl
+             c = act_d(j0+j)
+             ik = (c-1)/nck + 1
+             IF ( ig <= npwq_d(ik) ) psig_d(nlq_d(ig,ik) + (j-1)*nnr) = src_d(ig,c)
+          ENDDO
+       ENDDO
+       istat = cufftExecZ2Z( plan(ip), psig_d, psic_d, CUFFT_INVERSE )
+       !$cuf kernel do(2)
+       DO j = 1, nb
+          DO ig = 1, npwxl
+             c = act_d(j0+j)
+             ik = (c-1)/nck + 1
+             IF ( ig <= npwq_d(ik) ) psig_d(nlq_d(ig,ik) + (j-1)*nnr) = (0.0_DP, 0.0_DP)
+          ENDDO
+       ENDDO
+       !$cuf kernel do(2)
+       DO j = 1, nb
+          DO ir = 1, nnr
+             c = act_d(j0+j)
+             ik = (c-1)/nck + 1
+             psic_d(ir + (j-1)*nnr) = psic_d(ir + (j-1)*nnr) * v_d(ir,spin_d(ik))
+          ENDDO
+       ENDDO
+       istat = cufftExecZ2Z( plan(ip), psic_d, psic_d, CUFFT_FORWARD )
+       !$cuf kernel do(2)
+       DO j = 1, nb
+          DO ig = 1, npwxl
+             c = act_d(j0+j)
+             ik = (c-1)/nck + 1
+             IF ( ig <= npwq_d(ik) ) THEN
+                dst_d(ig,c) = ( g2_d(ig,ik) - e_d(c) ) * src_d(ig,c) + &
+                              psic_d(nlq_d(ig,ik) + (j-1)*nnr) * scale
+             ELSE
+                dst_d(ig,c) = (0.0_DP, 0.0_DP)
+             ENDIF
+          ENDDO
+       ENDDO
+    ENDDO
+    !
+    ! ... nonlocal potential, e*S and projector on the valence bands, for
+    ! ... runs of consecutive k-points with active columns
+    !
+    i = 1
+    DO WHILE ( i <= nact )
+       k1 = (act_h(i)-1)/ncolk + 1
+       k2 = k1
+       DO WHILE ( i <= nact )
+          ik = (act_h(i)-1)/ncolk + 1
+          IF ( ik > k2+1 ) EXIT
+          k2 = ik
+          i = i + 1
+       ENDDO
+       !
+       CALL gemm_k( CUBLAS_OP_C, nw, ncolk, npwxl, c_one, w_d(1,1,k1), npwxl, INT(npwxl,8)*nw, &
+                    src_d(1,(k1-1)*ncolk+1), npwxl, INT(npwxl,8)*ncolk, c_zero, &
+                    cw_d(1,(k1-1)*ncolk+1), nw, INT(nw,8)*ncolk, k2-k1+1 )
+       !$cuf kernel do(2)
+       DO c = (k1-1)*nck+1, k2*nck
+          DO iw = 1, nwl
+             ik = (c-1)/nck + 1
+             IF ( iw <= nkl ) THEN
+                na = kbna_d(iw) ; iof = kbof_d(iw) ; ih = iw - iof
+                is = spin_d(ik) ; ee = e_d(c)
+                s = (0.0_DP, 0.0_DP)
+                DO jh = 1, kbnh_d(iw)
+                   s = s + ( deeq_d(ih,jh,na,is) - ee * qq_d(ih,jh,na) ) * cw_d(iof+jh,c)
+                ENDDO
+                cw2_d(iw,c) = s
+             ELSEIF ( iw - nkl <= noccq_d(ik) ) THEN
+                cw2_d(iw,c) = apv * cw_d(iw,c)
+             ELSE
+                cw2_d(iw,c) = (0.0_DP, 0.0_DP)
+             ENDIF
+          ENDDO
+       ENDDO
+       CALL gemm_k( CUBLAS_OP_N, npwxl, ncolk, nw, c_one, w_d(1,1,k1), npwxl, INT(npwxl,8)*nw, &
+                    cw2_d(1,(k1-1)*ncolk+1), nw, INT(nw,8)*ncolk, c_one, &
+                    dst_d(1,(k1-1)*ncolk+1), npwxl, INT(npwxl,8)*ncolk, k2-k1+1 )
+    ENDDO
+    CALL stop_clock( 'dfptd_hpsi' )
+    !
+  END SUBROUTINE apply_h
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE build_rhs( first_iter )
+    !-----------------------------------------------------------------------
+    !! g_d = -P_c^+ ( dV_bare + dV_scf ) psi   (apply_dpot_bands, adddvscf,
+    !! orthogonalize)
+    !
+    LOGICAL, INTENT(IN) :: first_iter
+    !
+    INTEGER :: j0, nb, ip, j, ig, ir, c, ik, ibnd, ipert, istat, nck, nbl, npl, nkl, nwl, nbql, &
+               iw, na, iof, ih, jh, is, n1, n2
+    REAL(DP) :: scale
+    COMPLEX(DP) :: s
+    !
+    CALL start_clock( 'dfptd_rhs' )
+    scale = 1.0_DP / DBLE(nnr)
+    nck = ncolk ; nbl = nbo ; npl = npe ; nkl = nkbl ; nwl = nw ; nbql = nbq
+    n1 = npwxl ; n2 = ncol
+    !
+    !$cuf kernel do(2)
+    DO c = 1, n2
+       DO ig = 1, n1
+          g_d(ig,c) = dvb_d(ig,c)
+       ENDDO
+    ENDDO
+    !
+    IF ( .NOT. first_iter ) THEN
+       !
+       ! ... dV_scf(r) psi_k(r), back to G-space on the k+q sphere
+       !
+       DO j0 = 0, nlive-1, nfb
+          nb = MIN( nfb, nlive-j0 )
+          ip = pick_plan( nb )
+          IF ( have_psir ) THEN
+             !$cuf kernel do(2)
+             DO j = 1, nb
+                DO ir = 1, nnr
+                   c = live_d(j0+j)
+                   ik = (c-1)/nck + 1
+                   ibnd = MOD(c-1,nbl) + 1
+                   ipert = MOD((c-1)/nbl,npl) + 1
+                   psic_d(ir + (j-1)*nnr) = psir_d(ir,ibnd,ik) * dv_d(ir,spin_d(ik),ipert)
+                ENDDO
+             ENDDO
+          ELSE
+             CALL psi_to_r( j0, nb, ip )
+             !$cuf kernel do(2)
+             DO j = 1, nb
+                DO ir = 1, nnr
+                   c = live_d(j0+j)
+                   ik = (c-1)/nck + 1
+                   ipert = MOD((c-1)/nbl,npl) + 1
+                   psic_d(ir + (j-1)*nnr) = psi2_d(ir + (j-1)*nnr) * dv_d(ir,spin_d(ik),ipert)
+                ENDDO
+             ENDDO
+          ENDIF
+          istat = cufftExecZ2Z( plan(ip), psic_d, psic_d, CUFFT_FORWARD )
+          !$cuf kernel do(2)
+          DO j = 1, nb
+             DO ig = 1, npwxl
+                c = live_d(j0+j)
+                ik = (c-1)/nck + 1
+                IF ( ig <= npwq_d(ik) ) g_d(ig,c) = g_d(ig,c) + psic_d(nlq_d(ig,ik) + (j-1)*nnr) * scale
+             ENDDO
+          ENDDO
+       ENDDO
+       !
+       ! ... ultrasoft term: beta_{k+q} int3 <beta_k|psi_k>
+       !
+       IF ( lus ) THEN
+          !$cuf kernel do(2)
+          DO c = 1, n2
+             DO iw = 1, nkl
+                ik = (c-1)/nck + 1
+                ibnd = MOD(c-1,nbl) + 1
+                ipert = MOD((c-1)/nbl,npl) + 1
+                na = kbna_d(iw) ; iof = kbof_d(iw) ; ih = iw - iof
+                is = spin_d(ik)
+                s = (0.0_DP, 0.0_DP)
+                DO jh = 1, kbnh_d(iw)
+                   s = s + int3_d(ih,jh,na,is,ipert) * becp1_d(iof+jh,ibnd,ik)
+                ENDDO
+                cw2_d(iw,c) = s
+             ENDDO
+          ENDDO
+          CALL gemm_k( CUBLAS_OP_N, npwxl, ncolk, nkbl, c_one, w_d, npwxl, INT(npwxl,8)*nw, &
+                       cw2_d, nw, INT(nw,8)*ncolk, c_one, g_d, npwxl, INT(npwxl,8)*ncolk, nks )
+       ENDIF
+       !
+    ENDIF
+    !
+    ! ... -P_c^+ : g = S psi_{k+q} ( wwg * <psi_{k+q}|g> ) - wg1 * g
+    !
+    IF ( lus ) THEN
+       CALL gemm_k( CUBLAS_OP_C, nbq, ncolk, npwxl, c_one, evq_d, npwxl, INT(npwxl,8)*nbq, &
+                    g_d, npwxl, INT(npwxl,8)*ncolk, c_zero, cw_d, nw, INT(nw,8)*ncolk, nks )
+    ELSE
+       CALL gemm_k( CUBLAS_OP_C, nbq, ncolk, npwxl, c_one, w_d(1,nkbl+1,1), npwxl, INT(npwxl,8)*nw, &
+                    g_d, npwxl, INT(npwxl,8)*ncolk, c_zero, cw_d, nw, INT(nw,8)*ncolk, nks )
+    ENDIF
+    !$cuf kernel do(2)
+    DO c = 1, n2
+       DO iw = 1, nbql
+          ik = (c-1)/nck + 1
+          ibnd = MOD(c-1,nbl) + 1
+          cw_d(iw,c) = cw_d(iw,c) * wwg_d(iw,ibnd,ik)
+       ENDDO
+    ENDDO
+    IF ( metal ) THEN
+       !$cuf kernel do(2)
+       DO c = 1, n2
+          DO ig = 1, n1
+             ik = (c-1)/nck + 1
+             ibnd = MOD(c-1,nbl) + 1
+             g_d(ig,c) = g_d(ig,c) * wg1_d(ibnd,ik)
+          ENDDO
+       ENDDO
+    ENDIF
+    CALL gemm_k( CUBLAS_OP_N, npwxl, ncolk, nbq, c_one, w_d(1,nkbl+1,1), npwxl, INT(npwxl,8)*nw, &
+                 cw_d, nw, INT(nw,8)*ncolk, c_mone, g_d, npwxl, INT(npwxl,8)*ncolk, nks )
+    CALL stop_clock( 'dfptd_rhs' )
+    !
+  END SUBROUTINE build_rhs
+  !
+  !-----------------------------------------------------------------------
   SUBROUTINE psi_to_r( j0, nb, ip )
     !-----------------------------------------------------------------------
     !! psi2_d(:,j) = psi_k(r) of the band of live column j0+j (no cache)
@@ -795,6 +1028,130 @@ CONTAINS
     ENDDO
     !
   END SUBROUTINE psi_to_r
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE add_drho( )
+    !-----------------------------------------------------------------------
+    !! drho_d(r,spin,ipert) = sum_kv 2 wk/omega conj(psi_kv(r)) dpsi_kv(r)
+    !! (incdrhoscf)
+    !
+    INTEGER :: j0, nb, ip, j, ig, ir, c, ik, ibnd, ipert, istat, nck, nbl, npl, is, n1, n2, n3
+    !
+    CALL start_clock( 'dfptd_drho' )
+    nck = ncolk ; nbl = nbo ; npl = npe
+    n1 = nnr ; n2 = nspl ; n3 = npe
+    !$cuf kernel do(3)
+    DO ipert = 1, n3
+       DO is = 1, n2
+          DO ir = 1, n1
+             drho_d(ir,is,ipert) = (0.0_DP, 0.0_DP)
+          ENDDO
+       ENDDO
+    ENDDO
+    !
+    DO j0 = 0, nlive-1, nfb
+       nb = MIN( nfb, nlive-j0 )
+       ip = pick_plan( nb )
+       IF ( .NOT. have_psir ) CALL psi_to_r( j0, nb, ip )
+       !$cuf kernel do(2)
+       DO j = 1, nb
+          DO ig = 1, npwxl
+             c = live_d(j0+j)
+             ik = (c-1)/nck + 1
+             IF ( ig <= npwq_d(ik) ) psig_d(nlq_d(ig,ik) + (j-1)*nnr) = dpsi_d(ig,c)
+          ENDDO
+       ENDDO
+       istat = cufftExecZ2Z( plan(ip), psig_d, psic_d, CUFFT_INVERSE )
+       !$cuf kernel do(2)
+       DO j = 1, nb
+          DO ig = 1, npwxl
+             c = live_d(j0+j)
+             ik = (c-1)/nck + 1
+             IF ( ig <= npwq_d(ik) ) psig_d(nlq_d(ig,ik) + (j-1)*nnr) = (0.0_DP, 0.0_DP)
+          ENDDO
+       ENDDO
+       IF ( have_psir ) THEN
+          !$cuf kernel do(1)
+          DO ir = 1, nnr
+             DO j = 1, nb
+                c = live_d(j0+j)
+                ik = (c-1)/nck + 1
+                ibnd = MOD(c-1,nbl) + 1
+                ipert = MOD((c-1)/nbl,npl) + 1
+                drho_d(ir,spin_d(ik),ipert) = drho_d(ir,spin_d(ik),ipert) + wgt_d(ik) * &
+                     CONJG( psir_d(ir,ibnd,ik) ) * psic_d(ir + (j-1)*nnr)
+             ENDDO
+          ENDDO
+       ELSE
+          !$cuf kernel do(1)
+          DO ir = 1, nnr
+             DO j = 1, nb
+                c = live_d(j0+j)
+                ik = (c-1)/nck + 1
+                ipert = MOD((c-1)/nbl,npl) + 1
+                drho_d(ir,spin_d(ik),ipert) = drho_d(ir,spin_d(ik),ipert) + wgt_d(ik) * &
+                     CONJG( psi2_d(ir + (j-1)*nnr) ) * psic_d(ir + (j-1)*nnr)
+             ENDDO
+          ENDDO
+       ENDIF
+    ENDDO
+    CALL stop_clock( 'dfptd_drho' )
+    !
+  END SUBROUTINE add_drho
+  !
+  !-----------------------------------------------------------------------
+  SUBROUTINE add_dbecsum( dbecsum )
+    !-----------------------------------------------------------------------
+    !! dbecsum += wk conj(<beta_k|psi_k>) <beta_{k+q}|dpsi_k>  (addusdbec)
+    !
+    USE ions_base,   ONLY : nat, ityp, ntyp => nsp
+    USE uspp,        ONLY : ijtoh, ofsbeta
+    USE uspp_param,  ONLY : upf, nh, nhm
+    USE noncollin_module, ONLY : nspin_mag
+    USE lrus,        ONLY : becp1
+    !
+    COMPLEX(DP), INTENT(INOUT) :: dbecsum(nhm*(nhm+1)/2, nat, nspin_mag, npe)
+    !
+    COMPLEX(DP), ALLOCATABLE :: dbq(:,:)
+    INTEGER :: ik, ipert, ibnd, c, na, nt, ih, jh, ikb, jkb, ijh, is
+    REAL(DP) :: wgt
+    !
+    CALL start_clock( 'dfptd_dbec' )
+    CALL gemm_k( CUBLAS_OP_C, nkbl, ncolk, npwxl, c_one, w_d, npwxl, INT(npwxl,8)*nw, &
+                 dpsi_d, npwxl, INT(npwxl,8)*ncolk, c_zero, cw_d, nw, INT(nw,8)*ncolk, nks )
+    ALLOCATE( dbq(nkbl,ncol) )
+    dbq(:,:) = cw_d(1:nkbl,1:ncol)
+    !
+    DO ik = 1, nks
+       wgt = wk_h(ik)
+       is = spin_h(ik)
+       DO ipert = 1, npe
+          DO ibnd = 1, nocc_h(ik)
+             c = ( (ik-1)*npe + (ipert-1) ) * nbo + ibnd
+             DO na = 1, nat
+                nt = ityp(na)
+                IF ( .NOT. upf(nt)%tvanp ) CYCLE
+                DO ih = 1, nh(nt)
+                   ikb = ofsbeta(na) + ih
+                   ijh = ijtoh(ih,ih,nt)
+                   dbecsum(ijh,na,is,ipert) = dbecsum(ijh,na,is,ipert) + &
+                        wgt * CONJG( becp1(ik)%k(ikb,ibnd) ) * dbq(ikb,c)
+                   DO jh = ih+1, nh(nt)
+                      ijh = ijtoh(ih,jh,nt)
+                      jkb = ofsbeta(na) + jh
+                      dbecsum(ijh,na,is,ipert) = dbecsum(ijh,na,is,ipert) + wgt * &
+                           ( CONJG( becp1(ik)%k(ikb,ibnd) ) * dbq(jkb,c) + &
+                             CONJG( becp1(ik)%k(jkb,ibnd) ) * dbq(ikb,c) )
+                   ENDDO
+                ENDDO
+             ENDDO
+          ENDDO
+       ENDDO
+    ENDDO
+    DEALLOCATE( dbq )
+    CALL stop_clock( 'dfptd_dbec' )
+    !
+  END SUBROUTINE add_dbecsum
   !
 #else
   !
