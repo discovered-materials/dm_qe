@@ -123,7 +123,7 @@ subroutine print_clock_ph
      call print_clock ('sth_postproc')
      call print_clock ('psymdvscf')
      call print_clock ('symdvscf_dev')
-     call print_clock ('paw_dpot')
+     call print_clock ('PAW_dpot')
      call print_clock ('pawd_setup')
      call print_clock ('pawd_apply')
      call print_clock ('pawd_a')

@@ -24,6 +24,7 @@ SUBROUTINE clean_pw( lflag )
   USE fixed_occ,            ONLY : f_inp
   USE ktetra,               ONLY : deallocate_tetra
   USE klist,                ONLY : deallocate_igk
+  USE beta_cache,           ONLY : beta_cache_free
   USE gvect,                ONLY : deallocate_gvect
   USE vlocal,               ONLY : strf, vloc
   USE wvfct,                ONLY : g2kin, et, wg, btype
@@ -164,6 +165,7 @@ SUBROUTINE clean_pw( lflag )
   !
   CALL deallocate_gth( lflag ) 
   CALL deallocate_noncol()
+  CALL beta_cache_free()     ! beta functions cached per k-point by ph.x: they go with igk_k
   CALL deallocate_igk()
   !
   ! ... arrays allocated in init_run.f90 ( and never deallocated )

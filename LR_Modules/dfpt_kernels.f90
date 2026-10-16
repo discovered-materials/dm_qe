@@ -510,9 +510,7 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
       !
       IF (okvan) THEN
          IF (okpaw) THEN
-            CALL start_clock('paw_dpot')
             CALL PAW_dpotential(dfpt_data%dbecsum, rho%bec, int3_paw, npert)
-            CALL stop_clock('paw_dpot')
          ENDIF
          !
          !     with the new change of the potential we compute the integrals
