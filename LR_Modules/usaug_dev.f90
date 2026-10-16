@@ -75,7 +75,8 @@ MODULE usaug_dev
   !
   LOGICAL :: tab_ready = .FALSE.
   INTEGER :: ngml = 0, natl = 0, nqxl = 0, nnrp = 0, nr1 = 0, nr2 = 0, nr3 = 0
-  REAL(DP) :: xq_tab(3) = 0.0_DP, omega_tab = 0.0_DP
+  REAL(DP) :: xq_tab(3) = 0.0_DP, omega_tab = 0.0_DP, at_tab(3,3) = 0.0_DP, tpiba_tab = 0.0_DP
+  LOGICAL :: lgamma_tab = .FALSE.
   REAL(DP), ALLOCATABLE :: tau_tab(:,:)
   !
   ! ... entries of the table: e = (type, ij) with ij = (ih, jh >= ih)
@@ -358,7 +359,7 @@ CONTAINS
     !! Make the data of the module those of the current q: nothing to do
     !! when they already are.
     !
-    USE cell_base,   ONLY : omega, tpiba
+    USE cell_base,   ONLY : omega, tpiba, at
     USE gvect,       ONLY : ngm, g, gg, mill, eigts1, eigts2, eigts3
     USE fft_base,    ONLY : dfftp
     USE ions_base,   ONLY : nat, ityp, ntyp => nsp, tau
@@ -374,10 +375,12 @@ CONTAINS
     REAL(DP), ALLOCATABLE :: e_sig(:,:), qmod(:), qpg(:,:), ylm(:,:)
     !
     IF ( tab_ready ) THEN
-       IF ( ngml == ngm .AND. natl == nat .AND. omega_tab == omega .AND. &
-            nqxl == SIZE(tab_qrad,1) .AND. nnrp == dfftp%nnr .AND. &
+       ! (the table depends on the cell through g, the structure factors and qmod, on the
+       !  atoms, on the q-point and on lgamma, which selects ylmr2(g) or ylmr2(q+g))
+       IF ( ngml == ngm .AND. natl == nat .AND. omega_tab == omega .AND. tpiba_tab == tpiba .AND. &
+            nqxl == SIZE(tab_qrad,1) .AND. nnrp == dfftp%nnr .AND. ( lgamma_tab .EQV. lgamma ) .AND. &
             xq_tab(1) == xq(1) .AND. xq_tab(2) == xq(2) .AND. xq_tab(3) == xq(3) ) THEN
-          IF ( ALL( tau_tab(:,:) == tau(:,1:nat) ) ) RETURN
+          IF ( ALL( tau_tab(:,:) == tau(:,1:nat) ) .AND. ALL( at_tab(:,:) == at(:,:) ) ) RETURN
        ENDIF
     ENDIF
     !
@@ -390,6 +393,7 @@ CONTAINS
     ENDIF
     !
     ngml = ngm ; natl = nat ; omega_tab = omega ; xq_tab(:) = xq(:)
+    tpiba_tab = tpiba ; at_tab(:,:) = at(:,:) ; lgamma_tab = lgamma
     nqxl = SIZE(tab_qrad,1)
     nnrp = dfftp%nnr ; nr1 = dfftp%nr1 ; nr2 = dfftp%nr2 ; nr3 = dfftp%nr3
     ALLOCATE( tau_tab(3,nat) )

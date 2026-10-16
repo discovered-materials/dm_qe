@@ -14,7 +14,7 @@ subroutine zstar_eu_us
   USE kinds,            ONLY : DP
   USE mp,               ONLY : mp_sum
   USE mp_pools,         ONLY : inter_pool_comm
-  USE mp_bands,         ONLY : intra_bgrp_comm, nbgrp
+  USE mp_bands,         ONLY : intra_bgrp_comm, nbgrp, nproc_bgrp
   USE cell_base,        ONLY : omega
   USE ions_base,        ONLY : nat, ntyp => nsp, ityp
   USE buffers,          ONLY : get_buffer
@@ -41,11 +41,12 @@ subroutine zstar_eu_us
   USE eqv,              ONLY : dvpsi, dpsi
   USE qpoint,           ONLY : nksq, ikks
   USE ldaU,             ONLY : lda_plus_u
+  USE control_flags,    ONLY : gamma_only
   USE dv_of_drho_lr
   USE uspp_init,        ONLY : init_us_2
   USE dfpt_dev_grid,    ONLY : dfpt_dev_dv_of_drho
   USE incdrhoscf_mod,   ONLY : incdrhoscf, incdrhoscf_nc
-  USE usaug_dev,        ONLY : usaug_on, usaug_check
+  USE usaug_dev,        ONLY : usaug_check
   !
   implicit none
   !
@@ -207,7 +208,9 @@ subroutine zstar_eu_us
   ! like, which do not depend on the mode: see zstar_eu_us_pos below
   !
   call start_clock ('zeu_us_pos')
-  lnew = usaug_on()
+  ! (host code: it needs the plane waves of one band group on this rank, the collinear
+  !  case and no DFT+U, not the device; usaug_check keeps the comparison with the loop below)
+  lnew = ( nproc_bgrp == 1 ) .AND. .NOT. ( noncolin .OR. lda_plus_u .OR. gamma_only )
   if (lnew) then
      allocate (zs_new(3,3*nat))
      call zstar_eu_us_pos (zs_new)
