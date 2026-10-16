@@ -109,10 +109,10 @@ CONTAINS
     INTEGER :: ln, ierr, istat, ik, ig, ibnd, ikb, na, ih, jh, is, ir, npw, i, j, n, m, np, nb1, &
                iter, nactk, npair, nbn, info, tot_iter, nrun, k1, k2, irun, nnotconv_tot, nserve
     REAL(DP) :: need, avg_iter, empty_ethr
-    LOGICAL :: batched
+    LOGICAL :: batched, env_off
     INTEGER(KIND=cuda_count_kind) :: mfree, mtot
     INTEGER, ALLOCATABLE :: ivec(:), nl_h(:), nbase(:), notcnv(:), kter(:), ntry(:), state(:), &
-                            inotcnv(:,:), flag_h(:), pk_h(:), pn_h(:), run1(:), run2(:), nbold(:)
+                            flag_h(:), pk_h(:), pn_h(:), run1(:), run2(:)
     ! state: 0 = active, 1 = converged, 2 = given up (ntry exhausted)
     LOGICAL, ALLOCATABLE :: conv(:,:), vzero(:)
     REAL(DP), ALLOCATABLE :: e(:,:), ew_h(:,:), ewk(:)
@@ -120,10 +120,12 @@ CONTAINS
                                 vcr(:,:,:), hk(:,:), sk(:,:), vk(:,:), stage(:,:)
     !
     done = .FALSE.
+    ! (the environment is read per rank: it enters the collective decision below)
+    env_off = .FALSE.
     CALL get_environment_variable( 'QE_PH_DEV', val, ln, ierr )
-    IF ( ierr == 0 .AND. ln > 0 .AND. val(1:1) == '0' ) RETURN
+    IF ( ierr == 0 .AND. ln > 0 .AND. val(1:1) == '0' ) env_off = .TRUE.
     CALL get_environment_variable( 'QE_PH_NSCF_DEV', val, ln, ierr )
-    IF ( ierr == 0 .AND. ln > 0 .AND. val(1:1) == '0' ) RETURN
+    IF ( ierr == 0 .AND. ln > 0 .AND. val(1:1) == '0' ) env_off = .TRUE.
     IF ( .NOT. use_gpu .OR. isolve /= 0 .OR. noncolin .OR. lda_plus_u .OR. gamma_only .OR. &
          real_space .OR. scissor .OR. lelfield .OR. exx_is_active() .OR. xclib_dft_is('meta') .OR. &
          use_para_diag .OR. restart .OR. dffts%has_task_groups .OR. nproc_bgrp /= 1 .OR. &
@@ -137,17 +139,25 @@ CONTAINS
     nnr = dffts%nnr ; nr1 = dffts%nr1 ; nr2 = dffts%nr2 ; nr3 = dffts%nr3
     nspl = nspin ; nhml = nhm ; natl = nat
     lus = okvan
+    nfb = MAX( 1, MIN( nvec*nk, 33554432 / nnr, 8192 ) )
     !
-    ! ... what follows depends on the rank (k-points of the pool, device and host
-    ! ... memory): the stock loop has collective MPI calls that this routine has not,
-    ! ... so it serves either all the ranks of the image or none
+    ! ... what follows depends on the rank (k-points of the pool, environment, device
+    ! ... and host memory): the stock loop has collective MPI calls that this routine
+    ! ... has not, so it serves either all the ranks of the image or none
     !
-    need = 16.0_DP * REAL(npwx,DP) * nk * ( 2.0_DP*nvecx + 3.0_DP*nvec + nkb ) + &
-           16.0_DP * REAL(npwx,DP) * nk * 2.0_DP
-    IF ( lus ) need = need + 16.0_DP * REAL(npwx,DP) * nk * nvecx
+    ! ... device memory: psi and H psi (S psi), the work blocks, the beta functions, the
+    ! ... diagonals, the reduced matrices, the projections, the potential, the FFT
+    ! ... scratch arrays and the work area of the largest batched cuFFT plan (their size)
+    need = 16.0_DP * REAL(npwx,DP) * nk * ( 2.0_DP*nvecx + 2.0_DP*nvec + nkb ) + &
+           16.0_DP * REAL(npwx,DP) * nk * 2.0_DP + &
+           16.0_DP * REAL(nvec,DP) * nvecx * nk * 3.0_DP + &
+           16.0_DP * REAL(MAX(nkb,1),DP) * nvec * nk * 3.0_DP + &
+           8.0_DP * REAL(nnr,DP) * nspin + &
+           64.0_DP * REAL(nnr,DP) * nfb
+    IF ( lus ) need = need + 16.0_DP * REAL(npwx,DP) * nk * ( nvecx + nvec )
     istat = cudaMemGetInfo( mfree, mtot )
     nserve = 1
-    IF ( nks < 4 .OR. need > 0.6_DP * REAL(mfree,DP) ) nserve = 0
+    IF ( env_off .OR. nks < 4 .OR. need > 0.6_DP * REAL(mfree,DP) ) nserve = 0
     ! reduced matrices of all k-points on the host
     IF ( 80.0_DP * REAL(nvecx,DP)**2 * nk > 8.0E9_DP ) nserve = 0
     CALL mp_sum( nserve, intra_image_comm )
@@ -222,7 +232,6 @@ CONTAINS
        DEALLOCATE( ivec )
     ENDIF
     !
-    nfb = MAX( 1, MIN( nvec*nk, 33554432 / nnr, 8192 ) )
     ALLOCATE( psig_d(nnr*nfb), psic_d(nnr*nfb) )
     psig_d = c_zero
     CALL make_plans( )
@@ -298,8 +307,8 @@ CONTAINS
     !
     CALL start_clock( 'nscfd_dav' )
     empty_ethr = MAX( ethr*5.0_DP, 1.0E-5_DP )
-    ALLOCATE( nbase(nk), notcnv(nk), kter(nk), ntry(nk), state(nk), inotcnv(nvec,nk), flag_h(nk), &
-              pk_h(nvec*nk), pn_h(nvec*nk), run1(nk), run2(nk), nbold(nk), conv(nvec,nk), vzero(nk) )
+    ALLOCATE( nbase(nk), notcnv(nk), kter(nk), ntry(nk), state(nk), flag_h(nk), &
+              pk_h(nvec*nk), pn_h(nvec*nk), run1(nk), run2(nk), conv(nvec,nk), vzero(nk) )
     ALLOCATE( e(nvec,nk), ew_h(nvec,nk), hc(nvecx,nvecx,nk), sc(nvecx,nvecx,nk), vc(nvecx,nvec,nk), &
               hcn_h(nvec,nvecx,nk), scn_h(nvec,nvecx,nk), vcr(nvecx,nvec,nk) )
     state = 0 ; kter = 0 ; ntry = 0 ; tot_iter = 0
@@ -395,7 +404,6 @@ CONTAINS
           DO n = 1, nvec
              IF ( .NOT. conv(n,ik) ) THEN
                 np = np + 1
-                inotcnv(np,ik) = n
                 npair = npair + 1
                 pk_h(npair) = ik ; pn_h(npair) = np
                 vcr(1:nbase(ik),np,ik) = vc(1:nbase(ik),n,ik)
@@ -592,7 +600,7 @@ CONTAINS
     avg_iter = avg_iter / nkstot
     WRITE( stdout, '(/,5X,"ethr = ",1PE9.2,",  avg # of iterations =",0PF5.1)' ) ethr, avg_iter
     !
-    DEALLOCATE( nbase, notcnv, kter, ntry, state, inotcnv, flag_h, pk_h, pn_h, run1, run2, nbold, conv, vzero )
+    DEALLOCATE( nbase, notcnv, kter, ntry, state, flag_h, pk_h, pn_h, run1, run2, conv, vzero )
     DEALLOCATE( e, ew_h, hc, sc, vc, hcn_h, scn_h, vcr )
     DEALLOCATE( psi_d, hpsi_d, wrk_d, hwrk_d, vkb_d, bw_d, bw2_d, bw3_d, vc_d, hcn_d, scn_d )
     IF ( lus ) DEALLOCATE( spsi_d, swrk_d )
