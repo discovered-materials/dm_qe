@@ -396,6 +396,7 @@ MODULE exx_bp
     !
 #if defined(__CUDA)
     p6_nbuild = p6_nbuild + 1     ! the adaptive precision of the fast path counts the builds
+    exx_sp_last = .FALSE.         ! set by vexx_sp_now when a pair transform of this build is single precision
 #endif
     gpu_fill = .FALSE.
 #if defined(__CUDA)
@@ -3766,7 +3767,11 @@ end associate
           IF ( .NOT. vexx_sp_now ) exx_sp_latched = .TRUE.
        ENDIF
     ENDIF
-    exx_sp_last = vexx_sp_now
+    ! exx_sp_last: whether any call of the present build was single precision. It is reset by
+    ! exxinit_bp, not here: a build whose fast path bails out (no room on the device) falls back
+    ! to the double-precision operator and never calls this function again, and a stale TRUE
+    ! would veto the convergence of the exact-exchange loop in electrons for good
+    exx_sp_last = exx_sp_last .OR. vexx_sp_now
   END FUNCTION vexx_sp_now
   !
   !-----------------------------------------------------------------------
@@ -4869,7 +4874,8 @@ end associate
     INTEGER, POINTER :: nl_d(:)
     attributes(DEVICE) :: nl_d
     INTEGER :: nrxxs, nr1, nr2, nr3, ngmt, nbuf, nkqs_d, nocc, pblk, cmax, npw
-    INTEGER :: ik, ikg, iq, jq, ikq, ikq2, ik2, ik2g, is, sinv, i, j, ig, ir, ib, jb, j0, np_, s, s0, ns, nstot, istat
+    INTEGER :: ik, ikg, iq, jq, ikq, ikq2, ik2, ik2g, is, sinv, i, j, ig, ir, ib, jb, j0, np_, s, s0, ns, istat
+    INTEGER(KIND=8) :: nstot
     INTEGER :: ncoup, nself, nsolo, nskip, jfirst, jlast, io, nord, cur, nflush
     REAL(DP) :: work_all, work_k
     INTEGER, ALLOCATABLE :: ord(:)
@@ -4943,6 +4949,14 @@ end associate
     IF ( .NOT. ALLOCATED(p6_res_d) )  need = need + 32_8*INT(nrt,8)*INT(m,8)
     IF ( .NOT. ALLOCATED(p6_rhoc_d) ) need = need + 32_8*INT(nrxxs,8)*INT(pblk,8)
     IF ( .NOT. ALLOCATED(p6_facb_d) ) need = need + 8_8*INT(nrxxs,8)*INT(nqs,8)
+    ! ... and the slot tables of one k-point (allocated below): at most m x m per k+q point,
+    ! ... 24 bytes per slot on the device (the same again on the host)
+    nstot = INT(nqs,8) * INT(m,8) * INT(MAX(m,1),8)
+    IF ( .NOT. ALLOCATED(ka_si_h) ) THEN
+       need = need + 24_8*nstot
+    ELSE IF ( SIZE(ka_si_h,KIND=8) < nstot ) THEN
+       need = need + 24_8*nstot
+    ENDIF
     istat = exx_device_room( need, free_, total_ )
     IF ( istat == 0 .AND. need + 268435456_8 > free_ ) THEN
        WRITE( stdout, '(5X,"EXX-GPU: the all-k exchange build would need ",I0," MB of device memory, ",I0," MB are free: V_x is applied k-point by k-point")' ) &
@@ -5126,10 +5140,9 @@ end associate
     ENDIF
     ka_h_d = ( 0._DP, 0._DP )
     IF ( us ) ku_dx_d = ( 0._DP, 0._DP )
-    ! ... room for the slots of one k-point: at most m x m per k+q point
-    nstot = nqs * m * MAX( m, 1 )
+    ! ... room for the slots of one k-point: at most m x m per k+q point (nstot, counted in need above)
     IF ( ALLOCATED(ka_si_h) ) THEN
-       IF ( SIZE(ka_si_h) < nstot ) DEALLOCATE( ka_si_h, ka_sj_h, ka_sw_h, ka_si_d, ka_sj_d, ka_sw_d )
+       IF ( SIZE(ka_si_h,KIND=8) < nstot ) DEALLOCATE( ka_si_h, ka_sj_h, ka_sw_h, ka_si_d, ka_sj_d, ka_sw_d )
     ENDIF
     IF ( .NOT. ALLOCATED(ka_si_h) ) ALLOCATE( ka_si_h(nstot), ka_sj_h(nstot), ka_sw_h(2,nstot), &
                                               ka_si_d(nstot), ka_sj_d(nstot), ka_sw_d(2,nstot) )
