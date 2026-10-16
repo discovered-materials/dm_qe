@@ -1317,9 +1317,9 @@ CONTAINS
        ENDDO
     ENDDO
     DEALLOCATE( stage )
-    ! (when restarting, iter0 > 0, the response wavefunctions of the interrupted run are
-    !  not in the buffer, which the engine fills only at the end of a session: the linear
-    !  systems start from zero)
+    ! (when restarting, iter0 > 0, the buffer holds at best the response wavefunctions
+    !  of the last recover record, written there by dfpt_dev_flush: the linear systems
+    !  start from zero, with the threshold of the recovered error, see dfpt_kernels)
     dpsi_d = c_zero
     h_d = c_zero ; t_d = c_zero ; g_d = c_zero
     !

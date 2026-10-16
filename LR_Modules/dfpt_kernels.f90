@@ -177,7 +177,7 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
    !! True if the response potential was computed on the device
    LOGICAL :: dev_mix
    !! True if the mixing history is kept in memory (device engine in use)
-   REAL(DP) :: eta_in, eta_fac, eta_now
+   REAL(DP) :: eta_in, eta_fac, eta_now, tr2_mix
    LOGICAL :: eta_off
    !! Device engine: from now on the linear systems are solved to thresh (set when
    !! self-consistency was reached in an iteration with a relative tolerance)
@@ -463,6 +463,13 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
       !
       !   And we mix with the old potential: dvscftmp -> dvscfp
       !
+      !   With the linear systems solved to a relative tolerance only (QE_PH_ETA) self-
+      !   consistency is not accepted: the mixer must not see it either, or it would return
+      !   without mixing and drop its history. It mixes, and the iterations continue with
+      !   the linear systems solved to thresh (eta_off below).
+      !
+      tr2_mix = npert * tr2_ph / npol
+      IF (eta_now > 0.0_DP) tr2_mix = -1.0_DP
       IF (okpaw) THEN
          !
          !  In this case we mix also dbecsum
@@ -470,30 +477,31 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
          CALL setmixout(ndim_pot, ndim_paw, mixout, dvscftmp, dfpt_data%dbecsum, ndim, -1)
          IF (dev_mix) THEN
             CALL mix_potential_mem(2 * (ndim_pot + ndim), mixout, mixin, alpha_mix(kter), dr2, &
-                                   npert * tr2_ph / npol, iter, nmix_ph, convt)
+                                   tr2_mix, iter, nmix_ph, convt)
          ELSE
             CALL mix_potential(2 * (ndim_pot + ndim), mixout, mixin, alpha_mix(kter), dr2, &
-                               npert * tr2_ph / npol, iter, nmix_ph, flmixdpot, convt)
+                               tr2_mix, iter, nmix_ph, flmixdpot, convt)
          ENDIF
          CALL setmixout(ndim_pot, ndim_paw, mixin, dfpt_data%dvscfp, dfpt_data%dbecsum, ndim, 1)
       ELSE
          IF (dev_mix) THEN
             CALL mix_potential_mem(2 * ndim_pot, dvscftmp, dfpt_data%dvscfp, alpha_mix(kter), dr2, &
-                                   npert * tr2_ph / npol, iter, nmix_ph, convt)
+                                   tr2_mix, iter, nmix_ph, convt)
          ELSE
             CALL mix_potential(2 * ndim_pot, dvscftmp, dfpt_data%dvscfp, alpha_mix(kter), dr2, &
-                               npert * tr2_ph / npol, iter, nmix_ph, flmixdpot, convt)
+                               tr2_mix, iter, nmix_ph, flmixdpot, convt)
          ENDIF
       ENDIF
       !
       !   fft_interpolate or copy potential from hard to smooth grid: dvscfp -> dvscfs
       !
       ! Self-consistency reached with linear systems solved to a relative tolerance only:
-      ! not accepted. The iterations continue with the linear systems solved to thresh.
+      ! not accepted (convt is false, see tr2_mix above). The iterations continue with the
+      ! linear systems solved to thresh.
       !
-      IF (convt .AND. eta_now > 0.0_DP) THEN
+      IF (eta_now > 0.0_DP) THEN
          convt = .FALSE.
-         eta_off = .TRUE.
+         IF (dr2 < npert * tr2_ph / npol) eta_off = .TRUE.
       ENDIF
       !
       CALL start_clock('dk_p2s')
@@ -585,6 +593,10 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
          IF (rec_due > 0 .OR. convt .OR. stop_now .OR. kter == niter_ph) THEN
             convt_rec = convt
             IF (convt .AND. dfpt_dev_keeping()) convt_rec = .FALSE.
+            ! the response wavefunctions go to their buffer with the record: a restart that
+            ! does not take the engine (CPU build, QE_PH_DEV=0, no room on the device) reads
+            ! its starting guess from there, as after a run of the stock loop
+            IF (dev_mix) CALL dfpt_dev_flush()
             CALL write_rec_callback(where_rec, irr, dr2, iter, convt_rec, dfpt_data)
             CALL SYSTEM_CLOCK(clk_rec, clk_rate)
          ENDIF
