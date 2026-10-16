@@ -69,6 +69,10 @@ MODULE exx
   LOGICAL :: exx_fft_initialized = .FALSE.
   REAL(DP)  :: ecutfock
   !! energy cutoff for custom grid
+  LOGICAL :: exx_auto_done = .FALSE.
+  !! the cutoff was chosen by exx_auto_cutoff, or restored from an earlier run (exx_restore_cutoff)
+  REAL(DP) :: ecutfock_auto = 0.0_DP
+  !! that cutoff, kept over the rebuilds of the EXX grid
   !
  CONTAINS
 #define _CX(A)  CMPLX(A,0._dp,kind=DP)
@@ -219,9 +223,14 @@ MODULE exx
     USE io_files,         ONLY : nwordwfc, iunwfc
     USE uspp,             ONLY : okvan
     USE control_flags,    ONLY : iverbosity
+    USE input_parameters, ONLY : ip_ecutfock => ecutfock
     USE mp_bands,         ONLY : intra_bgrp_comm
     USE mp_pools,         ONLY : inter_pool_comm
-    USE mp,               ONLY : mp_sum
+    USE mp_images,        ONLY : intra_image_comm, root_image
+    USE mp,               ONLY : mp_sum, mp_bcast
+#if defined(__CUDA)
+    USE exx_bp,           ONLY : exx_device_room
+#endif
     !
     IMPLICIT NONE
     !
@@ -239,12 +248,22 @@ MODULE exx
     REAL(DP), ALLOCATABLE, DEVICE :: ws_d(:,:), gg_d(:)
     INTEGER, ALLOCATABLE, DEVICE :: igk_d(:)
     INTEGER, POINTER, DEVICE :: nl_d(:), nlm_d(:)
-    INTEGER :: ir
+    INTEGER :: ir, istat
+    INTEGER(KIND=8) :: need, free_, total_
 #endif
     !
     edef = MIN( ecutrho, 4.0_DP*ecutwfc )
-    ! (ultrasoft and PAW: setup has fixed the cutoff; a cutoff from the input or a restart file is kept)
-    IF ( okvan .OR. noncolin .OR. ABS( ecutfock - edef ) > 1.0E-8_DP .OR. x_nbnd_occ < 1 ) RETURN
+    ! ... a choice already made for this system is kept: by an earlier call (the EXX grid is
+    ! ... rebuilt when the cell changes), by the restart file of an interrupted run or by the
+    ! ... XML file of the scf run that a non-scf run follows (exx_restore_cutoff)
+    IF ( exx_auto_done ) THEN
+       IF ( ecutfock_auto > 0.0_DP ) ecutfock = ecutfock_auto
+       RETURN
+    ENDIF
+    ! ... ultrasoft and PAW: setup has fixed the cutoff. A cutoff given in the input is kept: the
+    ! ... raw value of the namelist (iosys replaces an absent one by the default, so the module
+    ! ... variable cannot tell 'absent' from 'ecutfock = 4*ecutwfc typed in')
+    IF ( okvan .OR. noncolin .OR. ip_ecutfock > 0.0_DP .OR. x_nbnd_occ < 1 ) RETURN
     tol = 1.0E-8_DP
     CALL GET_ENVIRONMENT_VARIABLE( 'QE_EXX_ECUT_TOL', val, lenv, stat )
     IF ( stat == 0 .AND. lenv > 0 ) THEN
@@ -255,6 +274,8 @@ MODULE exx
           tol = 1.0E-8_DP
        ENDIF
     ENDIF
+    ! (one value on every rank: the collective sums below must be reached by all of them)
+    CALL mp_bcast( tol, root_image, intra_image_comm )
     IF ( tol == 0.0_DP ) RETURN
     CALL start_clock( 'exx_ecut' )
     !
@@ -282,6 +303,13 @@ MODULE exx
     on_device = .FALSE.
 #if defined(__CUDA)
     on_device = use_gpu .AND. ( dffts%nproc == 1 )
+    IF ( on_device ) THEN
+       ! ... only where the sample fits (a CUDA Fortran ALLOCATE that fails aborts the run; the
+       ! ... host path below costs a few dozen transforms, once)
+       need = 16_8*INT(nnr,8)*INT(ns+ne+1,8) + 20_8*INT(npw,8) + 24_8*INT(ngs,8)
+       istat = exx_device_room( need, free_, total_ )
+       on_device = ( istat == 0 .AND. need + 268435456_8 <= free_ )
+    ENDIF
     IF ( on_device ) THEN
        ALLOCATE( psir_d(nnr,ns+ne), rho_d(nnr), evc_d(npw), ws_d(ngs,2), gg_d(ngs), igk_d(npw) )
        nl_d  => dffts%nl_d
@@ -399,9 +427,34 @@ MODULE exx
        WRITE( stdout, '(5X,"     ",ES8.1," of the exchange sum beyond it (tolerance ",ES8.1,"; ecutfock in the input, or")' ) MAXVAL( tail(kc,:) ), tol
        WRITE( stdout, '(5X,"     QE_EXX_ECUT_TOL=0 in the environment, keeps the full sphere)")' )
     ENDIF
+    exx_auto_done = .TRUE.
+    ecutfock_auto = ecutfock
     CALL stop_clock( 'exx_ecut' )
     !
   END SUBROUTINE exx_auto_cutoff
+  !
+  !------------------------------------------------------------------------
+  SUBROUTINE exx_restore_cutoff( ecut )
+    !------------------------------------------------------------------------
+    !! The cutoff of the Fock operator of an earlier run of this system, read from the
+    !! restart file of an interrupted exact-exchange loop (electrons) or from the XML file
+    !! of the scf run before a non-scf run (setup): kept, so that the operator is the one of
+    !! that run instead of a new choice of exx_auto_cutoff from other orbitals. A cutoff given
+    !! in the input wins; ultrasoft, PAW and noncollinear runs keep the cutoff of setup.
+    !
+    USE input_parameters, ONLY : ip_ecutfock => ecutfock
+    USE uspp,             ONLY : okvan
+    !
+    IMPLICIT NONE
+    !
+    REAL(DP), INTENT(IN) :: ecut
+    !
+    IF ( ecut <= 0.0_DP .OR. ip_ecutfock > 0.0_DP .OR. okvan .OR. noncolin ) RETURN
+    ecutfock = ecut
+    ecutfock_auto = ecut
+    exx_auto_done = .TRUE.
+    !
+  END SUBROUTINE exx_restore_cutoff
   !
   !------------------------------------------------------------------------
   SUBROUTINE exx_device_grid()

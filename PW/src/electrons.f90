@@ -36,7 +36,7 @@ SUBROUTINE electrons()
   USE uspp,                 ONLY : okvan
   USE exx,                  ONLY : aceinit,exxinit, exxenergy2, exxenergyace, exxbuff, &
                                    fock0, fock1, fock2, fock3, dexx, use_ace, local_thr, &
-                                   domat
+                                   domat, exx_restore_cutoff, ecutfock_exx => ecutfock
   USE xc_lib,               ONLY : xclib_dft_is, exx_is_active, stop_exx
   USE control_flags,        ONLY : adapt_thr, tr2_init, tr2_multi, gamma_only
   !
@@ -77,6 +77,8 @@ SUBROUTINE electrons()
   REAL(DP) :: etot_cmp_paw(nat,2,2)
   LOGICAL :: DoLoc
   LOGICAL :: exx_conv
+  REAL(DP) :: ecut_res
+  ! cutoff of the Fock operator saved in the restart file (0 when absent)
   !! the exact-exchange loop has converged
   !
   !
@@ -119,6 +121,10 @@ SUBROUTINE electrons()
            ! FIXME: et and wg should be read from xml file
            READ (iunres, *) (wg(1:nbnd,ik),ik=1,nks)
            READ (iunres, *) (et(1:nbnd,ik),ik=1,nks)
+           ! the cutoff of the Fock operator chosen by exx_auto_cutoff (absent in older files)
+           ecut_res = 0.0_DP
+           READ (iunres, *, iostat=ios) ecut_res
+           ios = 0
            !$acc update device(et)
            CLOSE ( unit=iunres, status='delete')
            ! ... if restarting here, exx was already active
@@ -127,6 +133,8 @@ SUBROUTINE electrons()
 !civn  see non-scf comment about this
            Call stop_exx()
 !
+           ! the EXX grid of the interrupted run, so that its orbital buffer can be read below
+           CALL exx_restore_cutoff( ecut_res )
            CALL exxinit(DoLoc)
            IF( DoLoc.and.gamma_only) THEN
              CALL localize_orbitals( )
@@ -199,6 +207,7 @@ SUBROUTINE electrons()
            WRITE (iunres, *) exxen, fock0, fock1, fock2
            WRITE (iunres, *) (wg(1:nbnd,ik),ik=1,nks)
            WRITE (iunres, *) (et(1:nbnd,ik),ik=1,nks)
+           WRITE (iunres, *) ecutfock_exx
            CLOSE (unit=iunres, status='keep')
            CALL seqopn (iunres, 'restart_exx', 'unformatted', exst)
            CALL exxbuff_sync_host()

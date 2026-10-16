@@ -87,7 +87,7 @@ SUBROUTINE setup()
   USE qexsd_copy,         ONLY : qexsd_copy_efermi
   USE qes_libs_module,    ONLY : qes_reset
   USE qes_types_module,   ONLY : output_type
-  USE exx,                ONLY : ecutfock
+  USE exx,                ONLY : ecutfock, exx_restore_cutoff
   USE exx_bp,             ONLY : exx_us_forces_available
   USE xc_lib,             ONLY : xclib_dft_is
   USE paw_variables,      ONLY : okpaw
@@ -111,7 +111,7 @@ SUBROUTINE setup()
   !
   INTEGER  :: na, is, ierr, ibnd, ik, nrot_, nbnd_, nr3, nk_, natomwfc 
   LOGICAL  :: magnetic_sym, skip_equivalence=.FALSE.
-  REAL(DP) :: iocc, ionic_charge, one
+  REAL(DP) :: iocc, ionic_charge, one, ecutfock_xml
   !
   TYPE(output_type)  :: output_obj 
   !  
@@ -207,6 +207,20 @@ SUBROUTINE setup()
      CALL mp_bcast(ef_up, ionode_id, intra_image_comm)
      CALL mp_bcast(ef_dw, ionode_id, intra_image_comm)
      CALL mp_bcast(nbnd_, ionode_id, intra_image_comm)
+     !
+     ! ... the cutoff of the Fock operator of the scf run: a non-scf run of a hybrid
+     ! ... functional keeps it when the input gives none (exx_auto_cutoff would choose
+     ! ... again, from other orbitals)
+     !
+     ecutfock_xml = 0.0_DP
+     IF ( ionode ) THEN
+        IF ( output_obj%dft%hybrid_ispresent ) THEN
+           IF ( output_obj%dft%hybrid%ecutfock_ispresent ) &
+              ecutfock_xml = output_obj%dft%hybrid%ecutfock*e2
+        ENDIF
+     ENDIF
+     CALL mp_bcast(ecutfock_xml, ionode_id, intra_image_comm)
+     IF ( .NOT. lscf ) CALL exx_restore_cutoff( ecutfock_xml )
      CALL qes_reset  ( output_obj )
      !
   END IF
