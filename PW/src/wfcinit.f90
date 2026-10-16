@@ -476,7 +476,7 @@ SUBROUTINE aceinit0( nbndsize )
   USE io_files,             ONLY : restart_dir
   USE wvfct,                ONLY : nbnd
   USE pw_restart_new,       ONLY : read_collected_wfc
-  USE exx,                  ONLY : xi, xi_d, domat
+  USE exx,                  ONLY : xi, xi_d, domat, ace_to_device
   USE xc_lib,               ONLY : start_exx, exx_is_active
   USE noncollin_module,     ONLY : npol
   USE wvfct,                ONLY : npwx
@@ -519,9 +519,7 @@ SUBROUTINE aceinit0( nbndsize )
             'file with ACE potential not found or not readable',ik)
     END DO
     !
-#if defined (__CUDA)
-    IF (nks == 1) xi_d(:,:) = xi(:,:,1)
-#endif
+    CALL ace_to_device()
     !
     WRITE( stdout, '(5X,"Starting ACE correctly read from file")' )
     !

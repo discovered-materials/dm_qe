@@ -40,6 +40,15 @@ MODULE exx
 #if defined(__CUDA)
   ATTRIBUTES(DEVICE) :: xi_d
 #endif
+  INTEGER :: xi_d_k = -1
+  !! the k-point whose ACE projectors xi_d holds (-1: none): h_psi is applied many times to the
+  !! same k-point, and xi is uploaded when the k-point changes, not at every application
+  COMPLEX(DP), ALLOCATABLE :: xi_all_d(:,:,:)
+  !! the ACE projectors of every k-point on the device, when they fit there comfortably: a
+  !! change of k-point is then a copy on the device (ace_to_device)
+#if defined(__CUDA)
+  ATTRIBUTES(DEVICE) :: xi_all_d
+#endif
   LOGICAL :: domat
   !! 
   ! ... energy related variables
@@ -60,6 +69,10 @@ MODULE exx
   LOGICAL :: exx_fft_initialized = .FALSE.
   REAL(DP)  :: ecutfock
   !! energy cutoff for custom grid
+  LOGICAL :: exx_auto_done = .FALSE.
+  !! the cutoff was chosen by exx_auto_cutoff, or restored from an earlier run (exx_restore_cutoff)
+  REAL(DP) :: ecutfock_auto = 0.0_DP
+  !! that cutoff, kept over the rebuilds of the EXX grid
   !
  CONTAINS
 #define _CX(A)  CMPLX(A,0._dp,kind=DP)
@@ -102,6 +115,9 @@ MODULE exx
     !
     IF ( exx_fft_initialized ) RETURN
     !
+    ! ... the cutoff of the Fock operator from the pair densities themselves, unless the input gives one
+    CALL exx_auto_cutoff()
+    !
     ! Initialise the custom grid that allows us to put the wavefunction
     ! onto the new (smaller) grid for \rho=\psi_{k+q}\psi^*_k and vice versa
     !
@@ -136,6 +152,8 @@ MODULE exx
        ! ... no band parallelization: exx grid is a subgrid of general grid
        !
        lpara = ( nproc_bgrp > 1 )
+       IF ( use_gpu .AND. negrp == 1 .AND. exx_bgrp_type /= EXX_BGRP_BANDS .AND. .NOT. lpara .AND. .NOT. tqr ) &
+          CALL exx_device_grid()
        CALL fft_type_init( dfftt, smap, "rho", gamma_only, lpara,         &
                            intra_bgrp_comm, at, bg, gcutmt, gcutmt/gkcut, &
                            fft_fact=fft_fact, nyfft=nyfft, nmany=nmany_,  &
@@ -174,6 +192,358 @@ MODULE exx
     RETURN
     !
   END SUBROUTINE exx_fft_create
+  !
+  !------------------------------------------------------------------------
+  SUBROUTINE exx_auto_cutoff()
+    !------------------------------------------------------------------------
+    !! The default cutoff of the Fock operator, 4*ecutwfc, keeps every component of the pair
+    !! densities psi_i psi_j. Most of that sphere holds nothing: the exchange energy is a sum
+    !! over G of v(G) |rho_ij(G)|^2, and what lies beyond a cutoff E is exactly what a run with
+    !! ecutfock = E leaves out (at fixed orbitals), while the cost of the operator goes with
+    !! the number of grid points, E^(3/2).
+    !! When ecutfock is not given in the input (norm-conserving, collinear runs), this routine
+    !! measures that tail and sets ecutfock to the smallest of 1, 1.25, 1.5, 1.75, 2, 2.5, 3
+    !! times ecutwfc beyond which less than a fraction tol of the sum is left. The sum is taken
+    !! with the bare 1/G^2 weight (which bounds the screened kernels at large G) over a sample
+    !! of pair densities at the first k-point of each pool: the pairs of 8 occupied orbitals,
+    !! the highest included, and their pairs with up to 4 empty ones; the two kinds are held to
+    !! the tolerance separately, the second being what the eigenvalues of empty bands see.
+    !! tol is 1e-8, or QE_EXX_ECUT_TOL from the environment (0 keeps 4*ecutwfc).
+    !! Called once, before the EXX grid is made.
+    !
+    USE gvecw,            ONLY : ecutwfc
+    USE gvect,            ONLY : ecutrho, gg, gstart
+    USE cell_base,        ONLY : tpiba2
+    USE fft_base,         ONLY : dffts
+    USE fft_interfaces,   ONLY : invfft, fwfft
+    USE wavefunctions,    ONLY : evc
+    USE wvfct,            ONLY : nbnd
+    USE klist,            ONLY : nks, igk_k, ngk
+    USE buffers,          ONLY : get_buffer
+    USE io_files,         ONLY : nwordwfc, iunwfc
+    USE uspp,             ONLY : okvan
+    USE control_flags,    ONLY : iverbosity
+    USE input_parameters, ONLY : ip_ecutfock => ecutfock
+    USE mp_bands,         ONLY : intra_bgrp_comm
+    USE mp_pools,         ONLY : inter_pool_comm
+    USE mp_images,        ONLY : intra_image_comm, root_image
+    USE mp,               ONLY : mp_sum, mp_bcast
+#if defined(__CUDA)
+    USE exx_bp,           ONLY : exx_device_room
+#endif
+    !
+    IMPLICIT NONE
+    !
+    INTEGER, PARAMETER :: nl = 7
+    REAL(DP), PARAMETER :: ladder(nl) = (/ 1.0_DP, 1.25_DP, 1.5_DP, 1.75_DP, 2.0_DP, 2.5_DP, 3.0_DP /)
+    CHARACTER(LEN=32) :: val
+    INTEGER :: lenv, stat, ios, ns, ne, nocc, is, js, ig, k, npw, ib, kc, kind, ngs, nnr
+    REAL(DP) :: tol, e, wp, sh(nl+1,2), tot(2), tail(nl,2), edef
+    INTEGER, ALLOCATABLE :: ibs(:)
+    REAL(DP), ALLOCATABLE :: ws(:,:)
+    COMPLEX(DP), ALLOCATABLE :: psir(:,:), rho(:)
+    LOGICAL :: on_device
+#if defined(__CUDA)
+    COMPLEX(DP), ALLOCATABLE, DEVICE :: psir_d(:,:), rho_d(:), evc_d(:)
+    REAL(DP), ALLOCATABLE, DEVICE :: ws_d(:,:), gg_d(:)
+    INTEGER, ALLOCATABLE, DEVICE :: igk_d(:)
+    INTEGER, POINTER, DEVICE :: nl_d(:), nlm_d(:)
+    INTEGER :: ir, istat
+    INTEGER(KIND=8) :: need, free_, total_
+#endif
+    !
+    edef = MIN( ecutrho, 4.0_DP*ecutwfc )
+    ! ... a choice already made for this system is kept: by an earlier call (the EXX grid is
+    ! ... rebuilt when the cell changes), by the restart file of an interrupted run or by the
+    ! ... XML file of the scf run that a non-scf run follows (exx_restore_cutoff)
+    IF ( exx_auto_done ) THEN
+       IF ( ecutfock_auto > 0.0_DP ) ecutfock = ecutfock_auto
+       RETURN
+    ENDIF
+    ! ... ultrasoft and PAW: setup has fixed the cutoff. A cutoff given in the input is kept: the
+    ! ... raw value of the namelist (iosys replaces an absent one by the default, so the module
+    ! ... variable cannot tell 'absent' from 'ecutfock = 4*ecutwfc typed in')
+    IF ( okvan .OR. noncolin .OR. ip_ecutfock > 0.0_DP .OR. x_nbnd_occ < 1 ) RETURN
+    tol = 1.0E-8_DP
+    CALL GET_ENVIRONMENT_VARIABLE( 'QE_EXX_ECUT_TOL', val, lenv, stat )
+    IF ( stat == 0 .AND. lenv > 0 ) THEN
+       ios = 0
+       READ( val, *, IOSTAT=ios ) tol
+       IF ( ios /= 0 .OR. tol < 0.0_DP ) THEN
+          WRITE( stdout, '(5X,"EXX: QE_EXX_ECUT_TOL=",A," not understood (a relative tolerance, e.g. 1e-8; 0 keeps 4*ecutwfc): 1e-8")' ) TRIM(val)
+          tol = 1.0E-8_DP
+       ENDIF
+    ENDIF
+    ! (one value on every rank: the collective sums below must be reached by all of them)
+    CALL mp_bcast( tol, root_image, intra_image_comm )
+    IF ( tol == 0.0_DP ) RETURN
+    CALL start_clock( 'exx_ecut' )
+    !
+    ! ... the sample: ns occupied orbitals of the first k-point, the highest included, then ne empty ones
+    nocc = x_nbnd_occ
+    ns = MIN( nocc, 8 )
+    ne = MIN( nbnd - nocc, 4 )
+    ALLOCATE( ibs(ns+ne) )
+    DO is = 1, ns
+       ibs(is) = nocc
+       IF ( ns > 1 ) ibs(is) = 1 + NINT( DBLE( (is-1)*(nocc-1) ) / DBLE(ns-1) )
+    ENDDO
+    DO is = 1, ne
+       ibs(ns+is) = nbnd
+       IF ( ne > 1 ) ibs(ns+is) = nocc + 1 + NINT( DBLE( (is-1)*(nbnd-nocc-1) ) / DBLE(ne-1) )
+    ENDDO
+    IF ( nks > 1 ) CALL get_buffer( evc, nwordwfc, iunwfc, 1 )
+    npw = ngk(1)
+    ngs = dffts%ngm
+    nnr = dffts%nnr
+    ALLOCATE( ws(ngs,2) )
+    !
+    ! ... ws(G,kind): sum over the sampled pairs of |rho_ij(G)|^2 / G^2, the pairs standing for all of their
+    !     kind: nocc diagonal ones and nocc (nocc-1) / 2 off the diagonal (kind 1), occupied x empty (kind 2)
+    on_device = .FALSE.
+#if defined(__CUDA)
+    on_device = use_gpu .AND. ( dffts%nproc == 1 )
+    IF ( on_device ) THEN
+       ! ... only where the sample fits (a CUDA Fortran ALLOCATE that fails aborts the run; the
+       ! ... host path below costs a few dozen transforms, once)
+       need = 16_8*INT(nnr,8)*INT(ns+ne+1,8) + 20_8*INT(npw,8) + 24_8*INT(ngs,8)
+       istat = exx_device_room( need, free_, total_ )
+       on_device = ( istat == 0 .AND. need + 268435456_8 <= free_ )
+    ENDIF
+    IF ( on_device ) THEN
+       ALLOCATE( psir_d(nnr,ns+ne), rho_d(nnr), evc_d(npw), ws_d(ngs,2), gg_d(ngs), igk_d(npw) )
+       nl_d  => dffts%nl_d
+       gg_d = gg(1:ngs)
+       igk_d = igk_k(1:npw,1)
+       ws_d = 0.0_DP
+       psir_d = ( 0.0_DP, 0.0_DP )
+       DO is = 1, ns + ne
+          evc_d = evc(1:npw,ibs(is))
+          !$cuf kernel do (1)
+          DO ig = 1, npw
+             psir_d( nl_d(igk_d(ig)), is ) = evc_d(ig)
+          ENDDO
+          IF ( gamma_only ) THEN
+             nlm_d => dffts%nlm_d
+             !$cuf kernel do (1)
+             DO ig = 1, npw
+                psir_d( nlm_d(igk_d(ig)), is ) = CONJG( evc_d(ig) )
+             ENDDO
+          ENDIF
+          CALL invfft( 'Wave', psir_d(:,is), dffts )
+       ENDDO
+       DO js = 1, ns + ne
+          DO is = 1, MIN( js, ns )
+             kind = 1
+             wp = DBLE(nocc) / DBLE(ns)
+             IF ( is /= js ) wp = DBLE(nocc) * DBLE(nocc-1) / ( DBLE(ns) * DBLE(MAX(ns-1,1)) )
+             IF ( js > ns ) THEN
+                kind = 2
+                wp = 1.0_DP
+             ENDIF
+             !$cuf kernel do (1)
+             DO ir = 1, nnr
+                rho_d(ir) = CONJG( psir_d(ir,is) ) * psir_d(ir,js)
+             ENDDO
+             CALL fwfft( 'Rho', rho_d, dffts )
+             !$cuf kernel do (1)
+             DO ig = gstart, ngs
+                ws_d(ig,kind) = ws_d(ig,kind) + wp * ( DBLE( rho_d(nl_d(ig)) )**2 + AIMAG( rho_d(nl_d(ig)) )**2 ) / gg_d(ig)
+             ENDDO
+          ENDDO
+       ENDDO
+       ws = ws_d
+       DEALLOCATE( psir_d, rho_d, evc_d, ws_d, gg_d, igk_d )
+    ENDIF
+#endif
+    IF ( .NOT. on_device ) THEN
+       ALLOCATE( psir(nnr,ns+ne), rho(nnr) )
+       ws = 0.0_DP
+       DO is = 1, ns + ne
+          ib = ibs(is)
+          psir(:,is) = ( 0.0_DP, 0.0_DP )
+          DO ig = 1, npw
+             psir( dffts%nl(igk_k(ig,1)), is ) = evc(ig,ib)
+          ENDDO
+          IF ( gamma_only ) THEN
+             DO ig = 1, npw
+                psir( dffts%nlm(igk_k(ig,1)), is ) = CONJG( evc(ig,ib) )
+             ENDDO
+          ENDIF
+          CALL invfft( 'Wave', psir(:,is), dffts )
+       ENDDO
+       DO js = 1, ns + ne
+          DO is = 1, MIN( js, ns )
+             kind = 1
+             wp = DBLE(nocc) / DBLE(ns)
+             IF ( is /= js ) wp = DBLE(nocc) * DBLE(nocc-1) / ( DBLE(ns) * DBLE(MAX(ns-1,1)) )
+             IF ( js > ns ) THEN
+                kind = 2
+                wp = 1.0_DP
+             ENDIF
+             rho(:) = CONJG( psir(:,is) ) * psir(:,js)
+             CALL fwfft( 'Rho', rho, dffts )
+             DO ig = gstart, ngs
+                ws(ig,kind) = ws(ig,kind) + wp * ( DBLE( rho(dffts%nl(ig)) )**2 + AIMAG( rho(dffts%nl(ig)) )**2 ) / gg(ig)
+             ENDDO
+          ENDDO
+       ENDDO
+       DEALLOCATE( psir, rho )
+    ENDIF
+    !
+    ! ... the shells between the cutoffs of the ladder, summed over the processes of the grid and over the pools
+    sh = 0.0_DP
+    DO ig = gstart, ngs
+       e = gg(ig) * tpiba2
+       IF ( e > edef ) CYCLE
+       kc = nl + 1
+       DO k = nl, 1, -1
+          IF ( e <= ladder(k)*ecutwfc ) kc = k
+       ENDDO
+       sh(kc,:) = sh(kc,:) + ws(ig,:)
+    ENDDO
+    DEALLOCATE( ibs, ws )
+    CALL mp_sum( sh, intra_bgrp_comm )
+    CALL mp_sum( sh, inter_pool_comm )
+    tot(:) = SUM( sh, 1 )
+    tail = 0.0_DP
+    DO k = 1, nl
+       IF ( tot(1) > 0.0_DP ) tail(k,1) = SUM( sh(k+1:nl+1,1) ) / tot(1)
+       IF ( tot(2) > 0.0_DP ) tail(k,2) = SUM( sh(k+1:nl+1,2) ) / tot(2)
+    ENDDO
+    kc = 0
+    DO k = nl, 1, -1
+       IF ( ladder(k)*ecutwfc < edef .AND. MAXVAL( tail(k,:) ) <= tol ) kc = k
+    ENDDO
+    IF ( iverbosity > 0 ) THEN
+       WRITE( stdout, '(/5X,"EXX: part of the exchange sum beyond a cutoff of the Fock operator (occupied pairs, occupied x empty)")' )
+       DO k = 1, nl
+          IF ( ladder(k)*ecutwfc < edef ) WRITE( stdout, '(5X,"EXX:    ecutfock = ",F8.2," Ry:  ",2ES10.2)' ) ladder(k)*ecutwfc, tail(k,:)
+       ENDDO
+    ENDIF
+    IF ( kc > 0 ) THEN
+       ecutfock = ladder(kc)*ecutwfc
+       WRITE( stdout, '(/5X,"EXX: cutoff of the Fock operator set to ",F8.2," Ry (4*ecutwfc = ",F8.2,"): sampled pair densities hold")' ) ecutfock, edef
+       WRITE( stdout, '(5X,"     ",ES8.1," of the exchange sum beyond it (tolerance ",ES8.1,"; ecutfock in the input, or")' ) MAXVAL( tail(kc,:) ), tol
+       WRITE( stdout, '(5X,"     QE_EXX_ECUT_TOL=0 in the environment, keeps the full sphere)")' )
+    ENDIF
+    exx_auto_done = .TRUE.
+    ecutfock_auto = ecutfock
+    CALL stop_clock( 'exx_ecut' )
+    !
+  END SUBROUTINE exx_auto_cutoff
+  !
+  !------------------------------------------------------------------------
+  SUBROUTINE exx_restore_cutoff( ecut )
+    !------------------------------------------------------------------------
+    !! The cutoff of the Fock operator of an earlier run of this system, read from the
+    !! restart file of an interrupted exact-exchange loop (electrons) or from the XML file
+    !! of the scf run before a non-scf run (setup): kept, so that the operator is the one of
+    !! that run instead of a new choice of exx_auto_cutoff from other orbitals. A cutoff given
+    !! in the input wins; ultrasoft, PAW and noncollinear runs keep the cutoff of setup.
+    !
+    USE input_parameters, ONLY : ip_ecutfock => ecutfock
+    USE uspp,             ONLY : okvan
+    !
+    IMPLICIT NONE
+    !
+    REAL(DP), INTENT(IN) :: ecut
+    !
+    IF ( ecut <= 0.0_DP .OR. ip_ecutfock > 0.0_DP .OR. okvan .OR. noncolin ) RETURN
+    ecutfock = ecut
+    ecutfock_auto = ecut
+    exx_auto_done = .TRUE.
+    !
+  END SUBROUTINE exx_restore_cutoff
+  !
+  !------------------------------------------------------------------------
+  SUBROUTINE exx_device_grid()
+    !------------------------------------------------------------------------
+    !! The transforms of the EXX grid of a GPU run are cuFFT's, which is faster on a grid size
+    !! 4*7*2^a*3^b*5^c (28, 56, 84, 112, 140, 168, ...) than on the next size with factors 2, 3 and 5
+    !! only that good_fft_order would take: 84 against 90, 112 against 120, 168 against 180. Where
+    !! such a size holds the transforms, set it before fft_type_init chooses.
+    !! The exchange operator does not depend on the choice: the pair densities and their Fock
+    !! potentials are band limited, so every grid of n >= nrho + 2*nwfc + 1 points per direction
+    !! (nrho, nwfc the largest Miller indices of the spheres of the pair densities and of the
+    !! wavefunctions) gives the same V_x|psi> on the wavefunction sphere, aliasing included.
+    !! Nothing is set when no direction gains, when a direction would need more points than the
+    !! standard grid has, or when the grid would not go with a symmetry operation.
+    !
+    USE gvect,        ONLY : ngm, gg, mill
+    USE symm_base,    ONLY : nsym, s, ft, fft_fact
+    USE mp_bands,     ONLY : intra_bgrp_comm
+    USE mp,           ONLY : mp_max
+    USE fft_support,  ONLY : good_fft_order
+    !
+    IMPLICIT NONE
+    !
+    INTEGER :: nrho(3), nwfc(3), nstd(3), nr(3), i, ig, n, m, isym, lenv, stat
+    REAL(DP) :: ftn(3)
+    LOGICAL :: good
+    CHARACTER(LEN=8) :: val
+    !
+    IF ( dfftt%nr1 /= 0 .OR. dfftt%nr2 /= 0 .OR. dfftt%nr3 /= 0 ) RETURN
+    CALL GET_ENVIRONMENT_VARIABLE( 'QE_EXX_GRID7', val, lenv, stat )
+    IF ( stat == 0 .AND. lenv > 0 ) THEN
+       IF ( val(1:1) == '0' ) RETURN
+    ENDIF
+    !
+    nrho = 0
+    nwfc = 0
+    DO ig = 1, ngm
+       IF ( gg(ig) > gcutmt ) EXIT
+       nrho(:) = MAX( nrho(:), ABS( mill(:,ig) ) )
+       IF ( gg(ig) <= gkcut ) nwfc(:) = MAX( nwfc(:), ABS( mill(:,ig) ) )
+    ENDDO
+    CALL mp_max( nrho, intra_bgrp_comm )
+    CALL mp_max( nwfc, intra_bgrp_comm )
+    !
+    good = .FALSE.
+    DO i = 1, 3
+       nstd(i) = good_fft_order( 2*nrho(i) + 1, fft_fact(i) )
+       nr(i) = nstd(i)
+       ! the smallest size 28 * 2^a 3^b 5^c that holds the transforms and goes with fft_fact
+       DO n = MAX( 2*nrho(i) + 1, nrho(i) + 2*nwfc(i) + 1 ), nstd(i) - 1
+          IF ( MOD( n, 28 ) /= 0 .OR. MOD( n, 49 ) == 0 .OR. MOD( n, fft_fact(i) ) /= 0 ) CYCLE
+          m = n / 28
+          DO WHILE ( MOD( m, 2 ) == 0 )
+             m = m / 2
+          ENDDO
+          DO WHILE ( MOD( m, 3 ) == 0 )
+             m = m / 3
+          ENDDO
+          DO WHILE ( MOD( m, 5 ) == 0 )
+             m = m / 5
+          ENDDO
+          IF ( m == 1 ) THEN
+             nr(i) = n
+             good = .TRUE.
+             EXIT
+          ENDIF
+       ENDDO
+       ! the standard size must hold the transforms too, or the choice is left to fft_type_init
+       IF ( nstd(i) < nrho(i) + 2*nwfc(i) + 1 ) RETURN
+    ENDDO
+    IF ( .NOT. good ) RETURN
+    !
+    ! ... the rotations must send the grid into itself and the fractional translations must be
+    !     grid vectors (the tests of scale_sym_ops, which exx_set_symm will apply to this grid)
+    DO isym = 1, nsym
+       IF ( MOD( s(2,1,isym)*nr(1), nr(2) ) /= 0 .OR. MOD( s(3,1,isym)*nr(1), nr(3) ) /= 0 .OR. &
+            MOD( s(1,2,isym)*nr(2), nr(1) ) /= 0 .OR. MOD( s(3,2,isym)*nr(2), nr(3) ) /= 0 .OR. &
+            MOD( s(1,3,isym)*nr(3), nr(1) ) /= 0 .OR. MOD( s(2,3,isym)*nr(3), nr(2) ) /= 0 ) RETURN
+       ftn(:) = ft(:,isym) * nr(:)
+       IF ( ANY( ABS( ftn(:) - NINT( ftn(:) ) ) / nr(:) > 1.0E-5_DP ) ) RETURN
+    ENDDO
+    !
+    dfftt%nr1 = nr(1)
+    dfftt%nr2 = nr(2)
+    dfftt%nr3 = nr(3)
+    WRITE( stdout, '(5X,"EXX-GPU: EXX grid ",I0," x ",I0," x ",I0," for cuFFT (standard ",I0," x ",I0," x ",I0,")")' ) &
+         nr(1), nr(2), nr(3), nstd(1), nstd(2), nstd(3)
+    !
+  END SUBROUTINE exx_device_grid
   !
   !------------------------------------------------------------------------
   SUBROUTINE exx_gvec_reinit( at_old )
@@ -237,6 +607,8 @@ MODULE exx
     IF ( ALLOCATED(exxmat) )       DEALLOCATE( exxmat )
     IF ( ALLOCATED(xi)   )         DEALLOCATE( xi   )
     IF ( ALLOCATED(xi_d) )         DEALLOCATE( xi_d )
+    IF ( ALLOCATED(xi_all_d) )     DEALLOCATE( xi_all_d )
+    xi_d_k = -1
     IF ( ALLOCATED(evc0) )         DEALLOCATE( evc0 )
     !
     IF ( ALLOCATED(becxx) ) THEN
@@ -623,6 +995,9 @@ MODULE exx
     USE mp,                 ONLY : mp_sum
     USE wavefunctions,      ONLY : evc
     USE uspp_init,          ONLY : init_us_2
+#if defined(__CUDA)
+    USE exx_bp,             ONLY : vexx_all_path, vexx_bp_k_all_gpu
+#endif
     !
     IMPLICIT NONE
     !
@@ -636,6 +1011,7 @@ MODULE exx
     REAL(DP) :: ee, eexx
     INTEGER :: ik, npw
     TYPE(bec_type) :: becpsi
+    LOGICAL :: all_k
     !
     IF (nbndproj < x_nbnd_occ .OR. nbndproj > nbnd) THEN 
        WRITE( stdout, '(3(A,I4))' ) ' occ = ', x_nbnd_occ, ' proj = ', nbndproj, &
@@ -652,6 +1028,22 @@ MODULE exx
     eexx = 0.0d0
     xi = (0.0d0,0.0d0)
     !
+    ! ... where the batched device operator can, V_x|psi> of every k-point is built in one pass
+    !     (each pair potential then serves the two k-points of its pair), into xi
+    all_k = .FALSE.
+#if defined(__CUDA)
+    IF ( .NOT. gamma_only .AND. .NOT. DoLoc .AND. exx_bgrp_type /= EXX_BGRP_BANDS ) THEN
+       IF ( vexx_all_path( nbndproj ) ) THEN
+          CALL start_clock( 'aceinit' )
+          CALL start_clock( 'vexx' )
+          CALL vexx_bp_k_all_gpu( npwx, nbndproj, xi, all_k )
+          CALL stop_clock( 'vexx' )
+          CALL stop_clock( 'aceinit' )
+          IF ( .NOT. all_k ) xi = (0.0d0,0.0d0)
+       ENDIF
+    ENDIF
+#endif
+    !
     DO ik = 1, nks
        npw = ngk(ik)
        current_k = ik
@@ -664,7 +1056,7 @@ MODULE exx
        IF (gamma_only) THEN
           CALL aceinit_gamma( DoLoc, npw, nbnd, evc, xi(1,1,ik), becpsi, ee )
        ELSE
-          CALL aceinit_k( DoLoc, npw, nbnd, evc, xi(1,1,ik), becpsi, ee )
+          CALL aceinit_k( DoLoc, npw, nbnd, evc, xi(1,1,ik), becpsi, ee, all_k )
        ENDIF
        eexx = eexx + ee
     ENDDO
@@ -672,9 +1064,7 @@ MODULE exx
     CALL mp_sum( eexx, inter_pool_comm )
     ! WRITE(stdout,'(/,5X,"ACE energy",f15.8)') eexx
     !
-#if defined (__CUDA)
-    IF (nks == 1) xi_d(:,:) = xi(:,:,1)
-#endif
+    CALL ace_to_device()
     !
     IF (PRESENT(exex)) exex = eexx
     IF ( okvan ) CALL deallocate_bec_type( becpsi )
@@ -682,6 +1072,51 @@ MODULE exx
     domat = .FALSE.
     !
   END SUBROUTINE aceinit
+  !
+  !-----------------------------------------------------------------------------
+  SUBROUTINE ace_to_device()
+    !---------------------------------------------------------------------------
+    !! The device copies of the ACE projectors after xi has been (re)written on the host: the
+    !! one k-point of a single-k run, or every k-point when that takes little of the device
+    !! memory, so that vexxace need not upload xi whenever the k-point changes.
+    !
+    USE wvfct,      ONLY : npwx
+    USE klist,      ONLY : nks
+#if defined(__CUDA)
+    USE exx_bp,     ONLY : exx_device_room
+#endif
+    !
+    IMPLICIT NONE
+    !
+#if defined(__CUDA)
+    INTEGER :: istat
+    INTEGER(KIND=8) :: need, free_, total_
+    LOGICAL :: fits
+    !
+    xi_d_k = -1      ! xi has changed: the device copy of any k-point is stale
+    IF ( .NOT. use_gpu .OR. .NOT. ALLOCATED(xi_d) ) RETURN
+    IF ( nks == 1 ) THEN
+       xi_d(:,:) = xi(:,:,1)
+       xi_d_k = 1
+       RETURN
+    ENDIF
+    need = 16_8 * INT(SIZE(xi,1),8) * INT(SIZE(xi,2),8) * INT(nks,8)
+    IF ( ALLOCATED(xi_all_d) ) THEN
+       IF ( SIZE(xi_all_d,1) /= SIZE(xi,1) .OR. SIZE(xi_all_d,2) /= SIZE(xi,2) .OR. SIZE(xi_all_d,3) /= nks ) &
+          DEALLOCATE( xi_all_d )
+    ENDIF
+    fits = ALLOCATED(xi_all_d)
+    IF ( .NOT. fits ) THEN
+       istat = exx_device_room( 8_8*need, free_, total_ )
+       fits = ( istat == 0 .AND. need <= 2147483648_8 .AND. 8_8*need < free_ )
+       IF ( fits ) ALLOCATE( xi_all_d(SIZE(xi,1),SIZE(xi,2),nks) )
+    ENDIF
+    IF ( fits ) xi_all_d(:,:,:) = xi(:,:,1:nks)
+#else
+    xi_d_k = -1
+#endif
+    !
+  END SUBROUTINE ace_to_device
   !
   !
   !---------------------------------------------------------------------------------
@@ -733,11 +1168,17 @@ MODULE exx
       ! |xi> = Vx[phi]|phi>
       CALL vexx( nnpw, nnpw, nbndproj, phi, xitmp, becpsi )
       ! mexx = <phi|Vx[phi]|phi>
+      IF ( .NOT. use_gpu ) &
       CALL matcalc( 'exact', .TRUE., 0, nnpw, nbndproj, nbndproj, phi, xitmp, mexx, exxe )
       ! |xi> = -One * Vx[phi]|phi> * rmexx^T
     ENDIF  
     !
-    CALL aceupdate( nbndproj, nnpw, xitmp, mexx )
+    IF ( use_gpu .AND. .NOT. DoLoc ) THEN
+       ! the two steps above and below with the device BLAS
+       CALL aceupdate_gpu( nnpw, nnpw, phi, xitmp, exxe, .TRUE. )
+    ELSE
+       CALL aceupdate( nbndproj, nnpw, xitmp, mexx )
+    ENDIF
     !
     DEALLOCATE( mexx )  
     !
@@ -879,7 +1320,14 @@ MODULE exx
     ! do the ACE potential
     ALLOCATE( rmexx_d(nbndproj,nbnd), cmexx_d(nbndproj,nbnd) )
     !
-    IF ( nks > 1 ) xi_d(:,:) = xi(:,:,current_k)
+    IF ( nks > 1 .AND. xi_d_k /= current_k ) THEN
+       IF ( ALLOCATED(xi_all_d) ) THEN
+          xi_d(:,:) = xi_all_d(:,:,current_k)
+       ELSE
+          xi_d(:,:) = xi(:,:,current_k)
+       ENDIF
+       xi_d_k = current_k
+    ENDIF
     !
     ! <xi|phi>
     CALL matcalc_gpu( '<xi|phi>', .FALSE. , 0, nnpw, nbndproj, nbnd, xi_d, phi_d, rmexx_d, exxe )
@@ -923,6 +1371,85 @@ MODULE exx
     CALL stop_clock( 'vexxace' )
     !
   END SUBROUTINE vexxace_gamma_gpu
+  !
+  !-----------------------------------------------------------------------------------------
+  SUBROUTINE aceupdate_gpu( ld, nnpw, phi, xitmp, exxe, update )
+    !---------------------------------------------------------------------------------------
+    !! The matrix <phi|Vx[phi]|phi> with its energy (matcalc, matcalc_k) and the ACE projectors
+    !! |xi> = Vx[phi]|phi> L^-H, with -<phi|Vx|phi> = L L^H (aceupdate, aceupdate_k), by the device
+    !! BLAS: the two products over plane waves are the cost of an ACE build after V_x itself,
+    !! and the host BLAS of a GPU build need not be an optimised one. The factorisation and
+    !! inversion of the nbndproj x nbndproj matrix stay on the host.
+    !
+    USE wvfct,    ONLY : current_k
+#if defined(__CUDA)
+    USE cublas
+#endif
+    !
+    IMPLICIT NONE
+    !
+    INTEGER, INTENT(IN) :: ld
+    !! leading dimension of phi and xitmp (npwx*npol; the number of PW at Gamma)
+    INTEGER, INTENT(IN) :: nnpw
+    !! number of PW
+    COMPLEX(DP), INTENT(IN) :: phi(ld,nbndproj)
+    !! wave functions
+    COMPLEX(DP), INTENT(INOUT) :: xitmp(ld,nbndproj)
+    !! Vx[phi]|phi> on input, xi on output
+    REAL(DP), INTENT(OUT) :: exxe
+    !! exx energy
+    LOGICAL, INTENT(IN) :: update
+    !! if FALSE only the energy is computed (k-points of zero weight)
+    !
+    ! ... local variables
+    !
+    COMPLEX(DP), ALLOCATABLE :: phi_d(:,:), x_d(:,:), c_d(:,:), cmexx(:,:)
+    REAL(DP), ALLOCATABLE :: r_d(:,:), rmexx(:,:)
+#if defined(__CUDA)
+    ATTRIBUTES(DEVICE) :: phi_d, x_d, c_d, r_d
+#endif
+    REAL(DP), PARAMETER :: Zero=0._DP, One=1._DP
+    !
+#if defined(__CUDA)
+    ALLOCATE( phi_d(ld,nbndproj), x_d(ld,nbndproj), c_d(nbndproj,nbndproj), cmexx(nbndproj,nbndproj) )
+    phi_d = phi(:,1:nbndproj)
+    x_d = xitmp
+    IF ( gamma_only ) THEN
+       ALLOCATE( r_d(nbndproj,nbndproj), rmexx(nbndproj,nbndproj) )
+       CALL matcalc_gpu( 'exact', .TRUE., 0, ld, nbndproj, nbndproj, phi_d, x_d, r_d, exxe )
+       rmexx = r_d
+       IF ( update ) THEN
+          CALL start_clock( 'aceupdate' )
+          ! rmexx = -(Cholesky(rmexx))^-1
+          rmexx = -rmexx
+          CALL MatChol( nbndproj, rmexx )
+          CALL MatInv( 'L', nbndproj, rmexx )
+          cmexx = (One,Zero)*rmexx
+       ENDIF
+       DEALLOCATE( r_d, rmexx )
+    ELSE
+       CALL matcalc_k_gpu( 'exact', .TRUE., 0, current_k, ld, nbndproj, nbndproj, phi_d, x_d, c_d, exxe )
+       cmexx = c_d
+       IF ( update ) THEN
+          CALL start_clock( 'aceupdate' )
+          ! mexx = -(Cholesky(mexx))^-1
+          cmexx = -cmexx
+          CALL invchol_k( nbndproj, cmexx )
+       ENDIF
+    ENDIF
+    IF ( update ) THEN
+       ! |xi> = -One * Vx[phi]|phi> * mexx^T
+       c_d = cmexx
+       CALL ZTRMM( 'R', 'L', 'C', 'N', ld, nbndproj, (One,Zero), c_d, nbndproj, x_d, ld )
+       xitmp = x_d
+       CALL stop_clock( 'aceupdate' )
+    ENDIF
+    DEALLOCATE( phi_d, x_d, c_d, cmexx )
+#else
+    CALL errore( 'aceupdate_gpu', 'called in a build without CUDA', 1 )
+#endif
+    !
+  END SUBROUTINE aceupdate_gpu
   !
   !
   !-------------------------------------------------------------------------------------------
@@ -968,7 +1495,7 @@ MODULE exx
   !
   !
   !---------------------------------------------------------------------------------------------
-  SUBROUTINE aceinit_k( DoLoc, nnpw, nbnd, phi, xitmp, becpsi, exxe )
+  SUBROUTINE aceinit_k( DoLoc, nnpw, nbnd, phi, xitmp, becpsi, exxe, have_vx )
     !-----------------------------------------------------------------------------------------
     !! Compute xi(npw,nbndproj) for the ACE method.
     !
@@ -994,6 +1521,8 @@ MODULE exx
     !! <beta|psi>
     REAL(DP) :: exxe
     !! exx energy
+    LOGICAL, INTENT(IN) :: have_vx
+    !! if TRUE xitmp already holds Vx[phi]|phi> on input
     !
     ! ... local variables
     !
@@ -1009,15 +1538,16 @@ MODULE exx
     IF (nbndproj<=0)   CALL errore( 'aceinit_k', 'nbndproj le 0.', 1 )
     !
     ALLOCATE( mexx(nbndproj,nbndproj) )
-    xitmp = (Zero,Zero)
+    IF ( .NOT. have_vx ) xitmp = (Zero,Zero)
     mexx  = (Zero,Zero)
     IF ( DoLoc ) THEN
       CALL vexx_loc_k( nnpw, nbndproj, xitmp, mexx, exxe )
       CALL MatSymm_k( 'S', 'L', mexx, nbndproj )
     ELSE
       ! |xi> = Vx[phi]|phi>
-      CALL vexx( npwx, nnpw, nbndproj, phi, xitmp, becpsi )
+      IF ( .NOT. have_vx ) CALL vexx( npwx, nnpw, nbndproj, phi, xitmp, becpsi )
       ! mexx = <phi|Vx[phi]|phi>
+      IF ( .NOT. use_gpu ) &
       CALL matcalc_k( 'exact', .TRUE., 0, current_k, npwx*npol, nbndproj, nbndproj, &
                       phi, xitmp, mexx, exxe )
     ENDIF
@@ -1025,8 +1555,11 @@ MODULE exx
       WRITE( stdout,'(3(A,I3),A,I9,A,f12.6)') 'aceinit_k: nbnd=', nbnd, ' nbndproj=',nbndproj, &
                                               ' k=',current_k,' npw=',nnpw,' Ex(k)=',exxe
 #endif
+    IF ( use_gpu .AND. .NOT. DoLoc ) THEN
+      ! the matrix and the update with the device BLAS (the update skipped at zero weight, as below)
+      CALL aceupdate_gpu( npwx*npol, nnpw, phi, xitmp, exxe, wk(current_k)/=0._dp )
+    ELSE IF(wk(current_k)/=0._dp)THEN
     ! Skip k-points that have exactly zero weight
-    IF(wk(current_k)/=0._dp)THEN
       ! |xi> = -One * Vx[phi]|phi> * rmexx^T
       CALL aceupdate_k( nbndproj, nnpw, xitmp, mexx )
     ENDIF
@@ -1200,7 +1733,14 @@ MODULE exx
     ! do the ACE potential!
     ALLOCATE( cmexx_d(nbndproj,nbnd) )
     !
-    IF ( nks > 1 ) xi_d(:,:) = xi(:,:,current_k)
+    IF ( nks > 1 .AND. xi_d_k /= current_k ) THEN
+       IF ( ALLOCATED(xi_all_d) ) THEN
+          xi_d(:,:) = xi_all_d(:,:,current_k)
+       ELSE
+          xi_d(:,:) = xi(:,:,current_k)
+       ENDIF
+       xi_d_k = current_k
+    ENDIF
     !
     ! <xi|phi>
     CALL matcalc_k_gpu( '<xi|phi>', .FALSE., 0, current_k, npwx*npol, nbndproj, nbnd, &
