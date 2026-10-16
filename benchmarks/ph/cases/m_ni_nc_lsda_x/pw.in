@@ -1,0 +1,30 @@
+&CONTROL
+  calculation = 'scf'
+  prefix      = 'ni'
+  outdir      = './out'
+  verbosity   = 'low'
+/
+&SYSTEM
+  ibrav = 2
+  celldm(1) = 6.65
+  nat = 1
+  ntyp = 1
+  ecutwfc = 45.0
+  ecutrho = 180.0
+  occupations = 'smearing'
+  smearing = 'mv'
+  degauss = 0.03
+  nspin = 2
+  starting_magnetization(1) = 0.5
+/
+&ELECTRONS
+  conv_thr = 1.0d-12
+  mixing_beta = 0.3
+  electron_maxstep = 200
+/
+ATOMIC_SPECIES
+  Ni     58.69340  Ni.dojo-sr-04-pbe-std.upf
+ATOMIC_POSITIONS alat
+  Ni  0.00 0.00 0.00
+K_POINTS automatic
+  6 6 6 0 0 0

@@ -1,0 +1,10 @@
+NV64 Gamma phonons
+&INPUTPH
+  prefix = 'nv64'
+  outdir = './out'
+  fildyn = 'dyn'
+  tr2_ph = 1.0d-14
+  start_irr = 1
+  last_irr = 4
+/
+0.0000000000 0.0000000000 0.0000000000

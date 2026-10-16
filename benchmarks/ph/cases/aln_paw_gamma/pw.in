@@ -1,0 +1,31 @@
+&CONTROL
+  calculation = 'scf'
+  prefix      = 'aln'
+  outdir      = './out'
+  verbosity   = 'low'
+/
+&SYSTEM
+  ibrav = 4
+  celldm(1) = 5.880828
+  celldm(3) = 1.600900
+  nat = 4
+  ntyp = 2
+  ecutwfc = 80.0
+  ecutrho = 640.0
+  occupations = 'fixed'
+/
+&ELECTRONS
+  conv_thr = 1.0d-12
+  mixing_beta = 0.7
+  electron_maxstep = 200
+/
+ATOMIC_SPECIES
+  Al     26.98150  Al.pbesol-n-kjpaw_psl.1.0.0.UPF
+  N      14.00700  N.pbesol-n-kjpaw_psl.1.0.0.UPF
+ATOMIC_POSITIONS crystal
+  Al  0.333333333333 0.666666666667 0.000000000000
+  Al  0.666666666667 0.333333333333 0.500000000000
+  N   0.333333333333 0.666666666667 0.382100000000
+  N   0.666666666667 0.333333333333 0.882100000000
+K_POINTS automatic
+  9 9 5 0 0 0

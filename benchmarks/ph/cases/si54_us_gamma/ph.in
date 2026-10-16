@@ -1,0 +1,10 @@
+Si54 Gamma phonons
+&INPUTPH
+  prefix = 'si54'
+  outdir = './out'
+  fildyn = 'dyn'
+  tr2_ph = 1.0d-14
+  start_irr = 1
+  last_irr = 6
+/
+0.0000000000 0.0000000000 0.0000000000

@@ -1,0 +1,8 @@
+Al q
+&INPUTPH
+  prefix = 'al'
+  outdir = './out'
+  fildyn = 'dyn'
+  tr2_ph = 1.0d-14
+/
+0.3750000000 0.2500000000 0.1250000000

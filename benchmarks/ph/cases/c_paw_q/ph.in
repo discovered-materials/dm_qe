@@ -1,0 +1,8 @@
+diamond q phonons
+&INPUTPH
+  prefix = 'c'
+  outdir = './out'
+  fildyn = 'dyn'
+  tr2_ph = 1.0d-14
+/
+0.3000000000 0.2000000000 0.1000000000

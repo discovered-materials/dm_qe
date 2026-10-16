@@ -1,0 +1,8 @@
+AlN q phonons
+&INPUTPH
+  prefix = 'aln'
+  outdir = './out'
+  fildyn = 'dyn'
+  tr2_ph = 1.0d-14
+/
+0.2500000000 0.1000000000 0.2000000000

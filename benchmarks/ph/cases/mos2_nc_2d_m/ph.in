@@ -1,0 +1,8 @@
+MoS2 M phonons
+&INPUTPH
+  prefix = 'mos2'
+  outdir = './out'
+  fildyn = 'dyn'
+  tr2_ph = 1.0d-14
+/
+0.5000000000 0.2886751346 0.0000000000

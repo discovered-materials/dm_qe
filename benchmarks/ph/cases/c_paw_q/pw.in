@@ -1,0 +1,27 @@
+&CONTROL
+  calculation = 'scf'
+  prefix      = 'c'
+  outdir      = './out'
+  verbosity   = 'low'
+/
+&SYSTEM
+  ibrav = 2
+  celldm(1) = 6.740653
+  nat = 2
+  ntyp = 1
+  ecutwfc = 80.0
+  ecutrho = 650.0
+  occupations = 'fixed'
+/
+&ELECTRONS
+  conv_thr = 1.0d-12
+  mixing_beta = 0.7
+  electron_maxstep = 200
+/
+ATOMIC_SPECIES
+  C      12.01100  C.pbesol-n-kjpaw_psl.1.0.0.UPF
+ATOMIC_POSITIONS alat
+  C   0.00 0.00 0.00
+  C   0.25 0.25 0.25
+K_POINTS automatic
+  11 11 11 0 0 0
