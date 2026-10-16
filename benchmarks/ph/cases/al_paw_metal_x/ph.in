@@ -1,8 +1,0 @@
-Al X phonons
-&INPUTPH
-  prefix = 'al'
-  outdir = './out'
-  fildyn = 'dyn'
-  tr2_ph = 1.0d-14
-/
-1.0000000000 0.0000000000 0.0000000000

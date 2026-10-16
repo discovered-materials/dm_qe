@@ -1,9 +1,0 @@
-AlN Gamma
-&INPUTPH
-  prefix = 'aln'
-  outdir = './out'
-  fildyn = 'dyn'
-  tr2_ph = 1.0d-14
-  epsil = .true.
-/
-0.0000000000 0.0000000000 0.0000000000

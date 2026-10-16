@@ -1,0 +1,9 @@
+# produced locally
+/tools/
+/build/
+/wt/
+/example/si/pseudo/
+/example/si/out/
+/example/si/*.out
+/example/si/dyn*
+/example/si/_ph0/
