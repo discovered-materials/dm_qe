@@ -709,6 +709,7 @@ CONTAINS
           ENDDO
        ENDIF
        istat = cufftExecZ2Z( plan(ip), psig_d, psic_d, CUFFT_INVERSE )
+       IF ( istat /= 0 ) CALL errore( 'dvbare_dev', 'cufftExecZ2Z failed', ABS(istat) )
        !$cuf kernel do(2)
        DO j = 1, nbl
           DO ig = 1, npw
@@ -722,6 +723,7 @@ CONTAINS
           ENDDO
        ENDDO
        istat = cufftExecZ2Z( plan(ip), psic_d, psic_d, CUFFT_FORWARD )
+       IF ( istat /= 0 ) CALL errore( 'dvbare_dev', 'cufftExecZ2Z failed', ABS(istat) )
        !$cuf kernel do(2)
        DO j = 1, nbl
           DO ig = 1, npwxl
