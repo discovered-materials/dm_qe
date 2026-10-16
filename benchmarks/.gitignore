@@ -1,0 +1,6 @@
+# fetched, built or produced locally
+/ph/pseudo/
+/tools/
+/wt/
+/build/
+/runs/
