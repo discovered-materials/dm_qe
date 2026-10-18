@@ -20,8 +20,6 @@ URL=${2:-https://github.com/discovered-materials/dm_qe}
 LABELS=${RUNNER_LABELS:-self-hosted,gpu,dm-qe}; IDLE=${IDLE_MINUTES:-20}
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
 HERE=$(cd "$(dirname "$0")" && pwd)
-export DEBIAN_FRONTEND=noninteractive
-apt-get install -y -qq jq curl > /dev/null
 id github-runner > /dev/null 2>&1 || useradd -m -s /bin/bash github-runner
 install -d -o github-runner -g github-runner /opt/qe-ci /opt/qe-ci/build
 for c in "$HERE"/../../gpu-quickstart/tools/cmake-*-linux-x86_64/bin/cmake /opt/qe-ci/gpu-quickstart/tools/cmake-*-linux-x86_64/bin/cmake; do
@@ -29,7 +27,7 @@ for c in "$HERE"/../../gpu-quickstart/tools/cmake-*-linux-x86_64/bin/cmake /opt/
 done
 RUN=/opt/actions-runner
 if [ ! -x "$RUN/config.sh" ]; then
-  V=$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | sed 's/^v//')
+  V=$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"].lstrip("v"))')
   echo "== actions runner $V"
   install -d -o github-runner -g github-runner "$RUN"
   curl -fsSL "https://github.com/actions/runner/releases/download/v$V/actions-runner-linux-x64-$V.tar.gz" | sudo -u github-runner tar -xzf - -C "$RUN"

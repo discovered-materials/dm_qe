@@ -11,6 +11,11 @@ HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/.." && pwd)
 NVHPC_V=25.9; NVHPC=/opt/nvidia/hpc_sdk/Linux_x86_64/$NVHPC_V; CMAKE_V=3.31.6
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo $0" >&2; exit 1; }
 export DEBIAN_FRONTEND=noninteractive
+# a fresh cloud image runs its own apt jobs for a while after the first boot: wait for the locks
+for _ in $(seq 1 90); do
+  fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock > /dev/null 2>&1 || break
+  echo "   waiting for another apt process"; sleep 10
+done
 echo "== packages"
 apt-get update -qq
 apt-get install -y -qq build-essential gfortran libopenmpi-dev openmpi-bin libfftw3-dev libopenblas-dev \
