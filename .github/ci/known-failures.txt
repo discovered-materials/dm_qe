@@ -1,3 +1,9 @@
 # Tests of the QE test-suite that fail on stock develop before any change of ours, as "<dir>/<input>".
 # A failing test that is not here fails the GPU tests job; a listed test that starts passing is
 # reported so it can be removed. Measured on the CI runner (NVIDIA A100 40 GB, NVHPC 25.9), see .github/ci/README.md.
+#
+# stock develop (6e773a63), GPU build, NVHPC 25.9, A100: 86 of 89 ph_all pass, 245 of 245 pw_all pass.
+# The same three fail on an H100 and in the stock CPU build of upstream; none touches the GPU work.
+ph_metal/al.elph.in          # electron-phonon lambda outside the reference tolerance
+ph_multipole/scf.in
+ph_raman/h2o.dynmat.in
