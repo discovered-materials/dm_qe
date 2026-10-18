@@ -56,11 +56,11 @@ for c in $CATS; do ( cd "$T" && ./check_pseudo.sh "${c%%_*}_" >> "$LOGS/prolog.l
 # categories run at the same time, each on its own GPU when the machine has several (their
 # test directories are disjoint; the jobs are one rank with one thread): the wall time is that
 # of the longest category. Two categories on one GPU slow each other down by about half.
-# CI_SERIAL=1 runs them one after the other; CI_TIMEOUT (seconds, 7200) caps one category.
+# CI_SERIAL=1 runs them one after the other; CI_TIMEOUT (seconds, 9000) caps one category.
 rc_all=0; t0=$(date +%s)
 run_cat() {   # <category of jobconfig, or a test directory: testcode takes either as --category> <gpu>
   local c=$1 dev=$2 t1; t1=$(date +%s)
-  ( export CUDA_VISIBLE_DEVICES=$dev; cd "$T" && timeout "${CI_TIMEOUT:-7200}" python3 "$T/testcode/bin/testcode.py" --verbose --category="$c" > "$LOGS/$c.log" 2>&1 )
+  ( export CUDA_VISIBLE_DEVICES=$dev; cd "$T" && timeout "${CI_TIMEOUT:-9000}" python3 "$T/testcode/bin/testcode.py" --verbose --category="$c" > "$LOGS/$c.log" 2>&1 )
   echo "== $c (GPU $dev): $(( $(date +%s) - t1 )) s, $(grep -E 'All done' "$LOGS/$c.log" | tail -1)"
 }
 NGPU=1; [ "$FLAVOR" = gpu ] && NGPU=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU'); [ "${NGPU:-0}" -ge 1 ] || NGPU=1

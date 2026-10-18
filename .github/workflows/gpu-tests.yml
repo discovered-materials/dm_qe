@@ -79,25 +79,40 @@ jobs:
           VM: ${{ vars.GPU_RUNNER_VM || 'dmqe-ci-a100' }}
           ZONE: ${{ vars.GPU_RUNNER_ZONE || 'us-central1-c' }}
           PROJECT: ${{ vars.GCP_PROJECT }}
+          # GPU capacity comes and goes: the preferred machine type (two A100s, one test-suite category
+          # per GPU, about an hour) first, the fallback (one A100, about two hours) when the zone has
+          # no such machine free, retried for about 25 minutes
+          PREFERRED: ${{ vars.GPU_RUNNER_MACHINE_TYPE || 'a2-highgpu-2g' }}
+          FALLBACK: ${{ vars.GPU_RUNNER_FALLBACK_TYPE || 'a2-highgpu-1g' }}
         run: |
           [ -n "$PROJECT" ] && gcloud config set project "$PROJECT"
-          st=$(gcloud compute instances describe "$VM" --zone "$ZONE" --format='value(status)')
-          echo "$VM is $st"
-          case "$st" in
-            RUNNING) ;;
-            TERMINATED|STOPPED|SUSPENDED) gcloud compute instances start "$VM" --zone "$ZONE" ;;
-            STOPPING|SUSPENDING) sleep 60; gcloud compute instances start "$VM" --zone "$ZONE" ;;
-            *) echo "unexpected state $st"; exit 1 ;;
-          esac
-          for i in $(seq 1 30); do [ "$(gcloud compute instances describe "$VM" --zone "$ZONE" --format='value(status)')" = RUNNING ] && break; sleep 10; done
-          gcloud compute instances describe "$VM" --zone "$ZONE" --format='value(status)'
+          state() { gcloud compute instances describe "$VM" --zone "$ZONE" --format='value(status)'; }
+          mtype() { gcloud compute instances describe "$VM" --zone "$ZONE" --format='value(machineType.basename())'; }
+          echo "$VM is $(state), $(mtype)"
+          case "$(state)" in STOPPING|SUSPENDING|STAGING|PROVISIONING|REPAIRING) sleep 90 ;; esac
+          for attempt in $(seq 1 10); do
+            for mt in "$PREFERRED" "$FALLBACK"; do
+              [ "$(state)" = RUNNING ] && break 2
+              if [ "$(mtype)" != "$mt" ]; then
+                gcloud compute instances set-machine-type "$VM" --zone "$ZONE" --machine-type "$mt" --quiet || true
+              fi
+              if gcloud compute instances start "$VM" --zone "$ZONE" --quiet 2> start.err; then
+                echo "started $VM as $mt"; break 2
+              fi
+              grep -q -E "RESOURCE_POOL_EXHAUSTED|STOCKOUT|not enough resources" start.err \
+                && echo "no capacity for $mt in $ZONE (attempt $attempt)" || { cat start.err; exit 1; }
+            done
+            sleep 120
+          done
+          [ "$(state)" = RUNNING ] || { echo "could not start $VM: no GPU capacity in $ZONE for $PREFERRED or $FALLBACK; re-run the workflow later"; exit 1; }
+          echo "$VM is $(state), $(mtype)"
 
   gpu-tests:
     name: GPU build and test-suite
     needs: start-runner
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, gpu, dm-qe]
-    timeout-minutes: 170
+    timeout-minutes: 200
     steps:
       - uses: actions/checkout@v4
         with: { submodules: recursive }
