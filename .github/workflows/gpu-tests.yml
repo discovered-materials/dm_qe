@@ -1,0 +1,108 @@
+# GPU tests: the gate for pull requests into develop.
+#
+#   cpu-build    GitHub-hosted: the tree must build without CUDA (gfortran, Open MPI, FFTW, OpenBLAS)
+#                and pass two quick test directories.
+#   start-runner GitHub-hosted: starts the GPU runner VM in our Google Cloud project (a self-hosted
+#                runner labelled gpu + dm-qe; it shuts itself down when idle). Needs the repository
+#                secret GCP_SA_KEY and the variables GPU_RUNNER_VM / GPU_RUNNER_ZONE / GCP_PROJECT;
+#                without them the job is skipped and gpu-tests waits for whatever runner is online.
+#   gpu-tests    self-hosted GPU runner: GPU build with the published flags, then the QE test-suite
+#                categories in CI_CATEGORIES (pw_all ph_all, 60-90 minutes), compared with
+#                .github/ci/known-failures.txt: a test that fails and is not on the list fails the job.
+#
+# .github/ci/README.md: the runner, the secrets, the known-failure list, branch protection.
+name: GPU tests
+on:
+  pull_request:
+    branches: [develop]
+  push:
+    branches: [develop]
+  workflow_dispatch:
+    inputs:
+      categories:
+        description: test-suite categories (space separated)
+        default: pw_all ph_all
+  schedule:
+    - cron: '23 5 * * 1'     # weekly, so the self-hosted runner never goes 14 days without connecting
+concurrency:
+  group: gpu-tests-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+env:
+  CI_CATEGORIES: ${{ github.event.inputs.categories || 'pw_all ph_all' }}
+jobs:
+  cpu-build:
+    name: CPU-only build and quick tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - name: Packages
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential gfortran libopenmpi-dev openmpi-bin \
+            libfftw3-dev libopenblas-dev cmake python3 > /dev/null
+      - name: Build pw.x and ph.x (gfortran)
+        run: BUILD_JOBS=4 gpu-quickstart/scripts/build.sh . build/cpu cpu-gnu pw ph
+      - name: Quick tests (pw_scf, ph_base)
+        env:
+          OMPI_ALLOW_RUN_AS_ROOT: 1
+          OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: 1
+        run: |
+          CI_BUILD_DIR=$PWD/build/cpu CI_FLAVOR=cpu CI_CATEGORIES="pw_scf ph_base" CI_SKIP_BUILD=1 bash .github/ci/run_tests.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: cpu-test-logs, path: ci-logs/, if-no-files-found: ignore }
+
+  start-runner:
+    name: Start the GPU runner VM
+    runs-on: ubuntu-latest
+    # self-hosted runners and secrets are for branches of this repository, not for forks
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    outputs:
+      started: ${{ steps.start.outputs.started }}
+    steps:
+      - id: start
+        env:
+          HAVE_KEY: ${{ secrets.GCP_SA_KEY != '' }}
+        run: |
+          if [ "$HAVE_KEY" != true ]; then echo "no GCP_SA_KEY: not starting a VM, waiting for an online runner"; echo "started=no" >> "$GITHUB_OUTPUT"; exit 0; fi
+          echo "started=yes" >> "$GITHUB_OUTPUT"
+      - uses: google-github-actions/auth@v2
+        if: steps.start.outputs.started == 'yes'
+        with: { credentials_json: '${{ secrets.GCP_SA_KEY }}' }
+      - uses: google-github-actions/setup-gcloud@v2
+        if: steps.start.outputs.started == 'yes'
+      - name: gcloud compute instances start
+        if: steps.start.outputs.started == 'yes'
+        env:
+          VM: ${{ vars.GPU_RUNNER_VM || 'dmqe-ci-gpu' }}
+          ZONE: ${{ vars.GPU_RUNNER_ZONE || 'us-central1-a' }}
+          PROJECT: ${{ vars.GCP_PROJECT }}
+        run: |
+          [ -n "$PROJECT" ] && gcloud config set project "$PROJECT"
+          st=$(gcloud compute instances describe "$VM" --zone "$ZONE" --format='value(status)')
+          echo "$VM is $st"
+          case "$st" in
+            RUNNING) ;;
+            TERMINATED|STOPPED|SUSPENDED) gcloud compute instances start "$VM" --zone "$ZONE" ;;
+            STOPPING|SUSPENDING) sleep 60; gcloud compute instances start "$VM" --zone "$ZONE" ;;
+            *) echo "unexpected state $st"; exit 1 ;;
+          esac
+          for i in $(seq 1 30); do [ "$(gcloud compute instances describe "$VM" --zone "$ZONE" --format='value(status)')" = RUNNING ] && break; sleep 10; done
+          gcloud compute instances describe "$VM" --zone "$ZONE" --format='value(status)'
+
+  gpu-tests:
+    name: GPU build and test-suite
+    needs: start-runner
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, gpu, dm-qe]
+    timeout-minutes: 170
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - name: GPU build and test-suite
+        run: bash .github/ci/run_tests.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: gpu-test-logs, path: ci-logs/, if-no-files-found: ignore }
