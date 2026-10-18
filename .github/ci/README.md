@@ -7,7 +7,7 @@ it, weekly, and by hand):
 |---|---|---|---|
 | `cpu-build` | GitHub-hosted | build without CUDA (gfortran, Open MPI, FFTW, OpenBLAS), test directories `pw_scf` and `ph_base` | ~30 min |
 | `start-runner` | GitHub-hosted | starts the GPU runner VM in our Google Cloud project | 1 min |
-| `gpu-tests` | self-hosted GPU runner | GPU build with the published flags, then the test-suite categories `pw_all` and `ph_all`, one per GPU at the same time, compared with `known-failures.txt` | ~1 h |
+| `gpu-tests` | self-hosted GPU runner | GPU build with the published flags, then the test-suite categories `pw_all` and `ph_all`, one per GPU at the same time, compared with `known-failures.txt` | ~1 h (two A100s), ~2 h (one) |
 
 A test that fails and is not in `known-failures.txt` fails `gpu-tests`; so does a category whose
 run ends without testcode's summary. A listed test that passes is reported in the job summary so
@@ -39,9 +39,13 @@ sudo .github/ci/runner-setup.sh <registration-token>    # Settings -> Actions ->
 ```
 
 The workflow finds the machine through three repository settings: the secret `GCP_SA_KEY` (the
-JSON key of a service account allowed to start the instance) and the variables `GCP_PROJECT`,
-`GPU_RUNNER_VM` (default `dmqe-ci-a100`) and `GPU_RUNNER_ZONE` (default `us-central1-c`). Without
-the secret the start job does nothing and `gpu-tests` waits for whatever runner is online.
+JSON key of a service account allowed to start the instance) and the variables `GCP_PROJECT`, `GPU_RUNNER_VM` (default `dmqe-ci-a100`), `GPU_RUNNER_ZONE` (default
+`us-central1-c`), `GPU_RUNNER_MACHINE_TYPE` (default `a2-highgpu-2g`) and `GPU_RUNNER_FALLBACK_TYPE`
+(default `a2-highgpu-1g`). Without the secret the start job does nothing and `gpu-tests` waits for
+whatever runner is online. GPU capacity in a zone comes and goes, so the start job retries for about
+25 minutes and, when no two-GPU machine is free, resizes the stopped VM to the one-GPU type and runs
+there (the job then takes about two hours instead of one; the next run tries the two-GPU type again).
+When neither is available the job fails with "no GPU capacity": re-run it later.
 
 The GPU build is for the runner's GPU (`run_tests.sh` reads the compute capability: `sm_80` on an
 A100, `sm_90` on an H100, `sm_89` on an L4); results are compared with the test-suite's references with its
