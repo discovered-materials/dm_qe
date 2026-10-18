@@ -7,7 +7,7 @@
 #                secret GCP_SA_KEY and the variables GPU_RUNNER_VM / GPU_RUNNER_ZONE / GCP_PROJECT;
 #                without them the job is skipped and gpu-tests waits for whatever runner is online.
 #   gpu-tests    self-hosted GPU runner: GPU build with the published flags, then the QE test-suite
-#                categories in CI_CATEGORIES (pw_all ph_all, about an hour on an A100), compared with
+#                categories in CI_CATEGORIES (pw_all ph_all, one per GPU, about an hour on two A100s), compared with
 #                .github/ci/known-failures.txt: a test that fails and is not on the list fails the job.
 #
 # .github/ci/README.md: the runner, the secrets, the known-failure list, branch protection.

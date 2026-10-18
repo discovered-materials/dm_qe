@@ -7,7 +7,7 @@ it, weekly, and by hand):
 |---|---|---|---|
 | `cpu-build` | GitHub-hosted | build without CUDA (gfortran, Open MPI, FFTW, OpenBLAS), test directories `pw_scf` and `ph_base` | ~30 min |
 | `start-runner` | GitHub-hosted | starts the GPU runner VM in our Google Cloud project | 1 min |
-| `gpu-tests` | self-hosted GPU runner | GPU build with the published flags, then the test-suite categories `pw_all` and `ph_all` on the GPU (at the same time), compared with `known-failures.txt` | ~1 h |
+| `gpu-tests` | self-hosted GPU runner | GPU build with the published flags, then the test-suite categories `pw_all` and `ph_all`, one per GPU at the same time, compared with `known-failures.txt` | ~1 h |
 
 A test that fails and is not in `known-failures.txt` fails `gpu-tests`; so does a category whose
 run ends without testcode's summary. A listed test that passes is reported in the job summary so
@@ -21,16 +21,17 @@ Branch protection on `develop` should require the checks `CPU-only build and qui
 
 A self-hosted runner with the labels `gpu` and `dm-qe`, on a machine with an NVIDIA GPU, the
 toolchain of `gpu-quickstart/cloud/setup_node.sh` and the runner service of
-`.github/ci/runner-setup.sh`. Ours is a Google Compute Engine `a2-highgpu-1g` (12 vCPUs, one A100
+`.github/ci/runner-setup.sh`. Ours is a Google Compute Engine `a2-highgpu-2g` (24 vCPUs, two A100
 40 GB, `dmqe-ci-a100` in `us-central1-c`), off between runs: the workflow starts it, the runner's
 idle watchdog powers it off 20 minutes after the last job (a stopped VM bills only its disk). The
 weekly schedule keeps the runner registered (GitHub removes a runner that has not connected for
 14 days). The GPU has to be a data-centre part with real double-precision throughput: on an L4
 one noncollinear SCF of `ph_all` alone took 30 minutes (seconds on an A100 or H100), which puts
-the suite far outside the hour.
+the suite far outside the hour. Two GPUs, one per category: on a single A100 the two
+categories slow each other down and the job takes over 1.5 h.
 
 To make one, on an Ubuntu 22.04 machine with the NVIDIA driver (the Deep Learning VM image of
-`gpu-quickstart/cloud/create_vm.sh` with `MACHINE_TYPE` set to an `a2` machine, or any other):
+`gpu-quickstart/cloud/create_vm.sh` with `MACHINE_TYPE=a2-highgpu-2g`, or any other):
 
 ```bash
 sudo gpu-quickstart/cloud/setup_node.sh                 # NVHPC 25.9, the gfortran set, CMake

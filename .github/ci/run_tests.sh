@@ -49,21 +49,25 @@ if [ "$FLAVOR" = gpu ]; then
   source gpu-quickstart/scripts/env_nvhpc.sh
   W=$LOGS/mpiwrap; mkdir -p "$W"
   printf '#!/bin/bash\nargs=(); for v in "${!QE_@}"; do args+=(-x "$v"); done\nexec %s/comm_libs/mpi/bin/mpirun "${args[@]}" "$@"\n' "$NVHPC_ROOT" > "$W/mpirun"
-  chmod 755 "$W/mpirun"; export PATH=$W:$PATH; export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+  chmod 755 "$W/mpirun"; export PATH=$W:$PATH
 fi
 ( cd "$T" && make prolog > "$LOGS/prolog.log" 2>&1 ) || { cat "$LOGS/prolog.log"; echo "test-suite prolog failed"; exit 1; }
 for c in $CATS; do ( cd "$T" && ./check_pseudo.sh "${c%%_*}_" >> "$LOGS/prolog.log" 2>&1 ); done
-# categories run at the same time (their test directories are disjoint; the jobs are one rank
-# with one thread, and a single GPU holds all of them): the wall time is that of the longest.
-# CI_SERIAL=1 runs them one after the other.
+# categories run at the same time, each on its own GPU when the machine has several (their
+# test directories are disjoint; the jobs are one rank with one thread): the wall time is that
+# of the longest category. Two categories on one GPU slow each other down by about half.
+# CI_SERIAL=1 runs them one after the other; CI_TIMEOUT (seconds, 7200) caps one category.
 rc_all=0; t0=$(date +%s)
-run_cat() {   # <category of jobconfig, or a test directory: testcode takes either as --category>
-  local c=$1 t1; t1=$(date +%s)
-  ( cd "$T" && timeout "${CI_TIMEOUT:-5400}" python3 "$T/testcode/bin/testcode.py" --verbose --category="$c" > "$LOGS/$c.log" 2>&1 )
-  echo "== $c: $(( $(date +%s) - t1 )) s, $(grep -E 'All done' "$LOGS/$c.log" | tail -1)"
+run_cat() {   # <category of jobconfig, or a test directory: testcode takes either as --category> <gpu>
+  local c=$1 dev=$2 t1; t1=$(date +%s)
+  ( export CUDA_VISIBLE_DEVICES=$dev; cd "$T" && timeout "${CI_TIMEOUT:-7200}" python3 "$T/testcode/bin/testcode.py" --verbose --category="$c" > "$LOGS/$c.log" 2>&1 )
+  echo "== $c (GPU $dev): $(( $(date +%s) - t1 )) s, $(grep -E 'All done' "$LOGS/$c.log" | tail -1)"
 }
+NGPU=1; [ "$FLAVOR" = gpu ] && NGPU=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU'); [ "${NGPU:-0}" -ge 1 ] || NGPU=1
+i=0
 for c in $CATS; do
-  if [ "${CI_SERIAL:-0}" = 1 ]; then run_cat "$c"; else run_cat "$c" & fi
+  dev=$(( i % NGPU )); i=$(( i + 1 ))
+  if [ "${CI_SERIAL:-0}" = 1 ]; then run_cat "$c" "$dev"; else run_cat "$c" "$dev" & fi
 done
 wait
 for c in $CATS; do

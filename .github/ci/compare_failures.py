@@ -3,14 +3,14 @@
 
   compare_failures.py --known known-failures.txt [--summary out.md] <testcode log> ...
 
-A test is "<directory>/<input>" as testcode names it ("ph_metal - al.elph.in (arg(s): 2): **FAILED**."
-becomes ph_metal/al.elph.in). Exit 1 when a test fails that is not on the list, or when a log has no
+A test is "<directory>/<input>" as testcode names it ("ph_metal - al.elph.in (arg(s): 2): **FAILED**." or
+"pw_atom - atom.in: Passed." become ph_metal/al.elph.in and pw_atom/atom.in). Exit 1 when a test fails that is not on the list, or when a log has no
 "All done" summary (testcode did not finish). Known failures that now pass are reported, not an error:
 remove them from the list.
 """
 import argparse, re, sys
 
-LINE = re.compile(r"^(\S+) - (\S+) \(arg\(s\): \d+\): (Passed|\*\*FAILED\*\*|Skipped|WARNING)", re.M)
+LINE = re.compile(r"^(\S+) - (\S+?)(?: \(arg\(s\): \d+\))?: (Passed|\*\*FAILED\*\*|Skipped|WARNING)", re.M)
 DONE = re.compile(r"^All done\..*$", re.M)
 
 def known_set(path):
