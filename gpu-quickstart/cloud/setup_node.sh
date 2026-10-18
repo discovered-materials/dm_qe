@@ -31,6 +31,7 @@ if [ ! -x "$ROOT/tools/cmake-$CMAKE_V-linux-x86_64/bin/cmake" ]; then
   curl -fsSL "https://github.com/Kitware/CMake/releases/download/v$CMAKE_V/cmake-$CMAKE_V-linux-x86_64.tar.gz" | tar -xzf - -C "$ROOT/tools"
   chown -R "$OWNER" "$ROOT/tools/cmake-$CMAKE_V-linux-x86_64"
 fi
+ln -sfn "$ROOT/tools/cmake-$CMAKE_V-linux-x86_64/bin/cmake" /usr/local/bin/cmake    # on the PATH for every checkout on this machine
 echo "== $(. /etc/os-release; echo "$PRETTY_NAME") $(uname -r), $(nproc) vCPUs, $(free -g | awk '/Mem/{print $2}') GB, /dev/shm $(df -h /dev/shm | awk 'NR==2{print $2}')"
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | sort | uniq -c | sed 's/^ */   /' || echo "   no nvidia-smi: install the NVIDIA driver first"
 echo "   nvfortran $($NVHPC/compilers/bin/nvfortran --version | sed -n 2p | awk '{print $2}'), CUDA $(ls $NVHPC/cuda | grep -E '^[0-9]' | tr '\n' ' ')"

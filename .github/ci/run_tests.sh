@@ -14,7 +14,7 @@
 #   QE_GPU_ARCHS   GPU architecture of the build (default: read from nvidia-smi, e.g. sm_89 for an L4)
 # Logs and the summary go to ci-logs/; the exit code is that of compare_failures.py (0: no new failure).
 set -uo pipefail
-ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel); cd "$ROOT"
+ROOT=$(cd "$(dirname "$0")/../.." && pwd); cd "$ROOT"     # the checkout (a plain tree works too)
 FLAVOR=${CI_FLAVOR:-gpu}; CATS=${CI_CATEGORIES:-pw_all ph_all}; KNOWN=${CI_KNOWN:-$ROOT/.github/ci/known-failures.txt}
 LOGS=$ROOT/ci-logs; rm -rf "$LOGS"; mkdir -p "$LOGS"
 if [ -z "${CI_BUILD_DIR:-}" ]; then

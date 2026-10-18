@@ -7,7 +7,7 @@
 #                secret GCP_SA_KEY and the variables GPU_RUNNER_VM / GPU_RUNNER_ZONE / GCP_PROJECT;
 #                without them the job is skipped and gpu-tests waits for whatever runner is online.
 #   gpu-tests    self-hosted GPU runner: GPU build with the published flags, then the QE test-suite
-#                categories in CI_CATEGORIES (pw_all ph_all, 60-90 minutes), compared with
+#                categories in CI_CATEGORIES (pw_all ph_all, about an hour on an A100), compared with
 #                .github/ci/known-failures.txt: a test that fails and is not on the list fails the job.
 #
 # .github/ci/README.md: the runner, the secrets, the known-failure list, branch protection.
@@ -76,8 +76,8 @@ jobs:
       - name: gcloud compute instances start
         if: steps.start.outputs.started == 'yes'
         env:
-          VM: ${{ vars.GPU_RUNNER_VM || 'dmqe-ci-gpu' }}
-          ZONE: ${{ vars.GPU_RUNNER_ZONE || 'us-central1-a' }}
+          VM: ${{ vars.GPU_RUNNER_VM || 'dmqe-ci-a100' }}
+          ZONE: ${{ vars.GPU_RUNNER_ZONE || 'us-central1-c' }}
           PROJECT: ${{ vars.GCP_PROJECT }}
         run: |
           [ -n "$PROJECT" ] && gcloud config set project "$PROJECT"

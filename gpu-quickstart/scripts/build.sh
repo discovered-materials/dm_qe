@@ -30,7 +30,8 @@ case "$FLAVOR" in
     ;;
   *) echo "unknown flavor $FLAVOR (gpu | cpu-gnu)" >&2; exit 2;;
 esac
-if [ ! -f "$BLD/CMakeCache.txt" ]; then
+# configure when the build directory is new or an earlier configure did not get to the build files
+if [ ! -f "$BLD/CMakeCache.txt" ] || { [ ! -f "$BLD/Makefile" ] && [ ! -f "$BLD/build.ninja" ]; }; then
   cmake -S "$SRC" -B "$BLD" -DCMAKE_BUILD_TYPE=Release -DQE_ENABLE_TEST=OFF "${CFG[@]}"
 fi
 cmake --build "$BLD" -j "${BUILD_JOBS:-$(nproc)}" --target "${TARGETS[@]}"
