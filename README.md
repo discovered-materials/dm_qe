@@ -1,3 +1,12 @@
+<img src="logo-discovered-materials.png" alt="Discovered Materials" width="480">
+
+This is Discovered Materials' fork of Quantum ESPRESSO with CUDA-specific accelerations to the
+hybrid functionals (HSE06 and PBE0) and to `ph.x`. [`gpu-quickstart/`](gpu-quickstart/README.md)
+is how to build and run it on GPUs, with a first calculation to compare against. Everything below
+is upstream Quantum ESPRESSO's README.
+
+---
+
 ![q-e-logo](logo.jpg)
 
 This is the distribution of the Quantum ESPRESSO suite of codes (ESPRESSO:
