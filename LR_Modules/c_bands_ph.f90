@@ -36,6 +36,7 @@ SUBROUTINE c_bands_nscf_ph( )
   USE noncollin_module,     ONLY : noncolin, npol, domag
   USE io_files,             ONLY : tmp_dir, prefix
   USE uspp_init,            ONLY : init_us_2
+  USE nscf_dev,             ONLY : c_bands_nscf_dev
   !
   IMPLICIT NONE
   !
@@ -47,6 +48,12 @@ SUBROUTINE c_bands_nscf_ph( )
   LOGICAL :: exst, exst_mem
   !
   REAL(DP), EXTERNAL :: get_clock
+  LOGICAL :: dev_done
+  !
+  ! ... GPU: Davidson iterations of all k-points advanced together
+  !
+  CALL c_bands_nscf_dev( dev_done )
+  IF ( dev_done ) RETURN
   !
   CALL start_clock( 'c_bands' )
   !

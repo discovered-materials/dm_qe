@@ -75,6 +75,7 @@ set(sources
     ccgsolve_all.f90
     ch_psi_all_complex.f90
     dfpt_dev.f90
+    nscf_dev.f90
     dfpt_dev_grid.f90
     usaug_dev.f90
     response_kernels.f90
