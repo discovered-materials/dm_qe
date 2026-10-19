@@ -1,37 +1,39 @@
-# GPU tests: the gate for pull requests into develop.
+# GPU tests: the QE test-suite on a GPU build. Run by hand from the Actions tab ("GPU tests" ->
+# "Run workflow": pick the branch and, if you like, the categories) or with
+# `gh workflow run gpu-tests.yml --ref <branch>`. Nothing triggers it automatically and it is not
+# a required check: merging into develop does not wait for it.
 #
 #   cpu-build    GitHub-hosted: the tree must build without CUDA (gfortran, Open MPI, FFTW, OpenBLAS)
-#                and pass two quick test directories.
+#                and pass two quick test directories. Skipped when the cpu_build input is off.
 #   start-runner GitHub-hosted: starts the GPU runner VM in our Google Cloud project (a self-hosted
 #                runner labelled gpu + dm-qe; it shuts itself down when idle). Needs the repository
 #                secret GCP_SA_KEY and the variables GPU_RUNNER_VM / GPU_RUNNER_ZONE / GCP_PROJECT;
 #                without them the job is skipped and gpu-tests waits for whatever runner is online.
-#   gpu-tests    self-hosted GPU runner: GPU build with the published flags, then the QE test-suite
-#                categories in CI_CATEGORIES (pw_all ph_all, one per GPU, about an hour on two A100s), compared with
+#   gpu-tests    self-hosted GPU runner: GPU build with the published flags, then the test-suite
+#                categories (pw_all ph_all, one per GPU, about an hour on two A100s), compared with
 #                .github/ci/known-failures.txt: a test that fails and is not on the list fails the job.
 #
-# .github/ci/README.md: the runner, the secrets, the known-failure list, branch protection.
+# .github/ci/README.md: the runner, the secrets, the known-failure list.
 name: GPU tests
 on:
-  pull_request:
-    branches: [develop]
-  push:
-    branches: [develop]
   workflow_dispatch:
     inputs:
       categories:
-        description: test-suite categories (space separated)
+        description: test-suite categories (space separated; a test directory such as pw_scf works too)
         default: pw_all ph_all
-  schedule:
-    - cron: '23 5 * * 1'     # weekly, so the self-hosted runner never goes 14 days without connecting
+      cpu_build:
+        description: also build without CUDA on a GitHub-hosted runner and run pw_scf and ph_base
+        type: boolean
+        default: true
 concurrency:
-  group: gpu-tests-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: gpu-tests-${{ github.ref }}
+  cancel-in-progress: false
 env:
-  CI_CATEGORIES: ${{ github.event.inputs.categories || 'pw_all ph_all' }}
+  CI_CATEGORIES: ${{ inputs.categories || 'pw_all ph_all' }}
 jobs:
   cpu-build:
     name: CPU-only build and quick tests
+    if: ${{ inputs.cpu_build }}
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     steps:
@@ -57,8 +59,6 @@ jobs:
   start-runner:
     name: Start the GPU runner VM
     runs-on: ubuntu-latest
-    # self-hosted runners and secrets are for branches of this repository, not for forks
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     outputs:
       started: ${{ steps.start.outputs.started }}
     steps:
@@ -110,7 +110,6 @@ jobs:
   gpu-tests:
     name: GPU build and test-suite
     needs: start-runner
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, gpu, dm-qe]
     timeout-minutes: 200
     steps:

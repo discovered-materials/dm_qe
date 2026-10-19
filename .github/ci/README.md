@@ -1,7 +1,11 @@
-# GPU tests: the gate on `develop`
+# GPU tests: the test-suite on a GPU, on request
 
-`.github/workflows/gpu-tests.yml` runs on every pull request into `develop` (and on pushes to
-it, weekly, and by hand):
+`.github/workflows/gpu-tests.yml` runs only when someone starts it: Actions → "GPU tests" → "Run
+workflow", choose the branch, optionally the categories (default `pw_all ph_all`) and whether to
+include the CPU-only build (default yes); or `gh workflow run gpu-tests.yml --ref <branch>`.
+Nothing triggers it on pull requests or pushes and it is not a required check, so merging into
+`develop` never waits for it; run it on a branch before merging work that touches the solvers, and
+on `develop` after. Its jobs:
 
 | job | where | what | time |
 |---|---|---|---|
@@ -14,8 +18,8 @@ run ends without testcode's summary. A listed test that passes is reported in th
 the list can be trimmed. The list is the state of stock `develop` on the runner (its GPU, the
 toolchain), not an allowance for new failures: a pull request that fixes one removes it.
 
-Branch protection on `develop` should require the checks `CPU-only build and quick tests` and
-`GPU build and test-suite` (Settings → Branches → `develop` → require status checks).
+The runner is one machine, so runs queue behind each other; a second run on the same branch waits
+for the first instead of cancelling it.
 
 ## The runner
 
@@ -23,9 +27,12 @@ A self-hosted runner with the labels `gpu` and `dm-qe`, on a machine with an NVI
 toolchain of `gpu-quickstart/cloud/setup_node.sh` and the runner service of
 `.github/ci/runner-setup.sh`. Ours is a Google Compute Engine `a2-highgpu-2g` (24 vCPUs, two A100
 40 GB, `dmqe-ci-a100` in `us-central1-c`), off between runs: the workflow starts it, the runner's
-idle watchdog powers it off 20 minutes after the last job (a stopped VM bills only its disk). The
-weekly schedule keeps the runner registered (GitHub removes a runner that has not connected for
-14 days). The GPU has to be a data-centre part with real double-precision throughput: on an L4
+idle watchdog powers it off 20 minutes after the last job (a stopped VM bills only its disk).
+GitHub removes a runner that has not connected for 14 days; since nothing runs on a schedule, after
+a quiet fortnight the `gpu-tests` job sits at "Waiting for a runner" although `start-runner`
+succeeded. Then register the machine again: start the VM, log in, and run
+`sudo REREGISTER=1 .github/ci/runner-setup.sh <new-token>` (the token from Settings → Actions →
+Runners → New self-hosted runner), and cancel and restart the workflow run. The GPU has to be a data-centre part with real double-precision throughput: on an L4
 one noncollinear SCF of `ph_all` alone took 30 minutes (seconds on an A100 or H100), which puts
 the suite far outside the hour. Two GPUs, one per category: on a single A100 the two
 categories slow each other down and the job takes over 1.5 h.

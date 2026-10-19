@@ -6,7 +6,9 @@
 #   sudo .github/ci/runner-setup.sh <registration-token> [repository-url]
 #
 # The token comes from the repository (Settings -> Actions -> Runners -> New self-hosted runner,
-# the value after --token; valid for an hour). What it sets up:
+# the value after --token; valid for an hour). A runner that has not connected for 14 days is
+# removed by GitHub: REREGISTER=1 with a fresh token registers the machine again (the same name,
+# replacing the stale entry); without it a configured runner is left alone. What it sets up:
 #   github-runner      the unprivileged user the jobs run as
 #   /opt/actions-runner  the runner, as a systemd service, labels self-hosted,gpu,dm-qe (RUNNER_LABELS)
 #   /opt/qe-ci/build   persistent build directories (incremental builds between runs)
@@ -32,6 +34,11 @@ if [ ! -x "$RUN/config.sh" ]; then
   install -d -o github-runner -g github-runner "$RUN"
   curl -fsSL "https://github.com/actions/runner/releases/download/v$V/actions-runner-linux-x64-$V.tar.gz" | sudo -u github-runner tar -xzf - -C "$RUN"
   "$RUN/bin/installdependencies.sh" > /dev/null
+fi
+if [ -f "$RUN/.runner" ] && [ "${REREGISTER:-0}" = 1 ]; then
+  echo "== dropping the old registration"
+  ( cd "$RUN" && ./svc.sh stop > /dev/null 2>&1; ./svc.sh uninstall > /dev/null 2>&1 ) || true
+  rm -f "$RUN/.runner" "$RUN/.credentials" "$RUN/.credentials_rsaparams" "$RUN/.service"
 fi
 if [ ! -f "$RUN/.runner" ]; then
   echo "== registering $(hostname -s) at $URL with labels $LABELS"
