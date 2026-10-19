@@ -20,6 +20,7 @@ SUBROUTINE psymdvscf (dvtosym, dfft)
   USE noncollin_module, ONLY : nspin_mag, noncolin, domag
   USE scatter_mod,      ONLY : cgather_sym
   USE lr_symm_base,     ONLY : nsymq, minus_q, lr_npert
+  USE dfpt_dev_grid,    ONLY : dfpt_dev_symdvscf
   !
   IMPLICIT NONE
   !
@@ -30,6 +31,7 @@ SUBROUTINE psymdvscf (dvtosym, dfft)
   !
   ! ... local variable
   !
+  LOGICAL :: done
 #if defined (__MPI)
   !
   INTEGER :: i, is, iper, ir3, ioff, ioff_tg, nxyp
@@ -38,6 +40,14 @@ SUBROUTINE psymdvscf (dvtosym, dfft)
   ! the potential to symmetrize, in gathered form
   IF (nsymq == 1 .AND. (.NOT.minus_q) ) RETURN
   CALL start_clock ('psymdvscf')
+  !
+  ! GPU, grid not distributed: symmetrization on the device
+  !
+  CALL dfpt_dev_symdvscf (dvtosym, dfft, done)
+  IF (done) THEN
+     CALL stop_clock ('psymdvscf')
+     RETURN
+  ENDIF
   !
   ALLOCATE (ddvtosym ( dfft%nr1x * dfft%nr2x * dfft%nr3x, nspin_mag, lr_npert))
   !
@@ -79,6 +89,8 @@ SUBROUTINE psymdvscf (dvtosym, dfft)
   CALL stop_clock ('psymdvscf')
 #else
   !
+  CALL dfpt_dev_symdvscf (dvtosym, dfft, done)
+  IF (done) RETURN
   CALL symdvscf(dvtosym, dfft)
   IF (noncolin .AND. domag) CALL sym_dmag(dvtosym, dfft)
   !

@@ -231,6 +231,201 @@ subroutine mix_potential (ndim, vout, vin, alphamix, dr2, tr2, &
   !
 end subroutine mix_potential
 
+!-----------------------------------------------------------------------
+subroutine mix_potential_mem (ndim, vout, vin, alphamix, dr2, tr2, &
+     iter, n_iter, conv)
+  !-----------------------------------------------------------------------
+  !
+  ! As mix_potential (modified Broyden mixing, same arithmetic), with the
+  ! history of the previous iterations kept in memory instead of being read
+  ! from and written to a file at every call, and threaded vector
+  ! operations. A history that is missing or of the wrong size (first
+  ! iteration, restart) restarts the mixing, as mix_potential does when its
+  ! file is missing; iter is not changed.
+  !
+  USE kinds,           ONLY : DP
+  USE mp_bands,        ONLY : intra_bgrp_comm
+  USE mp,              ONLY : mp_sum
+  !
+  implicit none
+  !
+  integer :: ndim, iter, n_iter
+  real(DP) :: vout (ndim), vin (ndim), alphamix, dr2, tr2
+  logical :: conv
+  !
+  integer :: n, i, j, info, iter_used, ipos, inext, ndimtot
+  real(DP) :: gamma, norm, fac, acc
+  real(DP), allocatable, save :: df (:,:), dv (:,:)
+  integer, save :: mit = 0
+  ! number of mixing steps since the history was started (iter of mix_potential,
+  ! except after a restart)
+  !
+  integer, allocatable :: iwork(:)
+  real(DP), allocatable :: vinsave(:), beta(:, :), work(:), w(:)
+  !
+  real(DP) :: w0 = 0.01_dp
+  real(DP) :: w1 = 1.0_dp
+  !
+  call start_clock ('mix_pot')
+  !
+  if (iter < 1) call errore ('mix_potential', 'iter must be positive', 1)
+  if (ndim < 1) call errore ('mix_potential', 'ndim must be positive', 3)
+  !
+  acc = 0.0_dp
+  !$omp parallel do reduction(+:acc)
+  do n = 1, ndim
+     vout (n) = vout (n) - vin (n)
+     acc = acc + vout (n) * vout (n)
+  enddo
+  !$omp end parallel do
+  dr2 = acc
+  ndimtot = ndim
+  !
+  call mp_sum (dr2, intra_bgrp_comm)
+  call mp_sum (ndimtot, intra_bgrp_comm)
+  !
+  dr2 = (sqrt (dr2) / ndimtot) **2
+  !
+  conv = dr2 < tr2
+  !
+  if (allocated (df)) then
+     if (iter == 1 .or. size (df, 1) /= ndim .or. size (df, 2) /= n_iter) deallocate (df, dv)
+  endif
+  if (.not. allocated (df)) then
+     ! no history (first iteration, restart of an interrupted run, iterations that
+     ! continue after convergence): the mixing starts here, whatever iter is
+     mit = 0
+     allocate (df( ndim , n_iter))
+     allocate (dv( ndim , n_iter))
+  endif
+  mit = mit + 1
+  if (conv) then
+     deallocate (dv)
+     deallocate (df)
+     call stop_clock ('mix_pot')
+     return
+  endif
+  allocate (vinsave( ndim))
+  !
+  iter_used = min (mit - 1, n_iter)
+  ipos = mit - 1 - ( (mit - 2) / n_iter) * n_iter
+  !
+  if (mit > 1) then
+     acc = 0.0_dp
+     !$omp parallel do reduction(+:acc)
+     do n = 1, ndim
+        df (n, ipos) = vout (n) - df (n, ipos)
+        dv (n, ipos) = vin (n) - dv (n, ipos)
+        acc = acc + df (n, ipos) * df (n, ipos)
+     enddo
+     !$omp end parallel do
+     norm = acc
+     call mp_sum (norm, intra_bgrp_comm)
+     norm = sqrt (norm)
+     fac = 1.d0 / norm
+     !$omp parallel do
+     do n = 1, ndim
+        df (n, ipos) = fac * df (n, ipos)
+        dv (n, ipos) = fac * dv (n, ipos)
+     enddo
+     !$omp end parallel do
+  endif
+  !
+  !$omp parallel do
+  do n = 1, ndim
+     vinsave (n) = vin (n)
+  enddo
+  !$omp end parallel do
+  !
+  if ( iter_used > 0 ) then
+     !
+     ALLOCATE(beta(iter_used, iter_used))
+     ALLOCATE(w(iter_used))
+     ALLOCATE(work(iter_used))
+     ALLOCATE(iwork(iter_used))
+     w(:) = w1
+     !
+     beta = 0.0_dp
+     do i = 1, iter_used
+        do j = i + 1, iter_used
+           acc = 0.0_dp
+           !$omp parallel do reduction(+:acc)
+           do n = 1, ndim
+              acc = acc + df (n, j) * df (n, i)
+           enddo
+           !$omp end parallel do
+           beta (i, j) = w (i) * w (j) * acc
+           call mp_sum ( beta (i, j), intra_bgrp_comm )
+        enddo
+        beta (i, i) = w0**2 + w (i) **2
+     enddo
+     !
+     call DSYTRF ('U', iter_used, beta, iter_used, iwork, work, iter_used, info)
+     call errore ('broyden', 'factorization', info)
+     call DSYTRI ('U', iter_used, beta, iter_used, iwork, work, info)
+     call errore ('broyden', 'DSYTRI', info)
+     deallocate ( iwork )
+     !
+     do i = 1, iter_used
+        do j = i + 1, iter_used
+           beta (j, i) = beta (i, j)
+        enddo
+     enddo
+     !
+     do i = 1, iter_used
+        acc = 0.0_dp
+        !$omp parallel do reduction(+:acc)
+        do n = 1, ndim
+           acc = acc + df (n, i) * vout (n)
+        enddo
+        !$omp end parallel do
+        work (i) = acc
+     enddo
+     call mp_sum ( work, intra_bgrp_comm )
+     !
+  end if
+  !
+  !$omp parallel do
+  do n = 1, ndim
+     vin (n) = vin (n) + alphamix * vout (n)
+  enddo
+  !$omp end parallel do
+  !
+  do i = 1, iter_used
+     gamma = 0.d0
+     do j = 1, iter_used
+        gamma = gamma + beta (j, i) * w (j) * work (j)
+     enddo
+     !
+     fac = w (i) * gamma
+     !$omp parallel do
+     do n = 1, ndim
+        vin (n) = vin (n) - fac * (alphamix * df (n, i) + dv (n, i) )
+     enddo
+     !$omp end parallel do
+  enddo
+  !
+  IF ( iter_used > 0 ) THEN
+     deallocate(beta)
+     deallocate(w)
+     deallocate(work)
+  ENDIF
+  !
+  inext = mit - ( (mit - 1) / n_iter) * n_iter
+  !$omp parallel do
+  do n = 1, ndim
+     df (n, inext) = vout (n)
+     dv (n, inext) = vinsave (n)
+  enddo
+  !$omp end parallel do
+  deallocate(vinsave)
+  !
+  call stop_clock ('mix_pot')
+  !
+  return
+  !
+end subroutine mix_potential_mem
+
 SUBROUTINE setmixout(in1, in2, mix, dvscfout, dbecsum, ndim, flag )
  !
  USE kinds,    ONLY : DP

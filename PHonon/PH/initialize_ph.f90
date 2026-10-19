@@ -16,9 +16,14 @@ SUBROUTINE initialize_ph()
   USE qpoint_aux, ONLY : ikmks, ikmkmqs
   USE control_lr, ONLY : lgamma
   USE noncollin_module, ONLY : noncolin, domag
+  USE dfpt_dev, ONLY : dfpt_dev_invalidate
   !
   IMPLICIT NONE
   INTEGER :: ik
+  !
+  ! ... the device DFPT engine holds data of the previous q-point
+  !
+  CALL dfpt_dev_invalidate()
   !
   ! ... nksq is the number of k-points, NOT including k+q points
   !

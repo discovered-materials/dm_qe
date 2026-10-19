@@ -121,6 +121,11 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
                                     sternheimer_kernel_twochem, dbecsum_cond, &
                                     dbecsum_cond_nc, drhos_cond, ef_shift_wfc_twochem
    USE localdos_mod,         ONLY : localdos_new
+   USE dfpt_dev,             ONLY : dfpt_dev_begin, dfpt_dev_end, dfpt_dev_flush, &
+                                    dfpt_dev_in_session, dfpt_dev_set_eta, dfpt_dev_agree, &
+                                    dfpt_dev_keeping
+   USE mp_images,            ONLY : intra_image_comm
+   USE dfpt_dev_grid,        ONLY : dfpt_dev_dv_of_drho
    !
    IMPLICIT NONE
    !
@@ -168,6 +173,23 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
    !
    LOGICAL :: all_conv
    !! True if sternheimer_kernel is converged at all k points and perturbations
+   LOGICAL :: dv_done
+   !! True if the response potential was computed on the device
+   LOGICAL :: dev_mix
+   !! True if the mixing history is kept in memory (device engine in use)
+   REAL(DP) :: eta_in, eta_fac, eta_now
+   LOGICAL :: eta_off
+   !! Device engine: from now on the linear systems are solved to thresh (set when
+   !! self-consistency was reached in an iteration with a relative tolerance)
+   !! Device engine: relative tolerance of the linear solver while the self-consistency
+   !! error is more than eta_fac times its threshold (environment QE_PH_ETA, QE_PH_ETAFAC)
+   CHARACTER(LEN=32) :: envval
+   INTEGER :: lenv, ierr
+   LOGICAL :: stop_now, convt_rec
+   INTEGER :: rec_due
+   INTEGER(8) :: clk_now, clk_rec, clk_rate
+   REAL(DP) :: rec_sec
+   !! Device engine: least time between two writes of the recover file (QE_PH_REC_SEC, default 30 s)
    logical :: lmetq0,     & ! true if xq=(0,0,0) in a metal
       first_iter    ! true if first iteration where induced rho is not yet calculated
    LOGICAL :: finite_freq
@@ -238,6 +260,32 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
    !
    IF (twochem) CALL allocate_twochem(npert, nsolv)
    !
+   ! Device engine for the Sternheimer equations (GPU builds, when the case is served)
+   !
+   dev_mix = .FALSE.
+   IF (nsolv == 1 .AND. .NOT. twochem .AND. TRIM(code) == 'PHONON') THEN
+      CALL dfpt_dev_begin(code, npert, iter0, lrdvpsi, iudvpsi)
+      ! all the ranks of the image take the same path (device memory is a per-rank matter)
+      CALL dfpt_dev_agree(dev_mix)
+      dev_mix = dfpt_dev_in_session()
+   ENDIF
+   eta_in = 0.0_DP
+   eta_fac = 100.0_DP
+   eta_off = .FALSE.
+   rec_sec = 30.0_DP
+   CALL SYSTEM_CLOCK(clk_rec, clk_rate)
+   IF (dev_mix) THEN
+      CALL get_environment_variable('QE_PH_ETA', envval, lenv, ierr)
+      IF (ierr == 0 .AND. lenv > 0) READ(envval, *, IOSTAT=ierr) eta_in
+      IF (ierr /= 0) eta_in = 0.0_DP
+      CALL get_environment_variable('QE_PH_REC_SEC', envval, lenv, ierr)
+      IF (ierr == 0 .AND. lenv > 0) READ(envval, *, IOSTAT=ierr) rec_sec
+      IF (ierr /= 0) rec_sec = 30.0_DP
+      CALL get_environment_variable('QE_PH_ETAFAC', envval, lenv, ierr)
+      IF (ierr == 0 .AND. lenv > 0) READ(envval, *, IOSTAT=ierr) eta_fac
+      IF (ierr /= 0) eta_fac = 100.0_DP
+   ENDIF
+   !
    ! Loop over DFPT self-consistent iterations
    !
    do kter = 1, niter_ph
@@ -259,11 +307,26 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
       !
       ! Set threshold for iterative solution of the linear system
       !
-      IF (first_iter .OR. kter == 1) THEN
-         ! If first iteration or first iteration after restart
+      IF (first_iter .OR. (kter == 1 .AND. .NOT. dev_mix)) THEN
+         ! If first iteration or first iteration after restart (the starting dpsi,
+         ! read from the buffer, is already converged: any threshold does)
          thresh = 1.0d-2
+      ELSE IF (kter == 1) THEN
+         ! Device engine: a restarted run solves its linear systems from zero, so its
+         ! first iteration needs the threshold of the recovered error, not 1e-2
+         thresh = min(1.d-1 * sqrt(dr2), 1.0d-2)
       ELSE
          thresh = min(1.d-1 * sqrt(dr2), thresh)
+      ENDIF
+      !
+      ! Device engine: far from self-consistency the linear systems need not be solved
+      ! beyond a fixed reduction of their residual; the last iterations use thresh alone
+      !
+      eta_now = 0.0_DP
+      IF (dev_mix) THEN
+         IF (kter > 1 .AND. .NOT. first_iter .AND. .NOT. eta_off .AND. &
+             dr2 > eta_fac * tr2_ph / npol) eta_now = eta_in
+         CALL dfpt_dev_set_eta(eta_now)
       ENDIF
       !
       ! DFPT+U: at each ph iteration calculate dnsscf,
@@ -378,8 +441,16 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
          ! No local field effect: set dvscf to 0
          dvscftmp(:, :, :) = (0.d0, 0.d0)
       ELSE
-         ! Compute the response HXC potential
+         ! Compute the response HXC potential (all perturbations at once on the device
+         ! when the case is served)
+         IF (ALLOCATED(dfpt_data%drhoc)) THEN
+            CALL dfpt_dev_dv_of_drho(npert, dfpt_data%drhop, dvscftmp, dv_done, &
+                                     drhoc = dfpt_data%drhoc)
+         ELSE
+            CALL dfpt_dev_dv_of_drho(npert, dfpt_data%drhop, dvscftmp, dv_done)
+         ENDIF
          DO ipert = 1, npert
+            IF (dv_done) EXIT
             CALL zcopy(dfftp%nnr*nspin_mag, dfpt_data%drhop(1,1,ipert), 1, dvscftmp(1,1,ipert), 1)
             IF (ALLOCATED(dfpt_data%drhoc)) THEN
                ! Consider core charge perturbation if present
@@ -397,17 +468,37 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
          !  In this case we mix also dbecsum
          !
          CALL setmixout(ndim_pot, ndim_paw, mixout, dvscftmp, dfpt_data%dbecsum, ndim, -1)
-         CALL mix_potential(2 * (ndim_pot + ndim), mixout, mixin, alpha_mix(kter), dr2, &
-                            npert * tr2_ph / npol, iter, nmix_ph, flmixdpot, convt)
+         IF (dev_mix) THEN
+            CALL mix_potential_mem(2 * (ndim_pot + ndim), mixout, mixin, alpha_mix(kter), dr2, &
+                                   npert * tr2_ph / npol, iter, nmix_ph, convt)
+         ELSE
+            CALL mix_potential(2 * (ndim_pot + ndim), mixout, mixin, alpha_mix(kter), dr2, &
+                               npert * tr2_ph / npol, iter, nmix_ph, flmixdpot, convt)
+         ENDIF
          CALL setmixout(ndim_pot, ndim_paw, mixin, dfpt_data%dvscfp, dfpt_data%dbecsum, ndim, 1)
       ELSE
-         CALL mix_potential(2 * ndim_pot, dvscftmp, dfpt_data%dvscfp, alpha_mix(kter), dr2, &
-                            npert * tr2_ph / npol, iter, nmix_ph, flmixdpot, convt)
+         IF (dev_mix) THEN
+            CALL mix_potential_mem(2 * ndim_pot, dvscftmp, dfpt_data%dvscfp, alpha_mix(kter), dr2, &
+                                   npert * tr2_ph / npol, iter, nmix_ph, convt)
+         ELSE
+            CALL mix_potential(2 * ndim_pot, dvscftmp, dfpt_data%dvscfp, alpha_mix(kter), dr2, &
+                               npert * tr2_ph / npol, iter, nmix_ph, flmixdpot, convt)
+         ENDIF
       ENDIF
       !
       !   fft_interpolate or copy potential from hard to smooth grid: dvscfp -> dvscfs
       !
+      ! Self-consistency reached with linear systems solved to a relative tolerance only:
+      ! not accepted. The iterations continue with the linear systems solved to thresh.
+      !
+      IF (convt .AND. eta_now > 0.0_DP) THEN
+         convt = .FALSE.
+         eta_off = .TRUE.
+      ENDIF
+      !
+      CALL start_clock('dk_p2s')
       CALL dfpt_dvscfp_to_dvscfs(dfpt_data)
+      CALL stop_clock('dk_p2s')
       !
       ! Check that convergence have been reached on ALL processors in this image.
       ! If convergence is reached on only some processors, call errore.
@@ -476,15 +567,43 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
       !
       !    Here we save the information for recovering the run from this point
       !
+      !    (device engine: iterations take a fraction of a second, the recover file is
+      !     written at convergence, before a stop and otherwise every rec_sec seconds)
+      !
+      !    The decision is the same on all ranks (write_rec has collective MPI calls).
+      !    When the engine keeps the response wavefunctions on the device, the record is
+      !    written as "not converged": a restart then repeats the last iteration instead of
+      !    looking for wavefunctions that were never written to their buffer.
+      !
+      stop_now = check_stop_now()
       IF (PRESENT(write_rec_callback)) THEN
-         CALL write_rec_callback(where_rec, irr, dr2, iter, convt, dfpt_data)
+         rec_due = 1
+         IF (dev_mix) THEN
+            CALL SYSTEM_CLOCK(clk_now, clk_rate)
+            rec_due = 0
+            IF (REAL(clk_now - clk_rec, DP) >= rec_sec * REAL(clk_rate, DP)) rec_due = 1
+            CALL mp_sum(rec_due, intra_image_comm)
+         ENDIF
+         IF (rec_due > 0 .OR. convt .OR. stop_now .OR. kter == niter_ph) THEN
+            convt_rec = convt
+            IF (convt .AND. dfpt_dev_keeping()) convt_rec = .FALSE.
+            CALL write_rec_callback(where_rec, irr, dr2, iter, convt_rec, dfpt_data)
+            CALL SYSTEM_CLOCK(clk_rec, clk_rate)
+         ENDIF
       ENDIF
       !
-      IF (check_stop_now() .AND. PRESENT(stop_callback)) CALL stop_callback(.FALSE.)
+      IF (stop_now .AND. PRESENT(stop_callback)) THEN
+         CALL dfpt_dev_end()
+         CALL stop_callback(.FALSE.)
+      ENDIF
       !
       IF (convt) EXIT
       !
    ENDDO ! iteration
+   !
+   ! Device engine: dpsi goes back to its buffer, where the rest of the code reads it
+   !
+   CALL dfpt_dev_end()
    !
    ! Update the responses with the Fermi energy shift
    !

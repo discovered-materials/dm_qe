@@ -78,6 +78,7 @@ SUBROUTINE sternheimer_kernel(first_iter, time_reversed, npert, lrdvpsi, iudvpsi
    USE apply_dpot_mod,        ONLY : apply_dpot_bands
    USE lr_nc_mag,             ONLY : lr_apply_time_reversal
    USE incdrhoscf_mod,        ONLY : incdrhoscf, incdrhoscf_nc
+   USE dfpt_dev,              ONLY : dfpt_dev_in_session, dfpt_dev_sternheimer
    !
    IMPLICIT NONE
    !
@@ -136,6 +137,15 @@ SUBROUTINE sternheimer_kernel(first_iter, time_reversed, npert, lrdvpsi, iudvpsi
    !
    exclude_hubbard_ = .FALSE.
    IF (PRESENT(exclude_hubbard)) exclude_hubbard_ = exclude_hubbard
+   !
+   ! Device engine: all k-points and perturbations are solved together on the GPU
+   !
+   IF (dfpt_dev_in_session() .AND. .NOT. time_reversed) THEN
+      CALL dfpt_dev_sternheimer(first_iter, npert, thresh, dvscfins, all_conv, avg_iter, &
+                                drhoout, dbecsum)
+      CALL stop_clock("sth_kernel")
+      RETURN
+   ENDIF
    !
    !  change the sign of the magnetic field if required
    !
