@@ -47,6 +47,10 @@ SUBROUTINE dynmat_us()
   USE qpoint,               ONLY : nksq, ikks
   USE control_lr,           ONLY : nbnd_occ, lgamma
   USE uspp_init,        ONLY : init_us_2
+  USE dyn_dev,          ONLY : dyn_check
+#if defined(__CUDA)
+  USE dyn_dev,          ONLY : dyn_dev_ok, dyn_d2form, dynmat_us_nl_dev, dyn_fwfft
+#endif
 
   IMPLICIT NONE
   
@@ -70,8 +74,16 @@ SUBROUTINE dynmat_us()
   ! fourier transform of rho
   ! the second derivative of the beta
   ! work space
+  REAL(DP), ALLOCATABLE :: cz(:,:)
+  COMPLEX(DP), ALLOCATABLE :: zz(:), s6(:,:)
+  INTEGER, PARAMETER :: pidx(3,3) = RESHAPE( (/ 1, 2, 4, 2, 3, 5, 4, 5, 6 /), (/ 3, 3 /) )
+  LOGICAL :: on_device
 
   CALL start_clock ('dynmat_us')
+  on_device = .FALSE.
+#if defined(__CUDA)
+  on_device = dyn_dev_ok( )
+#endif
   ALLOCATE (rhog  ( dfftp%nnr))
   ALLOCATE (work1 ( npwx))
   ALLOCATE (work2 ( npwx))
@@ -99,10 +111,48 @@ SUBROUTINE dynmat_us()
   rhog (:) = (0.d0, 0.d0)
   rhog (:) = CMPLX(rho%of_r(:, 1), 0.d0,kind=DP)
 
+#if defined(__CUDA)
+  IF ( on_device ) THEN
+     CALL dyn_fwfft (dfftp%nr1, dfftp%nr2, dfftp%nr3, dfftp%nnr, rhog)
+  ELSE
+     CALL fwfft ('Rho', rhog, dfftp)
+  ENDIF
+#else
   CALL fwfft ('Rho', rhog, dfftp)
+#endif
   !
   ! there is a delta ss'
   !
+  CALL start_clock ('dynus_loc')
+#if defined(__CUDA)
+  IF ( on_device ) THEN
+     !
+     ! Device path: sum_G g_i g_j vloc(G) Re[ rho(G) e^{i G tau} ] for all
+     ! the atoms in one kernel (dyn_d2form)
+     !
+     ALLOCATE (cz(ngm, ntyp), zz(ngm), s6(6, nat))
+     DO nt = 1, ntyp
+        DO ng = 1, ngm
+           cz (ng, nt) = vloc (igtongl (ng), nt)
+        ENDDO
+     ENDDO
+     DO ng = 1, ngm
+        zz (ng) = CONJG (rhog (dfftp%nl (ng) ) )
+     ENDDO
+     CALL dyn_d2form (ngm, ngm, cz, zz, s6)
+     DO na = 1, nat
+        DO icart = 1, 3
+           na_icart = 3 * (na - 1) + icart
+           DO jcart = 1, 3
+              na_jcart = 3 * (na - 1) + jcart
+              dynwrk (na_icart, na_jcart) = dynwrk (na_icart, na_jcart) - &
+                   omega * tpiba2 * DBLE (s6 (pidx (icart, jcart), na) )
+           ENDDO
+        ENDDO
+     ENDDO
+     DEALLOCATE (cz, zz, s6)
+  ELSE
+#endif
   DO na = 1, nat
      DO icart = 1, 3
         na_icart = 3 * (na - 1) + icart
@@ -121,6 +171,11 @@ SUBROUTINE dynmat_us()
         ENDDO
      ENDDO
   ENDDO
+#if defined(__CUDA)
+  ENDIF
+#endif
+  CALL stop_clock ('dynus_loc')
+  CALL dyn_check ('dynus_loc', 3*nat, dynwrk)
   IF (do_cutoff_2D) call cutoff_dynmat0(dynwrk, rhog)  
 
   CALL mp_sum (dynwrk, intra_bgrp_comm)
@@ -131,6 +186,15 @@ SUBROUTINE dynmat_us()
   !
   ! Here we compute  the nonlocal Ultra-soft contribution
   !
+  CALL start_clock ('dynus_nl')
+#if defined(__CUDA)
+  IF ( on_device ) THEN
+     !
+     ! Device path: projections with ZGEMM on the device, sums on the host
+     !
+     CALL dynmat_us_nl_dev (dynwrk)
+  ELSE
+#endif
   DO ik = 1, nksq
      ikk = ikks(ik)
      IF (lsda) current_spin = isk (ikk)
@@ -228,6 +292,11 @@ SUBROUTINE dynmat_us()
         ENDDO
      ENDDO
   ENDDO
+#if defined(__CUDA)
+  ENDIF
+#endif
+  CALL stop_clock ('dynus_nl')
+  CALL dyn_check ('dynus_nl', 3*nat, dynwrk)
   !
   !   For true US pseudopotentials there is an additional term in the second
   !   derivative which is due to the change of the self consistent D part

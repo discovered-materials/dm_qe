@@ -23,6 +23,8 @@ SUBROUTINE clean_pw_ph(iq)
   USE lr_symm_base,    ONLY : nsymq
   USE dfpt_dev,        ONLY : dfpt_dev_invalidate
   USE usaug_dev,       ONLY : usaug_invalidate
+  USE dvbare_dev,      ONLY : dvbare_dev_free
+  USE dyn_dev,         ONLY : dyn_dev_reset
   !
   USE beta_cache,       ONLY : beta_cache_free
   IMPLICIT NONE
@@ -35,6 +37,8 @@ SUBROUTINE clean_pw_ph(iq)
   !
   CALL dfpt_dev_invalidate()
   CALL usaug_invalidate()
+  CALL dvbare_dev_free()
+  CALL dyn_dev_reset()
   CALL beta_cache_free()
   !
   done_iq(iq)=.TRUE.

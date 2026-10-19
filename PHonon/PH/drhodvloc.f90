@@ -22,6 +22,12 @@ subroutine drhodvloc (nu_i0, npe, drhos, wdyn)
 
   USE mp_bands,  ONLY: intra_bgrp_comm
   USE mp,        ONLY: mp_sum
+#if defined(__CUDA)
+  USE gvect,     ONLY : ngm
+  USE gvecs,     ONLY : ngms
+  USE eqv,       ONLY : vlocq
+  USE dyn_dev,   ONLY : dyn_dev_ok, dyn_dform
+#endif
 
   implicit none
 
@@ -45,7 +51,46 @@ subroutine drhodvloc (nu_i0, npe, drhos, wdyn)
   complex(DP) :: dynwrk (3 * nat, 3 * nat)
   complex(DP), allocatable :: dvloc (:)
   ! d Vloc / dtau
+#if defined(__CUDA)
+  complex(DP), allocatable :: xs (:,:), w (:,:,:)
+  complex(DP) :: ps
+  integer :: na, mu
+  !
+  ! Device path: the scalar products of the response density with
+  ! dV_loc/du of all the patterns from one FFT of the density
+  ! (in reciprocal space), see dyn_dform
+  !
+  IF ( dyn_dev_ok( ) ) THEN
+     call start_clock ('drhodvloc')
+     allocate (xs( dffts%nnr, npe), w( 3, nat, npe))
+     do ipert = 1, npe
+        xs (:, ipert) = drhos (:, 1, ipert)
+        do is = 2, nspin_lsda
+           xs (:, ipert) = xs (:, ipert) + drhos (:, is, ipert)
+        enddo
+     enddo
+     CALL dyn_dform (dffts%nr1, dffts%nr2, dffts%nr3, dffts%nnr, ngms, dffts%nl, &
+                     npe, xs, ngm, vlocq, w)
+     do nu_j = 1, 3 * nat
+        do ipert = 1, npe
+           nu_i = nu_i0 + ipert
+           ps = (0.d0, 0.d0)
+           do na = 1, nat
+              mu = 3 * (na - 1)
+              if ( abs(u(mu+1,nu_j)) + abs(u(mu+2,nu_j)) + abs(u(mu+3,nu_j)) > 1.0d-12) &
+                 ps = ps + w(1,na,ipert) * u(mu+1,nu_j) + w(2,na,ipert) * u(mu+2,nu_j) + &
+                           w(3,na,ipert) * u(mu+3,nu_j)
+           enddo
+           wdyn (nu_i, nu_j) = wdyn (nu_i, nu_j) + ps * omega
+        enddo
+     enddo
+     deallocate (xs, w)
+     call stop_clock ('drhodvloc')
+     return
+  ENDIF
+#endif
 
+  call start_clock ('drhodvloc')
   allocate (dvloc( dffts%nnr))
   dynwrk (:,:) = (0.d0, 0.d0)
   !
@@ -71,5 +116,6 @@ subroutine drhodvloc (nu_i0, npe, drhos, wdyn)
 
   wdyn(:,:) = wdyn(:,:) + dynwrk(:,:)
   deallocate(dvloc)
+  call stop_clock ('drhodvloc')
   return
 end subroutine drhodvloc
