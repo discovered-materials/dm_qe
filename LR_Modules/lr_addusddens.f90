@@ -35,6 +35,7 @@ SUBROUTINE lr_addusddens (npert, dbecsum, drhop)
   USE uspp,                 ONLY : okvan
   USE uspp_param,           ONLY : upf, lmaxq, nh, nhm
   USE qpoint,               ONLY : xq, eigqts
+  USE usaug_dev,            ONLY : usaug_on, usaug_addusddens, usaug_check
   !
   IMPLICIT NONE
   !
@@ -75,10 +76,28 @@ SUBROUTINE lr_addusddens (npert, dbecsum, drhop)
   ! q_lm(G)
   ! auxiliary variable for drho(G)
   ! auxiliary variable for drho(r)
+  COMPLEX(DP), ALLOCATABLE :: drhop_dev(:,:,:), drhop_in(:,:,:)
+  ! result of the device code and input density (self-test only)
+  LOGICAL :: lcheck
   !
   IF (.NOT.okvan) RETURN
   !
   CALL start_clock ('lr_addusddens')
+  !
+  ! Device code: the table of Q_ij(q+G) is kept on the GPU and the sum over
+  ! (ij, atoms) is one matrix product per atomic type
+  !
+  IF (usaug_on()) THEN
+     IF (usaug_check()) ALLOCATE (drhop_in, SOURCE = drhop)
+     CALL usaug_addusddens (npert, dbecsum, drhop)
+     IF (.NOT. usaug_check()) THEN
+        CALL stop_clock ('lr_addusddens')
+        RETURN
+     ENDIF
+     ALLOCATE (drhop_dev, SOURCE = drhop)
+     drhop_dev = drhop_dev - drhop_in
+     drhop = drhop_in
+  ENDIF
   !
   ALLOCATE (aux(ngm, nspin_mag, npert))
   ALLOCATE (aux_r(dfftp%nnr))
@@ -198,6 +217,12 @@ SUBROUTINE lr_addusddens (npert, dbecsum, drhop)
          !
      ENDDO
   ENDDO ! ipert
+  !
+  IF (ALLOCATED(drhop_dev)) THEN
+     drhop_in = drhop - drhop_in
+     lcheck = usaug_check ('lr_addusddens', SIZE(drhop), drhop_dev, drhop_in)
+     DEALLOCATE (drhop_dev, drhop_in)
+  ENDIF
   !
   DEALLOCATE (qmod)
   DEALLOCATE (qgm)

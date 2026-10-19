@@ -47,6 +47,8 @@ subroutine print_clock_ph
      call print_clock ('solve_e')
      call print_clock ('dielec')
      call print_clock ('zstar_eu')
+     call print_clock ('zeu_bare')
+     call print_clock ('zeu_us_pos')
 #ifdef TIMING_ZSTAR_US
      WRITE( stdout, * )
      call print_clock ('zstar_eu_us')
@@ -171,6 +173,8 @@ subroutine print_clock_ph
 
   call print_clock ('addusddort')
   call print_clock ('lr_addusddens')
+  call print_clock ('usaug_qtab')
+  call print_clock ('usaug_interp')
   call print_clock ('PAW_dsymm')
   call print_clock ('PAW_dmqsymm')
   WRITE( stdout, * )

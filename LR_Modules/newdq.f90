@@ -31,6 +31,7 @@ subroutine newdq (dvscf, npe)
   USE lrus,                 ONLY : int3, int3_paw
   USE qpoint,               ONLY : xq, eigqts
   USE control_lr,           ONLY : lgamma
+  USE usaug_dev,            ONLY : usaug_on, usaug_newdq, usaug_check
 
   implicit none
   !
@@ -57,10 +58,26 @@ subroutine newdq (dvscf, npe)
 
   COMPLEX(DP) :: tmp
   ! temporary scalar to hold accumulated value
+  complex(DP), allocatable :: int3_dev (:,:,:,:,:)
+  ! result of the device code (self-test only)
+  logical :: lcheck
 
   if (.not.okvan) return
   !
   call start_clock ('newdq')
+  !
+  ! Device code: the table of Q_ij(q+G) is kept on the GPU and the sum over
+  ! G-vectors is one matrix product per atomic type
+  !
+  if (usaug_on()) then
+     call usaug_newdq (dvscf, npe)
+     if (.not. usaug_check()) then
+        IF (okpaw) int3 = int3 + int3_paw
+        call stop_clock ('newdq')
+        return
+     endif
+     allocate (int3_dev, source = int3)
+  endif
   !
   allocate (aux1 (ngm , nspin_mag))
   allocate (veff (dfftp%nnr))
@@ -171,6 +188,10 @@ subroutine newdq (dvscf, npe)
 #if defined(__MPI)
   call mp_sum ( int3, intra_bgrp_comm )
 #endif
+  if (allocated(int3_dev)) then
+     lcheck = usaug_check ('newdq', size(int3), int3_dev, int3)
+     deallocate (int3_dev)
+  endif
   !
   ! Sum of the USPP and PAW terms 
   ! (see last two terms in Eq.(12) in PRB 81, 075123 (2010))

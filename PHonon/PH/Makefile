@@ -37,6 +37,7 @@ close_phq.o \
 compute_alphasum.o \
 compute_becalp.o \
 compute_becsum_ph.o \
+phq_setup_dev.o \
 compute_drhous.o \
 compute_drhous_nc.o \
 compute_dvloc.o \

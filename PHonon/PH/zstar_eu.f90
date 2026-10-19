@@ -49,6 +49,7 @@ subroutine zstar_eu
   zstareu0(:,:) = (0.d0,0.d0)
   zstareu (:,:,:) = 0.d0
 
+  call start_clock ('zeu_bare')
   do ik = 1, nksq
      ikk=ikks(ik)
      npw = ngk(ikk)
@@ -84,6 +85,8 @@ subroutine zstar_eu
         imode0 = imode0 + npert (irr)
      enddo
   enddo
+  !
+  call stop_clock ('zeu_bare')
   !
   ! Now we add the terms which are due to the USPP
   !

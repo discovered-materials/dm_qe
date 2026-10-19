@@ -36,6 +36,8 @@ subroutine compute_drhous (drhous, dbecsum, wgg, becq, alpq)
   USE partial,    ONLY: nat_todo_input, comp_irr, atomo, nat_todo, set_local_atomo 
   USE symm_base,  ONLY: irt 
   USE lr_symm_base, ONLY: nsymq  
+  USE phq_setup_dev, ONLY: phq_setup_dev_on, drhous_dev
+  USE usaug_dev,  ONLY: usaug_check
 
   implicit none
   !
@@ -70,9 +72,28 @@ subroutine compute_drhous (drhous, dbecsum, wgg, becq, alpq)
 
   complex(DP), allocatable :: evcr (:,:)
   ! the wavefunctions in real space
+  complex(DP), allocatable :: drhous_dev_ (:,:,:), dbecsum_dev_ (:,:,:,:)
+  ! results of the device code (self-test only)
+  logical :: done, lcheck
   if (.not.okvan) return
 
   call start_clock ('com_drhous')
+  !
+  ! Device code: for each k-point all the modes are processed together
+  ! (matrix products and batched FFTs)
+  !
+  if (phq_setup_dev_on()) then
+     call drhous_dev (drhous, dbecsum, wgg, becq, alpq, done)
+     if (done) then
+        if (.not. usaug_check()) then
+           call stop_clock ('com_drhous')
+           return
+        endif
+        allocate (drhous_dev_, source = drhous)
+        allocate (dbecsum_dev_, source = dbecsum)
+     endif
+  endif
+  !
   allocate (evcr( dffts%nnr, nbnd))
   allocate(do_mode(3*nat)) 
   !
@@ -124,6 +145,11 @@ subroutine compute_drhous (drhous, dbecsum, wgg, becq, alpq)
 
   enddo
 
+  if (allocated(drhous_dev_)) then
+     lcheck = usaug_check ('drhous', size(drhous), drhous_dev_, drhous)
+     lcheck = usaug_check ('drhous dbecsum', size(dbecsum), dbecsum_dev_, dbecsum)
+     deallocate (drhous_dev_, dbecsum_dev_)
+  endif
   deallocate(evcr)
   call stop_clock ('com_drhous')
   return
