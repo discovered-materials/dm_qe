@@ -55,6 +55,23 @@ MODULE paw_onecenter
     INTEGER, EXTERNAL :: ldim_block
     INTEGER, EXTERNAL :: gind_block
     !
+    ! ... Cache of PAW_dpotential. The map dbecsum -> int3 is real-linear and diagonal in the
+    ! ... atom: int3(ih,jh,na,is,ipert) = sum_{ijh',is'} K_na(ijh,is;ijh',is') dbecsum(ijh',na,is',ipert)
+    ! ... with a real matrix K_na that depends on the ground state only (becsum, the pseudopotentials
+    ! ... and the functional), not on q, the perturbation or the iteration. It is built once by
+    ! ... PAW_dk_setup and rebuilt when becsum changes.
+    !
+    TYPE paw_dk_type
+       REAL(DP), ALLOCATABLE :: k(:,:)   ! (nij*nspin_mag,nij*nspin_mag), nij=nh*(nh+1)/2
+    END TYPE paw_dk_type
+    TYPE(paw_dk_type), ALLOCATABLE, SAVE :: dk(:)   ! one matrix per atom
+    REAL(DP), ALLOCATABLE, SAVE :: dk_becsum(:,:,:) ! the becsum dk was built for
+    INTEGER,  ALLOCATABLE, SAVE :: dk_ityp(:)       ! the atomic types dk was built for
+    LOGICAL, SAVE :: dk_gga = .FALSE.               ! dk was built for a gradient-corrected functional
+    INTEGER, SAVE :: dk_mode = -1  ! -1: environment not read yet, 0: stock routine (QE_PH_DEV=0),
+                                   !  1: cached matrix, 2: cached matrix checked against the stock
+                                   !     routine at every call (QE_PAW_DPOT_CHECK=1)
+    !
  CONTAINS
   !
   !---------------------------------------------------------------------------------
@@ -1503,9 +1520,898 @@ MODULE paw_onecenter
   !---------------------------------------------------------------------------------
   SUBROUTINE PAW_dpotential( dbecsum, becsum, int3, npe )
     !---------------------------------------------------------------------------------
-    !! Computes dV_h and dV_xc using the "change of density" dbecsum provided.  
+    !! Computes dV_h and dV_xc using the "change of density" dbecsum provided.
     !! Update the change of the descreening coefficients:
     !! $$ D_{ij}=\int dv_{H_{xc}} p_{ij}-\int dvt_{H_{xc}}(pt_{ij}+\text{augfun}_{ij}) $$
+    !! Driver: applies the cached matrix of the linear map dbecsum -> int3
+    !! (\(\texttt{PAW_dpotential_fast}\)) or calls the original routine
+    !! (\(\texttt{PAW_dpotential_stock}\)) in the noncollinear cases and when the
+    !! environment variable QE_PH_DEV is 0. With QE_PAW_DPOT_CHECK=1 both are
+    !! computed at every call and their largest difference is printed.
+    !
+    USE ions_base,         ONLY : nat
+    USE noncollin_module,  ONLY : nspin_mag, noncolin
+    USE uspp_param,        ONLY : nhm
+    USE io_global,         ONLY : stdout, ionode
+    USE mp_images,         ONLY : root_image
+    USE mp,                ONLY : mp_bcast
+    !
+    INTEGER, INTENT(IN) :: npe
+    !! number of perturbations
+    REAL(DP), INTENT(IN) :: becsum(nhm*(nhm+1)/2,nat,nspin_mag)
+    !! cross band
+    COMPLEX(DP), INTENT(IN) :: dbecsum(nhm*(nhm+1)/2,nat,nspin_mag,npe)
+    !! occupations
+    COMPLEX(DP), INTENT(OUT) :: int3(nhm,nhm,nat,nspin_mag,npe)
+    !! change of descreening coefficients (AE - PS)
+    !
+    COMPLEX(DP), ALLOCATABLE :: int3_ref(:,:,:,:,:)
+    REAL(DP) :: dmax, rmax, erel
+    CHARACTER(LEN=16) :: val
+    INTEGER :: ln, ierr
+    !
+    IF ( dk_mode < 0 ) THEN
+       ! the environment is read once, by the root of the image for all its processes
+       dk_mode = 1
+       CALL get_environment_variable( 'QE_PH_DEV', val, ln, ierr )
+       IF ( ierr == 0 .AND. ln > 0 .AND. val(1:1) == '0' ) dk_mode = 0
+       CALL get_environment_variable( 'QE_PAW_DPOT_CHECK', val, ln, ierr )
+       IF ( dk_mode == 1 .AND. ierr == 0 .AND. ln > 0 .AND. val(1:1) == '1' ) dk_mode = 2
+       CALL mp_bcast( dk_mode, root_image, intra_image_comm )
+    ENDIF
+    !
+    IF ( dk_mode == 0 .OR. noncolin .OR. nspin_mag > 2 ) THEN
+       CALL PAW_dpotential_stock( dbecsum, becsum, int3, npe )
+       RETURN
+    ENDIF
+    !
+    CALL PAW_dpotential_fast( dbecsum, becsum, int3, npe )
+    !
+    IF ( dk_mode == 2 ) THEN
+       ALLOCATE( int3_ref(nhm,nhm,nat,nspin_mag,npe) )
+       CALL PAW_dpotential_stock( dbecsum, becsum, int3_ref, npe )
+       rmax = MAXVAL( ABS(int3_ref) )
+       dmax = MAXVAL( ABS(int3 - int3_ref) )
+       ! largest element-wise relative difference among the elements that are not tiny
+       erel = MAXVAL( ABS(int3 - int3_ref) / MAX(ABS(int3_ref), TINY(1._DP)), &
+                      MASK = ABS(int3_ref) > 1.E-6_DP*rmax )
+       IF ( rmax == 0._DP ) erel = 0._DP
+       IF ( ionode ) WRITE( stdout, '(5x,"PAW_dpot check: npe=",i2," max|int3|=",es11.4, &
+            &" max abs diff=",es9.2," /max=",es9.2," max elem. rel=",es9.2)' ) &
+            npe, rmax, dmax, dmax/MAX(rmax,TINY(1._DP)), erel
+       DEALLOCATE( int3_ref )
+    ENDIF
+    !
+  END SUBROUTINE PAW_dpotential
+  !
+  !
+  !---------------------------------------------------------------------------------
+  SUBROUTINE PAW_dpotential_fast( dbecsum, becsum, int3, npe )
+    !---------------------------------------------------------------------------------
+    !! Same result as \(\texttt{PAW_dpotential_stock}\) (collinear cases), obtained
+    !! by applying the cached matrices dk(na)%k to dbecsum. Host code: the arrays
+    !! are tiny.
+    !
+    USE ions_base,         ONLY : nat, ityp
+    USE noncollin_module,  ONLY : nspin_mag
+    USE uspp_param,        ONLY : nh, nhm, upf
+    USE constants,         ONLY : eps12
+    USE xc_lib,            ONLY : xclib_dft_is
+    !
+    INTEGER, INTENT(IN) :: npe
+    REAL(DP), INTENT(IN) :: becsum(nhm*(nhm+1)/2,nat,nspin_mag)
+    COMPLEX(DP), INTENT(IN) :: dbecsum(nhm*(nhm+1)/2,nat,nspin_mag,npe)
+    COMPLEX(DP), INTENT(OUT) :: int3(nhm,nhm,nat,nspin_mag,npe)
+    !
+    REAL(DP), ALLOCATABLE :: din(:,:), dout(:,:)
+    REAL(DP) :: xr, xi
+    INTEGER :: ia, nt, nij, nd, is, ipert, ih, jh, ijh, irebuild
+    LOGICAL :: rebuild
+    !
+    CALL start_clock( 'PAW_dpot' )
+    !
+    ! ... the matrices are valid as long as the ground state they were built for is unchanged
+    !
+    rebuild = .NOT. ALLOCATED(dk)
+    IF ( .NOT. rebuild ) rebuild = ( SIZE(dk) /= nat ) .OR. ( SIZE(dk_becsum,1) /= SIZE(becsum,1) ) &
+                              .OR. ( SIZE(dk_becsum,3) /= nspin_mag ) &
+                              .OR. ( dk_gga .NEQV. xclib_dft_is('gradient') )
+    IF ( .NOT. rebuild ) rebuild = ANY( dk_ityp(1:nat) /= ityp(1:nat) )
+    IF ( .NOT. rebuild ) rebuild = ANY( dk_becsum /= becsum )
+    ! all the processes of the image must take the same decision (the set-up communicates)
+    irebuild = 0
+    IF ( rebuild ) irebuild = 1
+    CALL mp_sum( irebuild, intra_image_comm )
+    IF ( irebuild > 0 ) CALL PAW_dk_setup( becsum )
+    !
+    CALL start_clock( 'pawd_apply' )
+    int3 = (0.0_DP, 0.0_DP)
+    !
+    DO ia = 1, nat
+       nt = ityp(ia)
+       IF ( .NOT. upf(nt)%tpawp ) CYCLE
+       nij = nh(nt)*(nh(nt)+1)/2
+       nd  = nij*nspin_mag
+       ALLOCATE( din(nd,2*npe), dout(nd,2*npe) )
+       DO ipert = 1, npe
+          DO is = 1, nspin_mag
+             DO ijh = 1, nij
+                ! real and imaginary part are thresholded separately, as PAW_rho_lm does
+                xr = DBLE(  dbecsum(ijh,ia,is,ipert) )
+                xi = AIMAG( dbecsum(ijh,ia,is,ipert) )
+                IF ( ABS(xr) < eps12 ) xr = 0._DP
+                IF ( ABS(xi) < eps12 ) xi = 0._DP
+                din((is-1)*nij+ijh,2*ipert-1) = xr
+                din((is-1)*nij+ijh,2*ipert  ) = xi
+             ENDDO
+          ENDDO
+       ENDDO
+       CALL DGEMM( 'N', 'N', nd, 2*npe, nd, 1._DP, dk(ia)%k, nd, din, nd, 0._DP, dout, nd )
+       DO ipert = 1, npe
+          DO is = 1, nspin_mag
+             ijh = (is-1)*nij
+             DO ih = 1, nh(nt)
+                DO jh = ih, nh(nt)
+                   ijh = ijh + 1
+                   int3(ih,jh,ia,is,ipert) = CMPLX( dout(ijh,2*ipert-1), dout(ijh,2*ipert), KIND=DP )
+                   int3(jh,ih,ia,is,ipert) = int3(ih,jh,ia,is,ipert)
+                ENDDO
+             ENDDO
+          ENDDO
+       ENDDO
+       DEALLOCATE( din, dout )
+    ENDDO
+    CALL stop_clock( 'pawd_apply' )
+    !
+    CALL stop_clock( 'PAW_dpot' )
+    !
+  END SUBROUTINE PAW_dpotential_fast
+  !
+  !
+  !---------------------------------------------------------------------------------
+  SUBROUTINE PAW_dk_setup( becsum )
+    !---------------------------------------------------------------------------------
+    !! Builds the matrices dk(na)%k of the linear map dbecsum -> int3 (see the
+    !! declaration of dk). In exact arithmetic the result is the one obtained by
+    !! applying \(\texttt{PAW_dpotential_stock}\) to unit vectors; the algebra is
+    !! reorganised so that it costs about as much as one stock call.
+    !
+    !! The one-center density of the unit vector ijh is
+    !! \(\sum_t a_t Y_{lm_t}(\Omega) F_{s_t}(r)\), where the "terms" t run on the
+    !! allowed LM of the pair, a_t is the Clebsch-Gordan coefficient and
+    !! s=(radial pair nmb, lm) labels a product basis whose radial function F_s
+    !! is pfunc (AE) or ptfunc+aug (PS). In this basis
+    !! \(K = \sum_{tt'} a_t a_{t'} T(s_t,s_{t'})\), with T = Hartree + xc. For xc
+    !! the response potential at a point (r,direction) is a small matrix M (built
+    !! from the ground-state kernel: dmxc, dgcxc, xc_gcx and the gradient of the
+    !! density) times the vector (dn, grad dn); the projection on Y_lm and the
+    !! divergence of the stock routine are linear and are transposed onto the
+    !! left functions (angular tables ax, radial tables rx), so that for every
+    !! radial point only a product of small angular matrices is needed (qk).
+    !
+    USE atom,              ONLY : g => rgrid
+    USE ions_base,         ONLY : nat, ityp, ntyp => nsp
+    USE noncollin_module,  ONLY : nspin_mag
+    USE uspp_param,        ONLY : nh, nhm, upf
+    USE uspp,              ONLY : indv, ap, nhtolm, lpl, lpx
+    USE constants,         ONLY : e2, fpi
+    USE radial_grids,      ONLY : hartree
+    USE xc_lib,            ONLY : xclib_dft_is
+    !
+    REAL(DP), INTENT(IN) :: becsum(nhm*(nhm+1)/2,nat,nspin_mag)
+    !! cross band occupations of the ground state
+    !
+    INTEGER, PARAMETER :: AE = 1, PS = 2
+    INTEGER, PARAMETER :: amap(4) = (/ 1, 2, 3, 3 /) ! radial factor of each component
+    TYPE(paw_info) :: i
+    REAL(DP), POINTER :: rho_core(:)
+    LOGICAL :: lgga
+    INTEGER :: ns, nc, na, nt, ia, ia_s, ia_e, mykey, m, l2, lin2, nx, kkb, npair, nij, nd, &
+               nsb, mxt, kcut, kx, ky, iw, ih, jh, ijh, jjh, nb, mb, nmb, lp, lm, lmp, l, s, sp, &
+               t, tp, is, js, ks, ls, c, cp, a, b, k, kp, ix, ixk, nnz, nthr, ithr, lq
+    REAL(DP) :: sgn, pref, fac, hfac, sg, acc_, gv(3), a3(2,2,2), c3(2,2,2), b4(2,2,2,2)
+    INTEGER,  ALLOCATABLE :: nterm(:), t_s(:,:), sidx(:,:), s_lm(:), s_l(:), s_nb(:), s_mb(:), &
+                             s_nmb(:), inz(:)
+    REAL(DP), ALLOCATABLE :: t_ap(:,:), ff(:,:,:), wsim(:), rx(:,:,:,:), ry(:,:,:,:), aux(:), &
+                             gf(:), vh(:), th(:,:,:), ax(:,:,:), ayp(:,:), ayt(:,:), t2(:,:), &
+                             t3(:,:), rho_lm(:,:,:), fxc(:,:,:), d_rr(:,:,:), d_sr(:,:,:), &
+                             d_ss(:,:,:), d_s(:,:,:), grad(:,:,:), sign_v(:), tt(:,:,:,:), &
+                             tthr(:,:,:,:,:), mk(:,:,:,:,:), tmp(:,:,:,:), qk(:,:,:,:,:,:), &
+                             wv(:,:,:,:,:), rxs(:,:), kt(:,:,:,:)
+#if defined(_OPENMP)
+    INTEGER, EXTERNAL :: omp_get_max_threads, omp_get_thread_num
+#endif
+    !
+    CALL start_clock( 'pawd_setup' )
+    !
+    ns   = nspin_mag
+    lgga = xclib_dft_is('gradient')
+    nc = 1   ! components of the response at a point: dn [, grad dn (r,phi,theta)]
+    na = 1   ! distinct radial factors
+    IF ( lgga ) THEN
+       nc = 4
+       na = 3
+    ENDIF
+    nthr = 1
+#if defined(_OPENMP)
+    nthr = omp_get_max_threads()
+#endif
+    !
+    IF ( ALLOCATED(dk) ) DEALLOCATE( dk )
+    IF ( ALLOCATED(dk_becsum) ) DEALLOCATE( dk_becsum )
+    IF ( ALLOCATED(dk_ityp) ) DEALLOCATE( dk_ityp )
+    ALLOCATE( dk(nat), dk_ityp(nat) )
+    ALLOCATE( dk_becsum(SIZE(becsum,1),nat,nspin_mag) )
+    dk_becsum(:,:,:) = becsum(:,:,:)
+    dk_ityp(1:nat) = ityp(1:nat)
+    dk_gga = lgga
+    DO ia = 1, nat
+       nd = 0
+       IF ( upf(ityp(ia))%tpawp ) nd = ns*nh(ityp(ia))*(nh(ityp(ia))+1)/2
+       ALLOCATE( dk(ia)%k(nd,nd) )
+       dk(ia)%k(:,:) = 0._DP
+    ENDDO
+    !
+    ! ... atoms are distributed among the processes of the image as in the stock routine;
+    ! ... when there are more processes than atoms only the first one of each atom works
+    !
+    CALL block_distribute( nat, me_image, nproc_image, ia_s, ia_e, mykey )
+    IF ( mykey /= 0 ) ia_e = ia_s - 1
+    !
+    types: DO nt = 1, ntyp
+       !
+       IF ( .NOT. upf(nt)%tpawp ) CYCLE types
+       IF ( ia_e < ia_s ) CYCLE types
+       IF ( .NOT. ANY( ityp(ia_s:ia_e) == nt ) ) CYCLE types
+       !
+       i%t = nt
+       i%m = g(nt)%mesh
+       i%b = upf(nt)%nbeta
+       i%l = upf(nt)%lmax_rho + 1
+       m     = i%m
+       l2    = i%l**2
+       nx    = rad(nt)%nx
+       kkb   = upf(nt)%kkbeta
+       npair = i%b*(i%b+1)/2
+       nij   = nh(nt)*(nh(nt)+1)/2
+       ! all the directions are done by this process
+       nx_loc = nx
+       ix_s   = 1
+       ix_e   = nx
+       !
+       ! ... terms of the unit vectors and the product basis s = (nmb,lm)
+       !
+       mxt = MAXVAL( lpx )
+       ALLOCATE( nterm(nij), t_s(mxt,nij), t_ap(mxt,nij), sidx(npair,l2) )
+       ALLOCATE( s_lm(npair*l2), s_l(npair*l2), s_nb(npair*l2), s_mb(npair*l2), s_nmb(npair*l2) )
+       sidx(:,:) = 0
+       nsb = 0
+       ijh = 0
+       DO ih = 1, nh(nt)
+          DO jh = ih, nh(nt)
+             ijh = ijh + 1
+             nb  = indv(ih,nt)
+             mb  = indv(jh,nt)
+             IF ( nb > mb ) CALL errore( 'PAW_dk_setup', 'unexpected order of the projectors', ijh )
+             nmb = (mb*(mb-1))/2 + nb
+             nterm(ijh) = lpx(nhtolm(jh,nt),nhtolm(ih,nt))
+             DO lp = 1, nterm(ijh)
+                lm = lpl(nhtolm(jh,nt),nhtolm(ih,nt),lp)
+                IF ( lm > l2 ) CALL errore( 'PAW_dk_setup', 'angular momentum out of range', lm )
+                IF ( sidx(nmb,lm) == 0 ) THEN
+                   nsb = nsb + 1
+                   sidx(nmb,lm) = nsb
+                   s_lm(nsb)  = lm
+                   s_l(nsb)   = INT( SQRT(DBLE(lm-1)) )  ! l starts from zero, lm = l**2+m
+                   s_nb(nsb)  = nb
+                   s_mb(nsb)  = mb
+                   s_nmb(nsb) = nmb
+                ENDIF
+                t_s(lp,ijh)  = sidx(nmb,lm)
+                t_ap(lp,ijh) = ap(lm,nhtolm(ih,nt),nhtolm(jh,nt))
+             ENDDO
+          ENDDO
+       ENDDO
+       !
+       ! ... radial functions of the basis (they contain r^2, as pfunc does)
+       !
+       ALLOCATE( ff(m,nsb,2), wsim(m), aux(m), gf(m), vh(m), inz(m) )
+       lq = UBOUND( upf(nt)%qfuncl, 3 )
+       DO s = 1, nsb
+          ff(1:m,s,AE) = upf(nt)%paw%pfunc(1:m,s_nb(s),s_mb(s))
+          ff(1:m,s,PS) = upf(nt)%paw%ptfunc(1:m,s_nb(s),s_mb(s))
+          IF ( s_l(s) <= lq ) ff(1:m,s,PS) = ff(1:m,s,PS) + upf(nt)%qfuncl(1:m,s_nmb(s),s_l(s))
+       ENDDO
+       !
+       ! ... weights of the radial integration (simpson is linear in the integrand)
+       !
+       wsim(:) = 0._DP
+       aux(:)  = 0._DP
+       DO k = 1, kkb
+          aux(k) = 1._DP
+          CALL simpson( kkb, aux, g(nt)%rab, wsim(k) )
+          aux(k) = 0._DP
+       ENDDO
+       !
+       ! ... radial tables. Right functions ry: dn = F/r^2, its radial derivative, F/r^3 (the
+       ! ... radial part of the angular derivatives). Left functions rx: w F, the transposed
+       ! ... radial derivative applied to w F/r^2, w F/r^3.
+       !
+       ALLOCATE( rx(m,na,nsb,2), ry(m,na,nsb,2) )
+       DO iw = AE, PS
+          DO s = 1, nsb
+             ry(1:m,1,s,iw) = ff(1:m,s,iw)*g(nt)%rm2(1:m)
+             rx(1:m,1,s,iw) = ff(1:m,s,iw)*wsim(1:m)
+             IF ( lgga ) THEN
+                CALL radial_gradient( ry(1:m,1,s,iw), ry(1:m,2,s,iw), g(nt)%r, m, radial_grad_style )
+                ry(1:m,3,s,iw) = ff(1:m,s,iw)*g(nt)%rm3(1:m)
+                rx(1:m,3,s,iw) = ff(1:m,s,iw)*g(nt)%rm3(1:m)*wsim(1:m)
+             ENDIF
+          ENDDO
+       ENDDO
+       IF ( lgga ) THEN
+          ! column kp of the matrix of radial_gradient is its action on the unit vector kp
+          !$omp parallel default(shared) private(kp,k,t,nnz,iw,s,acc_,aux,gf,inz)
+          aux(:) = 0._DP
+          !$omp do schedule(static)
+          DO kp = 1, m
+             aux(kp) = 1._DP
+             CALL radial_gradient( aux, gf, g(nt)%r, m, radial_grad_style )
+             aux(kp) = 0._DP
+             nnz = 0
+             DO k = 1, kkb
+                IF ( gf(k) /= 0._DP ) THEN
+                   nnz = nnz + 1
+                   inz(nnz) = k
+                ENDIF
+             ENDDO
+             DO iw = AE, PS
+                DO s = 1, nsb
+                   acc_ = 0._DP
+                   DO t = 1, nnz
+                      k = inz(t)
+                      acc_ = acc_ + gf(k)*wsim(k)*ry(k,1,s,iw)
+                   ENDDO
+                   rx(kp,2,s,iw) = acc_
+                ENDDO
+             ENDDO
+          ENDDO
+          !$omp end do
+          !$omp end parallel
+       ENDIF
+       ! radial points beyond kcut do not contribute
+       kx = 0
+       ky = 0
+       DO k = 1, m
+          IF ( ANY( rx(k,:,:,:) /= 0._DP ) ) kx = k
+          IF ( ANY( ry(k,:,:,:) /= 0._DP ) ) ky = k
+       ENDDO
+       kcut = MIN( kx, ky )
+       !
+       ! ... Hartree: diagonal in lm and in the spin-summed density
+       !
+       ALLOCATE( th(nsb,nsb,2) )
+       th(:,:,:) = 0._DP
+       DO iw = AE, PS
+          DO sp = 1, nsb
+             l = s_l(sp)
+             pref = e2*fpi/DBLE(2*l+1)
+             aux(1:m) = pref*ff(1:m,sp,iw)
+             CALL hartree( l, 2*l+2, m, g(nt), aux, vh )
+             DO s = 1, nsb
+                IF ( s_lm(s) /= s_lm(sp) ) CYCLE
+                acc_ = 0._DP
+                DO k = 1, kkb
+                   acc_ = acc_ + rx(k,1,s,iw)*vh(k)
+                ENDDO
+                th(s,sp,iw) = acc_
+             ENDDO
+          ENDDO
+       ENDDO
+       aux(:) = 0._DP
+       !
+       ! ... angular tables. Right functions: Y_lm for dn and its radial derivative, dY/dphi and
+       ! ... dY/dtheta (without lm=1, as in PAW_gradient). Left functions ax: w Y_lm for the
+       ! ... scalar part and the radial component of the vector field h; for its phi and theta
+       ! ... components the transposed of PAW_rad2lm3 + PAW_divergence + PAW_rad2lm.
+       !
+       ALLOCATE( ax(nx,l2,nc) )
+       ax(1:nx,1:l2,1) = rad(nt)%wwylm(1:nx,1:l2)
+       IF ( lgga ) THEN
+          lin2 = (i%l + rad(nt)%ladd)**2
+          ALLOCATE( ayp(nx,l2), ayt(nx,l2), t2(l2,lin2), t3(l2,lin2) )
+          ayp(1:nx,1:l2) = rad(nt)%dylmp(1:nx,1:l2)
+          ayt(1:nx,1:l2) = rad(nt)%dylmt(1:nx,1:l2)
+          ayp(:,1) = 0._DP
+          ayt(:,1) = 0._DP
+          t2(:,:) = 0._DP
+          t3(:,:) = 0._DP
+          DO lmp = 1, lin2
+             DO lm = 1, l2
+                DO ix = 1, nx
+                   IF ( lmp > 1 ) t2(lm,lmp) = t2(lm,lmp) + rad(nt)%wwylm(ix,lm)*rad(nt)%dylmp(ix,lmp)
+                   t3(lm,lmp) = t3(lm,lmp) + rad(nt)%wwylm(ix,lm) * &
+                                ( rad(nt)%dylmt(ix,lmp)*rad(nt)%sin_th(ix) + &
+                                  2.0_DP*rad(nt)%ylm(ix,lmp)*rad(nt)%cos_th(ix) )
+                ENDDO
+             ENDDO
+          ENDDO
+          ax(1:nx,1:l2,2) = rad(nt)%wwylm(1:nx,1:l2)
+          ax(:,:,3:4) = 0._DP
+          DO lm = 1, l2
+             DO lmp = 1, lin2
+                DO ix = 1, nx
+                   ax(ix,lm,3) = ax(ix,lm,3) + rad(nt)%wwylm(ix,lmp)*t2(lm,lmp)
+                   ax(ix,lm,4) = ax(ix,lm,4) + rad(nt)%wwylm(ix,lmp)*t3(lm,lmp)
+                ENDDO
+             ENDDO
+             ax(1:nx,lm,4) = ax(1:nx,lm,4)/rad(nt)%sin_th(1:nx)
+          ENDDO
+          DEALLOCATE( t2, t3 )
+       ENDIF
+       !
+       ALLOCATE( rho_lm(m,l2,ns), fxc(m*nx,ns,ns), d_rr(m*nx,ns,ns), d_sr(m*nx,ns,ns), &
+                 d_ss(m*nx,ns,ns), d_s(m*nx,ns,ns), grad(m*nx,3,ns), sign_v(m*nx) )
+       ALLOCATE( tt(nsb,ns,nsb,ns), tthr(nsb,ns,nsb,ns,0:nthr-1), kt(nsb,ns,nij,ns) )
+       !
+       atoms: DO ia = ia_s, ia_e
+          !
+          IF ( ityp(ia) /= nt ) CYCLE atoms
+          i%a = ia
+          tt(:,:,:,:) = 0._DP
+          !
+          whattodo: DO iw = AE, PS
+             !
+             ! ... ground state: density and xc kernel on the radial grid, as in the stock routine
+             !
+             NULLIFY( rho_core )
+             IF ( iw == AE ) THEN
+                CALL PAW_rho_lm( i, becsum, upf(nt)%paw%pfunc, rho_lm )
+                rho_core => upf(nt)%paw%ae_rho_atc
+                sgn = +1._DP
+             ELSE
+                CALL PAW_rho_lm( i, becsum, upf(nt)%paw%ptfunc, rho_lm, upf(nt)%qfuncl )
+                rho_core => upf(nt)%rho_atc
+                sgn = -1._DP
+             ENDIF
+             CALL PAW_dxc_kernel( i, rho_lm, rho_core, lgga, fxc, d_rr, d_sr, d_ss, d_s, grad, sign_v )
+             !
+             tthr(:,:,:,:,:) = 0._DP
+             !
+             !$omp parallel default(shared) private(ithr,mk,tmp,qk,wv,rxs,k,ix,ixk,is,js,ks,ls,c,cp, &
+             !$omp                                  a,b,s,sp,lm,lmp,sg,fac,hfac,acc_,gv,a3,c3,b4)
+             ithr = 0
+#if defined(_OPENMP)
+             ithr = omp_get_thread_num()
+#endif
+             ALLOCATE( mk(nx,nc,ns,nc,ns), tmp(nx,l2,na,ns), qk(l2,l2,na,ns,na,ns), wv(nsb,ns,l2,na,ns), &
+                       rxs(nsb,na) )
+             !$omp do schedule(static)
+             DO k = 1, kcut
+                !
+                ! ... mk(ix,c,is,cp,js): component c, spin is of the response (c=1: potential
+                ! ... dv, c=2..4: the vector field h, with the factor -e2 of -div h) per unit
+                ! ... component cp, spin js of (dn, grad dn) in direction ix
+                !
+                IF ( .NOT. lgga ) THEN
+                   DO js = 1, ns
+                      DO is = 1, ns
+                         DO ix = 1, nx
+                            mk(ix,1,is,1,js) = fxc((ix-1)*m+k,is,js)
+                         ENDDO
+                      ENDDO
+                   ENDDO
+                ELSEIF ( ns == 1 ) THEN
+                   DO ix = 1, nx
+                      ixk  = (ix-1)*m + k
+                      sg   = sign_v(ixk)
+                      gv(1:3) = grad(ixk,1:3,1)
+                      fac  = e2*d_sr(ixk,1,1)*sg
+                      hfac = -e2*g(nt)%r2(k)*sg
+                      mk(ix,1,1,1,1) = fxc(ixk,1,1) + e2*d_rr(ixk,1,1)*sg
+                      DO cp = 1, 3
+                         mk(ix,1,1,1+cp,1) = fac*gv(cp)
+                         mk(ix,1+cp,1,1,1) = hfac*d_sr(ixk,1,1)*gv(cp)
+                      ENDDO
+                      DO cp = 1, 3
+                         DO c = 1, 3
+                            mk(ix,1+c,1,1+cp,1) = hfac*d_ss(ixk,1,1)*gv(c)*gv(cp)
+                         ENDDO
+                         mk(ix,1+cp,1,1+cp,1) = mk(ix,1+cp,1,1+cp,1) + hfac*d_s(ixk,1,1)
+                      ENDDO
+                   ENDDO
+                ELSE
+                   DO ix = 1, nx
+                      ixk  = (ix-1)*m + k
+                      hfac = -e2*g(nt)%r2(k)
+                      ! the tables a, b, c of PAW_dgcxc_potential
+                      DO is = 1, 2
+                         DO js = 1, 2
+                            DO ks = 1, 2
+                               IF ( is==js .AND. js==ks ) THEN
+                                  a3(is,js,ks) = d_sr(ixk,is,is)
+                                  c3(is,js,ks) = d_sr(ixk,is,is)
+                               ELSE
+                                  IF ( is==1 ) THEN
+                                     a3(is,js,ks) = d_sr(ixk,1,2)
+                                  ELSE
+                                     a3(is,js,ks) = d_sr(ixk,2,1)
+                                  ENDIF
+                                  IF ( js==1 ) THEN
+                                     c3(is,js,ks) = d_sr(ixk,1,2)
+                                  ELSE
+                                     c3(is,js,ks) = d_sr(ixk,2,1)
+                                  ENDIF
+                               ENDIF
+                               DO ls = 1, 2
+                                  IF ( is==js .AND. js==ks .AND. ks==ls ) THEN
+                                     b4(is,js,ks,ls) = d_ss(ixk,is,is)
+                                  ELSE
+                                     IF ( is==1 ) THEN
+                                        b4(is,js,ks,ls) = d_ss(ixk,1,2)
+                                     ELSE
+                                        b4(is,js,ks,ls) = d_ss(ixk,2,1)
+                                     ENDIF
+                                  ENDIF
+                               ENDDO
+                            ENDDO
+                         ENDDO
+                      ENDDO
+                      ! is: spin of the response; ks (js for dn): spin of the perturbing density
+                      DO ks = 1, 2
+                         DO is = 1, 2
+                            ! dv <- dn
+                            mk(ix,1,is,1,ks) = fxc(ixk,is,ks) + e2*d_rr(ixk,is,ks)
+                            DO cp = 1, 3
+                               ! dv <- grad dn: sum_js a(is,js,ks) grad_js . dgrad_ks
+                               mk(ix,1,is,1+cp,ks) = e2*( a3(is,1,ks)*grad(ixk,cp,1) + &
+                                                          a3(is,2,ks)*grad(ixk,cp,2) )
+                               ! h <- dn: sum_ls c(is,ks,ls) dn_ks grad_ls
+                               mk(ix,1+cp,is,1,ks) = hfac*( c3(is,ks,1)*grad(ixk,cp,1) + &
+                                                            c3(is,ks,2)*grad(ixk,cp,2) )
+                            ENDDO
+                            ! h <- grad dn: sum_js,ls b(is,js,ks,ls) (grad_js . dgrad_ks) grad_ls
+                            DO cp = 1, 3
+                               DO c = 1, 3
+                                  acc_ = 0._DP
+                                  DO ls = 1, 2
+                                     DO js = 1, 2
+                                        acc_ = acc_ + b4(is,js,ks,ls)*grad(ixk,cp,js)*grad(ixk,c,ls)
+                                     ENDDO
+                                  ENDDO
+                                  mk(ix,1+c,is,1+cp,ks) = hfac*acc_
+                               ENDDO
+                               mk(ix,1+cp,is,1+cp,ks) = mk(ix,1+cp,is,1+cp,ks) + hfac*d_s(ixk,is,ks)
+                            ENDDO
+                         ENDDO
+                      ENDDO
+                   ENDDO
+                ENDIF
+                !
+                ! ... qk(lm,lmp,b,js,a,is) = sum_ix ax(ix,lm,c) mk(ix,c,is,cp,js) ay(ix,lmp,cp),
+                ! ... summed on the components c (cp) that share the radial factor a (b)
+                !
+                DO is = 1, ns
+                   DO c = 1, nc
+                      DO js = 1, ns
+                         DO lmp = 1, l2
+                            DO ix = 1, nx
+                               tmp(ix,lmp,1,js) = mk(ix,c,is,1,js)*rad(nt)%ylm(ix,lmp)
+                            ENDDO
+                            IF ( lgga ) THEN
+                               DO ix = 1, nx
+                                  tmp(ix,lmp,2,js) = mk(ix,c,is,2,js)*rad(nt)%ylm(ix,lmp)
+                                  tmp(ix,lmp,3,js) = mk(ix,c,is,3,js)*ayp(ix,lmp) + &
+                                                     mk(ix,c,is,4,js)*ayt(ix,lmp)
+                               ENDDO
+                            ENDIF
+                         ENDDO
+                      ENDDO
+                      fac = 0._DP
+                      IF ( c == 4 ) fac = 1._DP
+                      CALL DGEMM( 'T', 'N', l2, l2*na*ns, nx, 1._DP, ax(1,1,c), nx, tmp, nx, &
+                                  fac, qk(1,1,1,1,amap(c),is), l2 )
+                   ENDDO
+                ENDDO
+                !
+                ! ... contraction with the radial functions at this radial point
+                !
+                DO a = 1, na
+                   DO s = 1, nsb
+                      rxs(s,a) = rx(k,a,s,iw)
+                   ENDDO
+                ENDDO
+                ! ... right functions: wv(sp,js,lm,a,is) = sum_b ry(k,b,sp) qk(lm,lm(sp),b,js,a,is)
+                DO is = 1, ns
+                   DO a = 1, na
+                      DO js = 1, ns
+                         DO sp = 1, nsb
+                            lmp = s_lm(sp)
+                            DO lm = 1, l2
+                               acc_ = 0._DP
+                               DO b = 1, na
+                                  acc_ = acc_ + ry(k,b,sp,iw)*qk(lm,lmp,b,js,a,is)
+                               ENDDO
+                               wv(sp,js,lm,a,is) = acc_
+                            ENDDO
+                         ENDDO
+                      ENDDO
+                   ENDDO
+                ENDDO
+                ! ... left functions: tthr(sp,js,s,is) += sum_a rx(k,a,s) wv(sp,js,lm(s),a,is)
+                DO is = 1, ns
+                   DO s = 1, nsb
+                      lm = s_lm(s)
+                      DO a = 1, na
+                         fac = rxs(s,a)
+                         DO js = 1, ns
+                            DO sp = 1, nsb
+                               tthr(sp,js,s,is,ithr) = tthr(sp,js,s,is,ithr) + fac*wv(sp,js,lm,a,is)
+                            ENDDO
+                         ENDDO
+                      ENDDO
+                   ENDDO
+                ENDDO
+                !
+             ENDDO
+             !$omp end do
+             DEALLOCATE( mk, tmp, qk, wv, rxs )
+             !$omp end parallel
+             !
+             ! ... threads are summed in a fixed order; Hartree is the same for all spin pairs
+             !
+             DO ithr = 0, nthr-1
+                tt(:,:,:,:) = tt(:,:,:,:) + sgn*tthr(:,:,:,:,ithr)
+             ENDDO
+             DO is = 1, ns
+                DO s = 1, nsb
+                   DO js = 1, ns
+                      tt(:,js,s,is) = tt(:,js,s,is) + sgn*th(s,:,iw)
+                   ENDDO
+                ENDDO
+             ENDDO
+             !
+          ENDDO whattodo
+          !
+          ! ... from the product basis to the pairs ijh: K = sum_tt' a_t a_t' T(s_t,s_t')
+          !
+          ! ... (tt and kt have the right index first: tt(sp,js,s,is), kt(sp,js,ijh,is))
+          !
+          kt(:,:,:,:) = 0._DP
+          DO is = 1, ns
+             DO ijh = 1, nij
+                DO t = 1, nterm(ijh)
+                   kt(:,:,ijh,is) = kt(:,:,ijh,is) + t_ap(t,ijh)*tt(:,:,t_s(t,ijh),is)
+                ENDDO
+             ENDDO
+          ENDDO
+          DO js = 1, ns
+             DO jjh = 1, nij
+                DO tp = 1, nterm(jjh)
+                   DO is = 1, ns
+                      DO ijh = 1, nij
+                         dk(ia)%k((is-1)*nij+ijh,(js-1)*nij+jjh) = dk(ia)%k((is-1)*nij+ijh,(js-1)*nij+jjh) &
+                                                     + t_ap(tp,jjh)*kt(t_s(tp,jjh),js,ijh,is)
+                      ENDDO
+                   ENDDO
+                ENDDO
+             ENDDO
+          ENDDO
+          !
+       ENDDO atoms
+       !
+       DEALLOCATE( nterm, t_s, t_ap, sidx, s_lm, s_l, s_nb, s_mb, s_nmb )
+       DEALLOCATE( ff, wsim, aux, gf, vh, inz, rx, ry, th, ax )
+       IF ( lgga ) DEALLOCATE( ayp, ayt )
+       DEALLOCATE( rho_lm, fxc, d_rr, d_sr, d_ss, d_s, grad, sign_v, tt, tthr, kt )
+       !
+    ENDDO types
+    !
+#if defined(__MPI)
+    IF ( nproc_image > 1 ) THEN
+       DO ia = 1, nat
+          IF ( SIZE(dk(ia)%k) > 0 ) CALL mp_sum( dk(ia)%k, intra_image_comm )
+       ENDDO
+    ENDIF
+#endif
+    !
+    CALL stop_clock( 'pawd_setup' )
+    !
+  END SUBROUTINE PAW_dk_setup
+  !
+  !
+  !---------------------------------------------------------------------------------
+  SUBROUTINE PAW_dxc_kernel( i, rho_lm, rho_core, lgga, fxc, d_rr, d_sr, d_ss, d_s, grad, sign_v )
+    !---------------------------------------------------------------------------------
+    !! Ground-state quantities that enter the xc response potential, on the points
+    !! (radial mesh x directions) of one atom: the part of
+    !! \(\texttt{PAW_dxc_potential}\) and \(\texttt{PAW_dgcxc_potential}\) that
+    !! does not depend on the perturbation, done with the same calls so that the
+    !! numbers are the same. Collinear cases only (nspin_mag = 1 or 2).
+    !
+    USE noncollin_module,  ONLY : nspin_mag, nspin_gga
+    USE atom,              ONLY : g => rgrid
+    USE constants,         ONLY : e2, eps => eps12, eps2 => eps24
+    USE xc_lib,            ONLY : xclib_set_threshold, xc_gcx, dgcxc, dmxc
+    !
+    TYPE(paw_info), INTENT(IN) :: i
+    !! atom's minimal info
+    REAL(DP), INTENT(IN) :: rho_lm(i%m,i%l**2,nspin_mag)
+    !! charge density as lm components
+    REAL(DP), INTENT(IN) :: rho_core(i%m)
+    !! core charge, radial and spherical
+    LOGICAL, INTENT(IN) :: lgga
+    !! gradient-corrected functional: the arrays below fxc are computed
+    REAL(DP), INTENT(OUT) :: fxc(i%m*nx_loc,nspin_mag,nspin_mag)
+    !! dmxc
+    REAL(DP), INTENT(OUT) :: d_rr(i%m*nx_loc,nspin_mag,nspin_mag)
+    REAL(DP), INTENT(OUT) :: d_sr(i%m*nx_loc,nspin_mag,nspin_mag)
+    REAL(DP), INTENT(OUT) :: d_ss(i%m*nx_loc,nspin_mag,nspin_mag)
+    !! dgcxc, divided by e2
+    REAL(DP), INTENT(OUT) :: d_s(i%m*nx_loc,nspin_mag,nspin_mag)
+    !! v2x + v2c of xc_gcx (dsvxc_s of the stock routine)
+    REAL(DP), INTENT(OUT) :: grad(i%m*nx_loc,3,nspin_mag)
+    !! gradient of the density (r, phi, theta)
+    REAL(DP), INTENT(OUT) :: sign_v(i%m*nx_loc)
+    !! 0 where the stock routine drops the gradient correction (nspin_mag=1), else 1
+    !
+    REAL(DP), ALLOCATABLE :: rho_rad(:,:), grad2(:,:), gradsw(:,:,:), r(:,:)
+    REAL(DP), ALLOCATABLE :: sx(:), sc(:), v1x(:,:), v2x(:,:), v1c(:,:), v2c(:,:), v2c_ud(:)
+    INTEGER :: ix, k, ixk, im_sum
+    !
+    im_sum = i%m*nx_loc
+    !
+    ALLOCATE( rho_rad(im_sum,nspin_mag) )
+    !
+    !$acc data copyin( rho_lm, rho_core ) copyout( fxc ) create( rho_rad )
+    !$acc data copyin( rad(i%t:i%t), rad(i%t)%ylm )
+    !$acc data copyin( g(i%t:i%t), g(i%t)%rm2, g(i%t)%rm3 )
+    !
+    CALL PAW_lm2rad( i, rho_lm(:,:,1:nspin_mag), rho_rad(:,1:nspin_mag), nspin_mag )
+    !
+    !$acc parallel loop collapse(2) present(g(i%t:i%t))
+    DO ix = ix_s, ix_e
+       DO k = 1, i%m
+         !
+         ixk = (ix-ix_s)*i%m+k
+         !
+         rho_rad(ixk,1:nspin_mag) = rho_rad(ixk,1:nspin_mag)*g(i%t)%rm2(k)
+         !
+         IF (nspin_mag/=2) THEN
+            rho_rad(ixk,1) = rho_rad(ixk,1) + rho_core(k)
+         ELSE
+            rho_rad(ixk,1) = rho_rad(ixk,1) + 0.5_DP*rho_core(k)
+            rho_rad(ixk,2) = rho_rad(ixk,2) + 0.5_DP*rho_core(k)
+         ENDIF
+         !
+       ENDDO
+    ENDDO
+    !
+    CALL dmxc( im_sum, nspin_mag, rho_rad(:,1:nspin_mag), fxc )
+    !
+    IF ( lgga ) THEN
+       !
+       ALLOCATE( grad2(im_sum,nspin_gga), gradsw(3,im_sum,nspin_gga), r(im_sum,nspin_gga) )
+       ALLOCATE( sx(im_sum), sc(im_sum), v1x(im_sum,nspin_gga), v2x(im_sum,nspin_gga) )
+       ALLOCATE( v1c(im_sum,nspin_gga), v2c(im_sum,nspin_gga), v2c_ud(im_sum) )
+       !
+       !$acc data copyin( rad(i%t:i%t), rad(i%t)%dylmt, rad(i%t)%dylmp )
+       !$acc data copyout( d_rr, d_sr, d_ss, d_s, grad, sign_v ) &
+       !$acc&     create( grad2, gradsw, r, sx, sc, v1x, v2x, v1c, v2c, v2c_ud )
+       !
+       CALL PAW_lm2rad( i, rho_lm, rho_rad, nspin_gga )
+       CALL PAW_gradient( i, rho_lm, rho_rad, rho_core, grad, grad2 )
+       !
+       !$acc kernels
+       sign_v = 1._DP
+       !$acc end kernels
+       !
+       IF ( nspin_mag == 1 ) THEN
+          !
+          !$acc parallel loop collapse(2) present(g(i%t:i%t))
+          DO ix = ix_s, ix_e
+             DO k = 1, i%m
+                ixk = (ix-ix_s)*i%m+k
+                ! ... arho_v is the absolute value of real charge, sgn is its sign
+                r(ixk,1) = ABS( rho_rad(ixk,1)*g(i%t)%rm2(k) + rho_core(k) )
+                !
+                ! ... using grad(rho)**2 here, so its eps has to be eps**2
+                IF ( r(ixk,1)<eps .OR. grad2(ixk,1)<eps2 ) THEN
+                   r(ixk,1) = 0.5_DP
+                   grad2(ixk,1) = 0.2_DP
+                   sign_v(ixk)  = 0.0_DP
+                ENDIF
+                ! ... swap gradient indexes to match xc_gcx input (temporary)
+                gradsw(1:3,ixk,1) = grad(ixk,1:3,1)
+             ENDDO
+          ENDDO
+          !
+          CALL xclib_set_threshold( 'gga', 1.E-10_DP )
+          !
+          CALL dgcxc( im_sum, nspin_mag, r, grad, d_rr, d_sr, d_ss, gpu_args_=.TRUE. )
+          !
+          !$acc kernels
+          d_rr = d_rr / e2
+          d_sr = d_sr / e2
+          d_ss = d_ss / e2
+          !$acc end kernels
+          !
+          CALL xc_gcx( im_sum, nspin_mag, r, gradsw, sx, sc, v1x, v2x, v1c, v2c, gpu_args_=.TRUE. )
+          !
+          CALL xclib_set_threshold( 'gga', 1.D-6 )
+          !
+          !$acc parallel loop
+          DO ixk = 1, im_sum
+             d_s(ixk,1,1) = v2x(ixk,1) + v2c(ixk,1)
+          ENDDO
+          !
+       ELSE
+          !
+          ! ... rho_core is considered half spin up and half spin down
+          !
+          !$acc parallel loop collapse(2) present(g(i%t:i%t))
+          DO ix = ix_s, ix_e
+             DO k = 1, i%m
+               ixk = (ix-ix_s)*i%m+k
+               r(ixk,1) = rho_rad(ixk,1)*g(i%t)%rm2(k) + rho_core(k)/DBLE(nspin_gga)
+               r(ixk,2) = rho_rad(ixk,2)*g(i%t)%rm2(k) + rho_core(k)/DBLE(nspin_gga)
+               !
+               ! ... swap gradient indexes to match xc_gcx input (temporary)
+               gradsw(1:3,ixk,1) = grad(ixk,1:3,1)
+               gradsw(1:3,ixk,2) = grad(ixk,1:3,2)
+             ENDDO
+          ENDDO
+          !
+          CALL dgcxc( im_sum, nspin_gga, r, grad, d_rr, d_sr, d_ss, gpu_args_=.TRUE. )
+          !
+          !$acc kernels
+          d_rr = d_rr / e2
+          d_sr = d_sr / e2
+          d_ss = d_ss / e2
+          !$acc end kernels
+          !
+          CALL xc_gcx( im_sum, nspin_gga, r, gradsw, sx, sc, v1x, v2x, v1c, v2c, v2c_ud, gpu_args_=.TRUE. )
+          !
+          !$acc parallel loop
+          DO ixk = 1, im_sum
+             IF ( r(ixk,1)+r(ixk,2) > eps ) THEN
+                d_s(ixk,1,1) = v2x(ixk,1) + v2c(ixk,1)
+                d_s(ixk,1,2) = v2c_ud(ixk)
+                d_s(ixk,2,1) = v2c_ud(ixk)
+                d_s(ixk,2,2) = v2x(ixk,2) + v2c(ixk,2)
+             ELSE
+                d_s(ixk,1,1) = 0.d0
+                d_s(ixk,1,2) = 0.d0
+                d_s(ixk,2,1) = 0.d0
+                d_s(ixk,2,2) = 0.d0
+             ENDIF
+          ENDDO
+          !
+       ENDIF
+       !
+       !$acc end data
+       !$acc end data
+       !
+       DEALLOCATE( grad2, gradsw, r, sx, sc, v1x, v2x, v1c, v2c, v2c_ud )
+       !
+    ENDIF
+    !
+    !$acc end data
+    !$acc end data
+    !$acc end data
+    !
+    DEALLOCATE( rho_rad )
+    !
+  END SUBROUTINE PAW_dxc_kernel
+  !
+  !
+  !---------------------------------------------------------------------------------
+  SUBROUTINE PAW_dpotential_stock( dbecsum, becsum, int3, npe )
+    !---------------------------------------------------------------------------------
+    !! Computes dV_h and dV_xc using the "change of density" dbecsum provided.
+    !! Update the change of the descreening coefficients:
+    !! $$ D_{ij}=\int dv_{H_{xc}} p_{ij}-\int dvt_{H_{xc}}(pt_{ij}+\text{augfun}_{ij}) $$
+    !! Original routine: one evaluation of the response potential per call.
     !
     USE atom,              ONLY : g => rgrid
     USE ions_base,         ONLY : nat, ityp
@@ -1611,6 +2517,7 @@ MODULE paw_onecenter
              ! Compute the change of the charge density. Complex because the
              ! displacements might be complex
              !
+             CALL start_clock('pawd_a')
              DO ipert = 1, npe
                 IF (i_what == AE) THEN
                    becfake(:,ia,:) = DBLE(dbecsum(:,ia,:,ipert))
@@ -1625,12 +2532,14 @@ MODULE paw_onecenter
                 ENDIF
              ENDDO
              !
+             CALL stop_clock('pawd_a')
              savedvr_lm(:,:,:,:) = 0._DP
              savedvi_lm(:,:,:,:) = 0._DP
              !
              DO ipert = 1, npe
                 ! Change of Hartree potential
                 !
+                CALL start_clock('pawd_h')
                 CALL PAW_h_potential( i, drhor_lm(1,1,1,ipert), dv_lm(:,:,1) )
                 DO is = 1,nspin_lsda 
                    savedvr_lm(:,:,is,ipert) = dv_lm(:,:,1)
@@ -1643,6 +2552,8 @@ MODULE paw_onecenter
                 !
                 ! Change of Exchange-correlation potential
                 !
+                CALL stop_clock('pawd_h')
+                CALL start_clock('pawd_xc')
                 CALL PAW_dxc_potential( i, drhor_lm(1,1,1,ipert), &
                                         rho_lm, rho_core, dv_lm )
                 savedvr_lm(:,:,:,ipert) = savedvr_lm(:,:,:,ipert) + dv_lm(:,:,:)
@@ -1650,9 +2561,11 @@ MODULE paw_onecenter
                 CALL PAW_dxc_potential( i, drhoi_lm(1,1,1,ipert), &
                                         rho_lm, rho_core, dv_lm )
                 savedvi_lm(:,:,:,ipert) = savedvi_lm(:,:,:,ipert) + dv_lm(:,:,:)
+                CALL stop_clock('pawd_xc')
              ENDDO
              !
              !
+             CALL start_clock('pawd_pair')
              spins: DO is = 1, nspin_mag
                 nmb = 0
                 ! loop on all pfunc for this kind of pseudo
@@ -1691,6 +2604,7 @@ MODULE paw_onecenter
                    ENDDO ! mb
                 ENDDO ! nb
              ENDDO spins
+             CALL stop_clock('pawd_pair')
           ENDDO whattodo
           !
           ! cleanup
@@ -1714,7 +2628,7 @@ MODULE paw_onecenter
     !
     CALL stop_clock( 'PAW_dpot' )
     !
-  END SUBROUTINE PAW_dpotential
+  END SUBROUTINE PAW_dpotential_stock
   !
   !
   !-----------------------------------------------------------------------------

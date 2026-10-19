@@ -125,6 +125,7 @@ hubbard.o \
 init_ns.o \
 init_q_aeps.o \
 init_run.o \
+beta_cache.o \
 init_us_2.o \
 init_vloc.o \
 input.o \

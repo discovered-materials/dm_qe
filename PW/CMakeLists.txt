@@ -112,6 +112,7 @@ set(src_pw
    src/init_ns.f90 
    src/init_q_aeps.f90 
    src/init_run.f90 
+   src/beta_cache.f90
    src/init_us_2.f90 
    src/init_vloc.f90 
    src/input.f90 
