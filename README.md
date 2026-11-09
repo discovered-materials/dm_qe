@@ -5,6 +5,8 @@ hybrid functionals (HSE06 and PBE0) and to `ph.x`. [`gpu-quickstart/`](gpu-quick
 is how to build and run it on NVIDIA GPUs, with a first calculation to compare against. This fork
 is under active development, so expect the code and these numbers to change as the work continues.
 
+## Speedups
+
 Here's a summary of the speedups we've shown for `ph.x`:
 
 | case | what is computed | stock CPU | stock GPU | optimized | vs stock GPU | vs stock CPU |
@@ -24,9 +26,7 @@ Here's a summary of the speedups we've shown for `ph.x`:
 | `si216_nc_gamma` | 216-atom Si, 2 modes | 1806 | 384.0 | 32.2 | 11.9x | 56x |
 | **geometric mean speedup** | 13 cases (12 with a CPU reference) | | | | **36x** | **14x** |
 
-Speedups observed across benchmarks for phonon (DFPT) calculations. The silicon example in
-`gpu-quickstart/` is a small `ph.x` case you can reproduce yourself, with reference results and
-times.
+Speedups observed across benchmarks for phonon (DFPT) calculations.
 
 Here's a summary of the speedups on hybrid functional calculations:
 
@@ -45,4 +45,54 @@ Here's a summary of the speedups on hybrid functional calculations:
 
 Speedups observed across benchmarks for hybrid functional calculations.
 
-Upstream Quantum ESPRESSO's README is in [`QE_README.md`](QE_README.md).
+## Getting started
+
+[`gpu-quickstart/`](gpu-quickstart/README.md) covers the machine, the toolchain (NVIDIA HPC SDK
+25.9), the build and a first calculation with reference results. In short, on an Ubuntu 22.04
+machine with an NVIDIA GPU and driver:
+
+```bash
+cd gpu-quickstart
+sudo cloud/setup_node.sh                            # the toolchain (or use cloud/Dockerfile)
+scripts/build.sh .. build/gpu gpu                   # pw.x and ph.x in build/gpu/bin
+scripts/run_gpu.sh build/gpu pw pw.in -o pw.out     # one MPI rank per GPU
+scripts/run_gpu.sh build/gpu ph ph.in -o ph.out
+```
+
+## Switching the accelerations off
+
+The GPU code paths can be switched off from the environment, so results can be compared with stock
+Quantum ESPRESSO using the same binary: `QE_PH_DEV=0` runs the stock `ph.x` routines and
+`QE_EXX_FAST=0` the original exact-exchange operator of `pw.x`. The finer `ph.x` switches are
+listed in [`gpu-quickstart/README.md`](gpu-quickstart/README.md#switches).
+
+## What runs on the GPU
+
+- `ph.x`: collinear calculations with norm-conserving, ultrasoft or PAW pseudopotentials,
+  insulators and metals, at any q. Noncollinear magnetism and spin-orbit, DFT+U and FFT grids
+  distributed over MPI ranks run the stock routines. Use one GPU per MPI process.
+- Hybrid functionals in `pw.x`: the batched exchange operator serves collinear k-point runs on one
+  band group with an undistributed FFT grid; other runs use the existing GPU routines of Quantum
+  ESPRESSO.
+
+## Contributing
+
+Bug reports, questions and pull requests about the GPU work are welcome here: open an issue or a
+pull request on this repository. Changes to the rest of Quantum ESPRESSO belong upstream, see
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## License
+
+Like Quantum ESPRESSO, this fork is distributed under the GNU General Public License, version 2 or
+(at your option) any later version. See [`License`](License).
+
+## Citing
+
+If you use this code in published work, please cite Quantum ESPRESSO as its developers ask
+(<https://www.quantum-espresso.org/quote>) and link to this repository.
+
+## Acknowledgements
+
+This work builds on [Quantum ESPRESSO](https://www.quantum-espresso.org), developed by the
+Quantum ESPRESSO Foundation and its many contributors. Upstream Quantum ESPRESSO's README is in
+[`QE_README.md`](QE_README.md).
